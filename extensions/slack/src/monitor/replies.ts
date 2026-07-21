@@ -85,6 +85,8 @@ export async function deliverReplies(params: {
    * hook fires regardless (self-gated on registered listeners).
    */
   sessionKeyForInternalHooks?: string;
+  /** Stable run identity shared with the inbound `message_received` hook. */
+  runId?: string;
   /** Whether the reply target is a group/channel (vs a DM). */
   isGroup?: boolean;
   /** Group/channel id for the `message_sent` event when `isGroup` is true. */
@@ -167,6 +169,7 @@ export async function deliverReplies(params: {
       }
       emitSlackMessageSentHooks({
         sessionKeyForInternalHooks: params.sessionKeyForInternalHooks,
+        runId: params.runId,
         to: params.messageSentHookTarget ?? params.target,
         accountId: params.accountId,
         content,
@@ -182,6 +185,7 @@ export async function deliverReplies(params: {
       }
       emitSlackMessageSentHooks({
         sessionKeyForInternalHooks: params.sessionKeyForInternalHooks,
+        runId: params.runId,
         to: params.messageSentHookTarget ?? params.target,
         accountId: params.accountId,
         content,

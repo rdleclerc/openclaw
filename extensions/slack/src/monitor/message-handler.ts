@@ -1,4 +1,5 @@
 // Slack plugin module implements message handler behavior.
+import { randomUUID } from "node:crypto";
 import {
   createChannelInboundDebouncer,
   shouldDebounceTextInbound,
@@ -49,6 +50,7 @@ type SlackDispatchCompletion = {
 };
 
 type IngressSlackMessageOptions = Parameters<SlackMessageHandler>[1] & {
+  lifecycleRunId?: string;
   retryAttempt?: number;
 };
 
@@ -381,6 +383,10 @@ export function createSlackMessageHandler(params: {
     message: SlackMessageEvent,
     opts: IngressSlackMessageOptions,
   ): Promise<SlackDispatchCompletion | undefined> {
+    opts = {
+      ...opts,
+      lifecycleRunId: opts.lifecycleRunId ?? randomUUID(),
+    };
     if (opts.source === "message" && message.type !== "message") {
       return undefined;
     }

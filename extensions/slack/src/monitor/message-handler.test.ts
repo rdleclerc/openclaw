@@ -354,6 +354,18 @@ describe("createSlackMessageHandler", () => {
         },
       });
       expect(enqueueMock.mock.calls[1]?.[0]).not.toHaveProperty("opts.dispatchCompletion");
+
+      dispatchPreparedSlackMessageMock.mockResolvedValueOnce(undefined);
+      const retryEntry = enqueueMock.mock.calls[1]?.[0] as Record<string, unknown>;
+      await onFlushCallbacks[0]?.([retryEntry]);
+      const firstPrepareParams = prepareSlackMessageMock.mock.calls[0]?.[0] as {
+        opts?: { lifecycleRunId?: string };
+      };
+      const retryPrepareParams = prepareSlackMessageMock.mock.calls[1]?.[0] as {
+        opts?: { lifecycleRunId?: string };
+      };
+      expect(firstPrepareParams.opts?.lifecycleRunId).toEqual(expect.any(String));
+      expect(retryPrepareParams.opts?.lifecycleRunId).toBe(firstPrepareParams.opts?.lifecycleRunId);
     } finally {
       vi.useRealTimers();
     }

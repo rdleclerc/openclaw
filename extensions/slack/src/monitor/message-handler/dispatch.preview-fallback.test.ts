@@ -46,6 +46,7 @@ let mockedSlackDraftMode: "replace" | "status_final" | "append" = "append";
 let mockedPinnedMainDmOwner: string | undefined;
 let capturedReplyOptions:
   | {
+      runId?: string;
       disableBlockStreaming?: boolean;
       sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
       suppressTyping?: boolean;
@@ -326,6 +327,7 @@ function createDraftStreamStub() {
 }
 
 function createPreparedSlackMessage(params?: {
+  lifecycleRunId?: string;
   cfg?: Record<string, unknown>;
   accountConfig?: Record<string, unknown>;
   ctxPayload?: Record<string, unknown>;
@@ -378,6 +380,7 @@ function createPreparedSlackMessage(params?: {
   };
 
   return {
+    lifecycleRunId: params?.lifecycleRunId,
     ctx: {
       cfg: params?.cfg ?? {},
       runtime: {},
@@ -981,6 +984,7 @@ vi.mock("../reply.runtime.js", () => ({
       deliver: (payload: TestReplyPayload, info: { kind: TestReplyDispatchKind }) => Promise<void>;
     };
     replyOptions?: {
+      runId?: string;
       disableBlockStreaming?: boolean;
       sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
       suppressTyping?: boolean;
@@ -1680,6 +1684,30 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     });
     expect(deliverRepliesMock).not.toHaveBeenCalled();
     expect(draftStream.clear).not.toHaveBeenCalled();
+  });
+
+  it("uses one run identity for inbound dispatch and terminal Slack delivery", async () => {
+    const lifecycleRunId = "slack-lifecycle-run-identity-proof";
+    const draftStream = {
+      ...createDraftStreamStub(),
+      flush: vi.fn(noopAsync),
+      clear: vi.fn(noopAsync),
+      discardPending: vi.fn(noopAsync),
+      seal: vi.fn(noopAsync),
+    };
+    createSlackDraftStreamMock.mockReturnValueOnce(draftStream);
+    finalizeSlackPreviewEditMock.mockResolvedValueOnce(undefined);
+    mockedDispatchSequence = [{ kind: "final", payload: { text: "identity proof" } }];
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage({ lifecycleRunId }));
+
+    expect(capturedReplyOptions?.runId).toBe(lifecycleRunId);
+    const hookParams = requireMockCall(
+      emitSlackMessageSentHooksMock,
+      0,
+      "identity message_sent",
+    )[0] as { runId?: string };
+    expect(hookParams.runId).toBe(capturedReplyOptions?.runId);
   });
 
   it("finalizes native chart blocks without re-escaping accessible preview text", async () => {

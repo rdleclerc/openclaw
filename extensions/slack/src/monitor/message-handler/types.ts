@@ -11,6 +11,7 @@ import type { SlackMonitorContext } from "../context.js";
 import type { SlackEventScope } from "../event-scope.js";
 
 export type PreparedSlackMessage = {
+  lifecycleRunId?: string;
   ctx: SlackMonitorContext;
   account: ResolvedSlackAccount;
   message: SlackMessageEvent;

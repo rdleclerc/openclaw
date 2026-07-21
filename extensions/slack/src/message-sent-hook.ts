@@ -22,6 +22,8 @@ import { getGlobalHookRunner } from "openclaw/plugin-sdk/plugin-runtime";
 type EmitSlackMessageSentHookParams = {
   /** Optional canonical session key. When set, the internal `message:sent` hook fires too. */
   sessionKeyForInternalHooks?: string;
+  /** Stable run identity shared with the inbound `message_received` hook. */
+  runId?: string;
   /** Slack target (channel ID `C…`, DM channel ID `D…`, group `G…`, or user ID `U…`). */
   to: string;
   accountId?: string | null;
@@ -50,6 +52,7 @@ function buildSlackSentHookContext(params: EmitSlackMessageSentHookParams) {
     // fires with). This matches the shared outbound emitter in
     // `src/infra/outbound/deliver.ts`.
     sessionKey: params.sessionKeyForInternalHooks,
+    runId: params.runId,
     messageId: params.messageId,
     isGroup: params.isGroup,
     groupId: params.groupId,

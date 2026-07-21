@@ -642,6 +642,7 @@ export async function prepareSlackMessage(params: {
   message: SlackMessageEvent;
   opts: {
     source: "message" | "app_mention";
+    lifecycleRunId?: string;
     wasMentioned?: boolean;
     relayIdentity?: SlackSendIdentity;
     eventScope?: SlackEventScope;
@@ -1636,6 +1637,7 @@ export async function prepareSlackMessage(params: {
   const updateLastRouteSessionKey = resolveInboundLastRouteSessionKey({ route, sessionKey });
 
   return {
+    ...(opts.lifecycleRunId ? { lifecycleRunId: opts.lifecycleRunId } : {}),
     ctx,
     account,
     message,

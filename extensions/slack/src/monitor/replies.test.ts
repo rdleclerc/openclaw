@@ -1056,7 +1056,7 @@ describe("deliverReplies message_sent hook", () => {
     expect(event).toMatchObject({ content: "shipped", success: true });
   });
 
-  it("threads the session key into the message_sent plugin context for correlation", async () => {
+  it("threads the session and run identity into the message_sent plugin context", async () => {
     messageHookRunner.hasHooks.mockImplementation((name: string) => name === "message_sent");
     sendMock.mockResolvedValue({ messageId: "1700000000.000200", channelId: "C123" });
 
@@ -1064,16 +1064,20 @@ describe("deliverReplies message_sent hook", () => {
       baseParams({
         replies: [{ text: "correlated" }],
         sessionKeyForInternalHooks: "slack:C123:U1",
+        runId: "slack-run-correlation-1",
       }),
     );
 
     expect(messageHookRunner.runMessageSent).toHaveBeenCalledOnce();
     const event = messageHookRunner.runMessageSent.mock.calls[0]?.[0] as Record<string, unknown>;
     const context = messageHookRunner.runMessageSent.mock.calls[0]?.[1] as Record<string, unknown>;
-    // Plugins observing both `message_sending` and `message_sent` must see the
-    // same `sessionKey` (mirrors the shared outbound emitter contract).
-    expect(event).toMatchObject({ sessionKey: "slack:C123:U1" });
-    expect(context).toMatchObject({ sessionKey: "slack:C123:U1" });
+    // Plugins observing inbound and terminal hooks must see the same stable
+    // run identity, alongside the canonical session key.
+    expect(event).toMatchObject({ sessionKey: "slack:C123:U1", runId: "slack-run-correlation-1" });
+    expect(context).toMatchObject({
+      sessionKey: "slack:C123:U1",
+      runId: "slack-run-correlation-1",
+    });
   });
 
   it("uses the logical hook target while delivering to a physical DM channel", async () => {

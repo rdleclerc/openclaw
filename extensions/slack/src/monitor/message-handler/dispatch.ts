@@ -1,4 +1,5 @@
 // Slack plugin module implements dispatch behavior.
+import { randomUUID } from "node:crypto";
 import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import {
   createStatusReactionController,
@@ -445,6 +446,7 @@ async function resolveSlackStreamRecipientTeamId(params: {
 
 export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessage) {
   const { ctx, account, message, route } = prepared;
+  const lifecycleRunId = prepared.lifecycleRunId ?? randomUUID();
   const slackClient = prepared.eventScope?.client ?? ctx.app.client;
   const slackStreamFallbackTeamId = prepared.eventScope?.teamId ?? ctx.teamId;
   const cfg = ctx.cfg;
@@ -521,6 +523,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     prepared.ctxPayload.OriginatingTo ?? prepared.ctxPayload.To ?? prepared.replyTarget;
   const messageSentHookContext = {
     sessionKeyForInternalHooks: prepared.ctxPayload.SessionKey ?? route.sessionKey,
+    runId: lifecycleRunId,
     isGroup: prepared.isRoomish,
     groupId: prepared.isRoomish ? message.channel : undefined,
   };
@@ -1933,6 +1936,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       history: prepared.turn.history,
       botLoopProtection: resolveSlackBotLoopProtection(prepared),
       replyOptions: {
+        runId: lifecycleRunId,
         skillFilter: prepared.channelConfig?.skills,
         sourceReplyDeliveryMode,
         // Room events are observe-style turns; Slack status indicators imply an
