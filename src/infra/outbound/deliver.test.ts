@@ -4917,7 +4917,7 @@ describe("deliverOutboundPayloads", () => {
     expect(ctx).not.toHaveProperty("sessionKey");
   });
 
-  it("threads sessionKey into the message_sent hook context when session is provided", async () => {
+  it("threads sessionKey and the authoritative recovery run into message_sent", async () => {
     // Contract test for `message_sent`: the documented JSDoc says the
     // outbound delivery hooks mirror `OutboundSessionContext.key`. This
     // test pins `message_sent` to that contract so it cannot diverge
@@ -4947,6 +4947,16 @@ describe("deliverOutboundPayloads", () => {
       to: "!room",
       payloads: [{ text: "hello" }],
       session: { key: "agent:tank:main" },
+      replyPayloadSendingHook: {
+        kind: "final",
+        channel: "matrix",
+        runId: "recovery-run-exact",
+        context: {
+          channelId: "matrix",
+          conversationId: "!room",
+          runId: "recovery-run-exact",
+        },
+      },
     });
 
     expect(hookMocks.runner.runMessageSent).toHaveBeenCalledTimes(1);
@@ -4955,6 +4965,7 @@ describe("deliverOutboundPayloads", () => {
       expect.objectContaining({
         channelId: "matrix",
         sessionKey: "agent:tank:main",
+        runId: "recovery-run-exact",
       }),
     );
   });
