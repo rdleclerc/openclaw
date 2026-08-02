@@ -36,19 +36,21 @@ export type GatewayToolCallerMessageActionCapabilityResolution =
 
 type GatewayToolCallerContext = GatewayToolCallerIdentity & {
   messageActionTurnCapabilityBoundary?: boolean;
+  requestIdentityConflict?: boolean;
 };
 
 const gatewayToolCallerStorage = new AsyncLocalStorage<GatewayToolCallerContext | undefined>();
 
 export function getGatewayToolCallerIdentity(): GatewayToolCallerIdentity | undefined {
-  return gatewayToolCallerStorage.getStore();
+  const identity = gatewayToolCallerStorage.getStore();
+  return identity?.requestIdentityConflict ? undefined : identity;
 }
 
 export function resolveGatewayToolCallerMessageActionCapability(
   explicitToken: string | undefined,
 ): GatewayToolCallerMessageActionCapabilityResolution {
   const identity = gatewayToolCallerStorage.getStore();
-  if (identity?.messageActionTurnCapabilityConflict) {
+  if (identity?.requestIdentityConflict || identity?.messageActionTurnCapabilityConflict) {
     return { ok: false, reason: "token_conflict" };
   }
   const explicit = explicitToken?.trim();
@@ -112,20 +114,23 @@ export async function withGatewayToolCallerIdentity<T>(
   const active = gatewayToolCallerStorage.getStore();
   const sameIdentity =
     active?.agentId === normalized.agentId && active.sessionKey === normalized.sessionKey;
-  const boundaryIdentityConflict =
-    active?.messageActionTurnCapabilityBoundary === true && !sameIdentity;
+  // A request boundary owns its caller identity. A prebuilt tool from another
+  // agent or session must not replace it, even when neither side carries a token.
+  const requestIdentityConflict =
+    active?.requestIdentityConflict === true ||
+    (active?.messageActionTurnCapabilityBoundary === true && !sameIdentity);
   const explicit = normalized.messageActionTurnCapability;
   const inherited = sameIdentity ? active?.messageActionTurnCapability : undefined;
   const conflict =
+    requestIdentityConflict ||
     normalized.messageActionTurnCapabilityConflict === true ||
-    boundaryIdentityConflict ||
     (sameIdentity && active?.messageActionTurnCapabilityConflict === true) ||
     (sameIdentity &&
       active?.messageActionTurnCapabilityBoundary === true &&
       !inherited &&
       Boolean(explicit)) ||
     Boolean(explicit && inherited && explicit !== inherited);
-  const contextIdentity = boundaryIdentityConflict ? active : normalized;
+  const contextIdentity = requestIdentityConflict ? active : normalized;
   const {
     messageActionTurnCapability: _discardedCapability,
     messageActionTurnCapabilityConflict: _discardedConflict,
@@ -138,7 +143,8 @@ export async function withGatewayToolCallerIdentity<T>(
         ? { messageActionTurnCapability: explicit || inherited }
         : {}),
       ...(conflict ? { messageActionTurnCapabilityConflict: true } : {}),
-      ...((sameIdentity || boundaryIdentityConflict) && active?.messageActionTurnCapabilityBoundary
+      ...(requestIdentityConflict ? { requestIdentityConflict: true } : {}),
+      ...(active?.messageActionTurnCapabilityBoundary
         ? { messageActionTurnCapabilityBoundary: true }
         : {}),
     },

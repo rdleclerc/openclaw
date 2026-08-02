@@ -3,6 +3,7 @@ import {
   nativeHookRelayTesting,
   type NativeHookRelayRegistrationHandle,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { ChannelMessageActionContext, ChannelPlugin } from "openclaw/plugin-sdk/core";
 import {
   onInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -14,8 +15,11 @@ import {
 } from "openclaw/plugin-sdk/hook-runtime";
 import {
   createMockPluginRegistry,
-  inspectGatewayToolCallerMessageActionCapabilityForTest,
-  wrapToolWithGatewayCallerIdentityForTest,
+  createTestRegistry,
+  mintMessageActionTurnCapabilityForTest,
+  resetPluginRuntimeStateForTest,
+  revokeMessageActionTurnCapabilityForTest,
+  setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveCodexSupervisionAppServerRuntimeOptions } from "./config.js";
@@ -50,6 +54,57 @@ const withLeasedCodexAppServerClientStartSelectionRetryMock = vi.fn(
       signal: params.options.abandonSignal,
     }),
 );
+
+const SIDE_DOSSIER_CHANNEL = "C-DOSSIERS";
+const mintedSideTurnCapabilities: string[] = [];
+const handleSideDownloadFile = vi.fn(async (ctx: ChannelMessageActionContext) => ({
+  content: [
+    {
+      type: "text" as const,
+      text: JSON.stringify({ ok: true, path: `/tmp/${String(ctx.params.fileId)}.pdf` }),
+    },
+  ],
+  details: { ok: true, path: `/tmp/${String(ctx.params.fileId)}.pdf` },
+}));
+
+const sideSlackDownloadPlugin: ChannelPlugin = {
+  id: "slack",
+  meta: {
+    id: "slack",
+    label: "Slack",
+    selectionLabel: "Slack",
+    docsPath: "/channels/slack",
+    blurb: "Test Slack download action",
+  },
+  capabilities: { chatTypes: ["direct", "group"] },
+  config: {
+    listAccountIds: () => ["default"],
+    resolveAccount: () => ({}),
+  },
+  messaging: {
+    normalizeTarget: (raw) => raw,
+    targetResolver: {
+      looksLikeId: () => true,
+      resolveTarget: async ({ normalized }) => ({
+        to: normalized,
+        kind: "group",
+        source: "normalized",
+      }),
+    },
+  },
+  outbound: {
+    deliveryMode: "direct",
+    resolveTarget: ({ to }) => ({ ok: true, to: to?.trim() ?? "" }),
+    sendText: async () => ({ channel: "slack", messageId: "unused" }),
+    sendMedia: async () => ({ channel: "slack", messageId: "unused" }),
+  },
+  actions: {
+    describeMessageTool: () => ({ actions: ["download-file"] }),
+    supportsAction: ({ action }) => action === "download-file",
+    requiresTrustedRequesterSender: ({ action }) => action === "download-file",
+    handleAction: handleSideDownloadFile,
+  },
+};
 
 function supervisionConnectionFingerprint(): string {
   return buildCodexAppServerConnectionFingerprint(
@@ -457,6 +512,121 @@ function platformPreparedRuntimeAuth(resolvedApiKey?: string) {
   } satisfies Parameters<typeof runCodexAppServerSideQuestion>[0]["preparedRuntimeAuth"];
 }
 
+type SideAttemptIdentity = {
+  agentId: string;
+  runId: string;
+  sessionId: string;
+  sessionKey: string;
+};
+
+function mintSideAttemptCapability(identity: SideAttemptIdentity, senderId: string): string {
+  const token = mintMessageActionTurnCapabilityForTest({
+    ...identity,
+    requesterAccountId: "default",
+    requesterSenderId: senderId,
+    toolContext: {
+      currentChannelProvider: "slack",
+      currentChannelId: SIDE_DOSSIER_CHANNEL,
+      currentMessagingTarget: SIDE_DOSSIER_CHANNEL,
+    },
+  });
+  mintedSideTurnCapabilities.push(token);
+  return token;
+}
+
+async function materializeSideMessageTool(
+  identity: SideAttemptIdentity,
+  constructorToken?: string,
+) {
+  const actualAgentHarness = await vi.importActual<
+    typeof import("openclaw/plugin-sdk/agent-harness")
+  >("openclaw/plugin-sdk/agent-harness");
+  const tools = actualAgentHarness.createOpenClawCodingTools({
+    ...identity,
+    cwd: "/tmp/workspace",
+    workspaceDir: "/tmp/workspace",
+    config: {} as never,
+    messageProvider: "slack",
+    messageChannel: "slack",
+    toolPolicyMessageProvider: "slack",
+    agentAccountId: "default",
+    currentChannelId: SIDE_DOSSIER_CHANNEL,
+    currentMessagingTarget: SIDE_DOSSIER_CHANNEL,
+    messageActionTurnCapability: constructorToken,
+    modelProvider: "openai",
+    modelId: "gpt-5.6-sol",
+    modelApi: "openai-responses",
+    suppressManagedWebSearch: false,
+    runtimeToolAllowlist: ["message"],
+    forceMessageTool: true,
+    toolConstructionPlan: {
+      includeBaseCodingTools: false,
+      includeShellTools: false,
+      includeChannelTools: false,
+      includeOpenClawTools: true,
+      includePluginTools: false,
+    },
+  });
+  const messageTool = tools.find((tool) => tool.name === "message");
+  if (!messageTool) {
+    throw new Error("Expected the production side-thread message tool to be materialized");
+  }
+  return messageTool;
+}
+
+function createSideDownloadClient(callId: string) {
+  const client = createFakeClient();
+  let toolResponse: unknown;
+  client.request.mockImplementation(async (method: string) => {
+    if (method === "thread/fork") {
+      return threadResult("side-thread");
+    }
+    if (method === "thread/inject_items") {
+      return {};
+    }
+    if (method === "turn/start") {
+      setTimeout(() => {
+        void (async () => {
+          toolResponse = await client.handleRequest({
+            id: 44,
+            method: "item/tool/call",
+            params: {
+              threadId: "side-thread",
+              turnId: "turn-1",
+              callId,
+              namespace: null,
+              tool: "message",
+              arguments: {
+                action: "download-file",
+                channel: "slack",
+                channelId: SIDE_DOSSIER_CHANNEL,
+                fileId: `F-${callId}`,
+              },
+            },
+          });
+          client.emit(agentDelta("side-thread", "turn-1", "Side answer."));
+          client.emit(turnCompleted("side-thread", "turn-1", "Side answer."));
+        })();
+      }, 0);
+      return turnStartResult("turn-1");
+    }
+    if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+      return {};
+    }
+    throw new Error(`unexpected request: ${method}`);
+  });
+  return { client, readToolResponse: () => toolResponse };
+}
+
+function expectSideCapabilityNotLeaked(value: unknown, tokens: Array<string | undefined>) {
+  const serialized = JSON.stringify(value);
+  for (const token of tokens) {
+    if (token) {
+      expect(serialized).not.toContain(token);
+    }
+  }
+}
+
 async function runSideQuestionWithManagedWebSearchCall(
   params: Parameters<typeof runCodexAppServerSideQuestion>[0] = sideParams(),
   options: { preserveToolFactory?: boolean } = {},
@@ -514,6 +684,9 @@ async function runSideQuestionWithManagedWebSearchCall(
 
 describe("runCodexAppServerSideQuestion", () => {
   beforeEach(() => {
+    resetPluginRuntimeStateForTest();
+    setActivePluginRegistry(createTestRegistry([]));
+    handleSideDownloadFile.mockClear();
     nativeHookRelayTesting.clearNativeHookRelaysForTests();
     readCodexAppServerBindingMock.mockReset();
     isCodexAppServerNativeAuthProfileMock.mockReset();
@@ -573,6 +746,10 @@ describe("runCodexAppServerSideQuestion", () => {
   });
 
   afterEach(() => {
+    for (const token of mintedSideTurnCapabilities.splice(0)) {
+      revokeMessageActionTurnCapabilityForTest(token);
+    }
+    resetPluginRuntimeStateForTest();
     nativeHookRelayTesting.clearNativeHookRelaysForTests();
     resetDiagnosticEventsForTest();
     resetGlobalHookRunner();
@@ -2291,81 +2468,127 @@ describe("runCodexAppServerSideQuestion", () => {
     });
   });
 
-  it("binds current attempt authority for a pre-materialized side-thread tool", async () => {
+  it("downloads through a pre-materialized production message tool in a side question", async () => {
     const runSessionKey = "agent:main:side-run";
     const sandboxSessionKey = "agent:main:side-sandbox";
-    const capability = "opaque-side-capability";
-    let observed: unknown;
-    toolExecuteMock.mockImplementationOnce(async () => {
-      await Promise.resolve();
-      observed = inspectGatewayToolCallerMessageActionCapabilityForTest(capability);
-      return { content: [{ type: "text", text: "tool output" }] };
-    });
-    createOpenClawCodingToolsMock.mockReturnValue([
-      wrapToolWithGatewayCallerIdentityForTest(
+    const identity = {
+      agentId: "main",
+      runId: "side-run",
+      sessionId: "session-1",
+      sessionKey: sandboxSessionKey,
+    };
+    const capability = mintSideAttemptCapability(identity, "side-sender");
+    setActivePluginRegistry(
+      createTestRegistry([
         {
-          name: "wiki_status",
-          label: "Wiki status",
-          description: "Check wiki status",
-          parameters: { type: "object", properties: {} },
-          execute: toolExecuteMock,
+          pluginId: "slack",
+          source: "test",
+          origin: "bundled",
+          plugin: sideSlackDownloadPlugin,
         },
-        { agentId: "main", sessionKey: sandboxSessionKey },
-      ),
-    ]);
-    const client = createFakeClient();
-    client.request.mockImplementation(async (method: string) => {
-      if (method === "thread/fork") {
-        return threadResult("side-thread");
-      }
-      if (method === "thread/inject_items") {
-        return {};
-      }
-      if (method === "turn/start") {
-        setTimeout(() => {
-          void (async () => {
-            await client.handleRequest({
-              id: 44,
-              method: "item/tool/call",
-              params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
-                callId: "authority-1",
-                tool: "wiki_status",
-                arguments: {},
-              },
-            });
-            client.emit(agentDelta("side-thread", "turn-1", "Side answer."));
-            client.emit(turnCompleted("side-thread", "turn-1", "Side answer."));
-          })();
-        }, 0);
-        return turnStartResult("turn-1");
-      }
-      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
-        return {};
-      }
-      throw new Error(`unexpected request: ${method}`);
-    });
+      ]),
+    );
+    const messageTool = await materializeSideMessageTool(identity);
+    createOpenClawCodingToolsMock.mockReturnValue([messageTool]);
+    const { client, readToolResponse } = createSideDownloadClient("side-positive");
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
 
     await expect(
       runCodexAppServerSideQuestion(
-        sideParams({
-          opts: { runId: "side-run" },
+sideParams({
+  agentId: "main",
+  opts: { runId: "side-run" },
           sessionKey: runSessionKey,
           sandboxSessionKey,
+          messageProvider: "slack",
+          messageChannel: "slack",
+          currentChannelId: SIDE_DOSSIER_CHANNEL,
+          agentAccountId: "default",
           messageActionTurnCapability: capability,
+          opts: { runId: "side-run" },
         }),
       ),
     ).resolves.toEqual({ text: "Side answer." });
 
-    expect(observed).toEqual({ ok: true, present: true, matchesExpected: true });
-    expect(inspectGatewayToolCallerMessageActionCapabilityForTest()).toEqual({
-      ok: true,
-      present: false,
-      matchesExpected: true,
+    expect(readToolResponse()).toMatchObject({ success: true });
+    expect(handleSideDownloadFile).toHaveBeenCalledOnce();
+    expect(handleSideDownloadFile.mock.calls[0]?.[0]).toMatchObject({
+      action: "download-file",
+      requesterAccountId: "default",
+      requesterSenderId: "side-sender",
+      params: {
+        channelId: SIDE_DOSSIER_CHANNEL,
+        fileId: "F-side-positive",
+      },
     });
+    expectSideCapabilityNotLeaked(readToolResponse(), [capability]);
   });
+
+  it.each(["revoked", "stale-constructor", "conflicting-constructor", "cross-session"] as const)(
+    "keeps %s message authority fail-closed in side questions",
+    async (scenario) => {
+      const runSessionKey = "agent:main:side-run";
+      const sandboxSessionKey = "agent:main:side-sandbox";
+      const identity = {
+        agentId: "main",
+        runId: "side-run",
+        sessionId: "session-1",
+        sessionKey: sandboxSessionKey,
+      };
+      setActivePluginRegistry(
+        createTestRegistry([
+          {
+            pluginId: "slack",
+            source: "test",
+            origin: "bundled",
+            plugin: sideSlackDownloadPlugin,
+          },
+        ]),
+      );
+      let requestToken: string | undefined;
+      let constructorToken: string | undefined;
+      let toolIdentity = identity;
+      if (scenario === "revoked") {
+        requestToken = mintSideAttemptCapability(identity, "revoked-sender");
+        revokeMessageActionTurnCapabilityForTest(requestToken);
+      } else if (scenario === "stale-constructor") {
+        constructorToken = mintSideAttemptCapability(identity, "stale-sender");
+      } else if (scenario === "conflicting-constructor") {
+        requestToken = mintSideAttemptCapability(identity, "request-sender");
+        constructorToken = mintSideAttemptCapability(identity, "constructor-sender");
+      } else {
+        requestToken = mintSideAttemptCapability(identity, "request-sender");
+        toolIdentity = {
+          ...identity,
+          sessionKey: "agent:main:other-side-sandbox",
+        };
+      }
+      const messageTool = await materializeSideMessageTool(toolIdentity, constructorToken);
+      createOpenClawCodingToolsMock.mockReturnValue([messageTool]);
+      const { client, readToolResponse } = createSideDownloadClient(`side-${scenario}`);
+      getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+      await expect(
+        runCodexAppServerSideQuestion(
+          sideParams({
+            agentId: "main",
+            sessionKey: runSessionKey,
+            sandboxSessionKey,
+            messageProvider: "slack",
+            messageChannel: "slack",
+            currentChannelId: SIDE_DOSSIER_CHANNEL,
+            agentAccountId: "default",
+            messageActionTurnCapability: requestToken,
+            opts: { runId: "side-run" },
+          }),
+        ),
+      ).resolves.toEqual({ text: "Side answer." });
+
+      expect(readToolResponse()).toMatchObject({ success: false });
+      expect(handleSideDownloadFile).not.toHaveBeenCalled();
+      expectSideCapabilityNotLeaked(readToolResponse(), [requestToken, constructorToken]);
+    },
+  );
 
   it("omits computer control from side threads without a compaction owner", async () => {
     const client = createFakeClient();

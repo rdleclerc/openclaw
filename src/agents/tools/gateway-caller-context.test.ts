@@ -12,6 +12,7 @@ import {
 } from "../tool-terminal-presentation.js";
 import type { AnyAgentTool } from "./common.js";
 import {
+  getGatewayToolCallerIdentity,
   resolveGatewayToolCallerMessageActionCapability,
   runWithGatewayToolCallerRequestContext,
   wrapToolWithGatewayCallerIdentity,
@@ -152,40 +153,46 @@ describe("gateway caller context wrapper", () => {
 
   it.each([
     {
-      name: "another session",
-      wrappedIdentity: { agentId: "agent-a", sessionKey: "agent-a:other-session" },
+      name: "agent",
+      nested: { agentId: "agent-b", sessionKey: "agent-a:session" },
     },
     {
-      name: "another agent",
-      wrappedIdentity: { agentId: "agent-b", sessionKey: "agent-b:session" },
+      name: "session",
+      nested: { agentId: "agent-a", sessionKey: "agent-a:other-session" },
     },
-  ])("rejects wrapped authority from $name inside a request boundary", async (testCase) => {
+  ])("fails closed when a nested tool replaces the request $name identity", async ({ nested }) => {
     let observed: unknown;
-    const tool: AnyAgentTool = {
-      name: "probe",
-      label: "Probe",
-      description: "probe",
-      parameters: Type.Object({}),
-      execute: async () => {
-        observed = resolveGatewayToolCallerMessageActionCapability(undefined);
-        return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+    const materialized = wrapToolWithGatewayCallerIdentity(
+      {
+        name: "probe",
+        label: "Probe",
+        description: "probe",
+        parameters: Type.Object({}),
+        execute: async () => {
+          observed = {
+            identity: getGatewayToolCallerIdentity(),
+            capability: resolveGatewayToolCallerMessageActionCapability(undefined),
+          };
+          return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+        },
       },
-    };
-    const materialized = wrapToolWithGatewayCallerIdentity(tool, {
-      ...testCase.wrappedIdentity,
-      messageActionTurnCapability: "other-live-token",
-    });
+      nested,
+    );
 
     await runWithGatewayToolCallerRequestContext(
       {
         agentId: "agent-a",
         sessionKey: "agent-a:session",
-        messageActionTurnCapability: "current-request-token",
+        messageActionTurnCapability: "request-token",
       },
       () => materialized.execute?.("call-1", {}),
     );
 
-    expect(observed).toEqual({ ok: false, reason: "token_conflict" });
+    expect(observed).toEqual({
+      identity: undefined,
+      capability: { ok: false, reason: "token_conflict" },
+    });
+    expect(getGatewayToolCallerIdentity()).toBeUndefined();
   });
 
   it("rejects wrapped authority from another session when the current request has no authority", async () => {
@@ -212,5 +219,66 @@ describe("gateway caller context wrapper", () => {
     );
 
     expect(observed).toEqual({ ok: false, reason: "token_conflict" });
+  });
+
+  it("isolates concurrent request authority across different agents and sessions", async () => {
+    const observations: Array<{ agentId?: string; token?: string }> = [];
+    let release: (() => void) | undefined;
+    const overlap = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = 0;
+    const createProbe = (agentId: string, sessionKey: string) =>
+      wrapToolWithGatewayCallerIdentity(
+        {
+          name: `probe_${agentId}`,
+          label: "Probe",
+          description: "probe",
+          parameters: Type.Object({}),
+          execute: async () => {
+            entered += 1;
+            if (entered === 2) {
+              release?.();
+            }
+            await overlap;
+            const capability = resolveGatewayToolCallerMessageActionCapability(undefined);
+            observations.push({
+              agentId: getGatewayToolCallerIdentity()?.agentId,
+              token: capability.ok ? capability.token : undefined,
+            });
+            return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+          },
+        },
+        { agentId, sessionKey },
+      );
+    const first = createProbe("agent-a", "agent-a:session");
+    const second = createProbe("agent-b", "agent-b:session");
+
+    await Promise.all([
+      runWithGatewayToolCallerRequestContext(
+        {
+          agentId: "agent-a",
+          sessionKey: "agent-a:session",
+          messageActionTurnCapability: "token-a",
+        },
+        () => first.execute?.("call-a", {}),
+      ),
+      runWithGatewayToolCallerRequestContext(
+        {
+          agentId: "agent-b",
+          sessionKey: "agent-b:session",
+          messageActionTurnCapability: "token-b",
+        },
+        () => second.execute?.("call-b", {}),
+      ),
+    ]);
+
+    expect(observations).toEqual(
+      expect.arrayContaining([
+        { agentId: "agent-a", token: "token-a" },
+        { agentId: "agent-b", token: "token-b" },
+      ]),
+    );
+    expect(getGatewayToolCallerIdentity()).toBeUndefined();
   });
 });

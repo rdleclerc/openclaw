@@ -1,50 +1,146 @@
+import { createOpenClawCodingTools } from "openclaw/plugin-sdk/agent-harness";
+import type { ChannelMessageActionContext, ChannelPlugin } from "openclaw/plugin-sdk/core";
 import {
-  inspectGatewayToolCallerMessageActionCapabilityForTest,
-  wrapToolWithGatewayCallerIdentityForTest,
+  createTestRegistry,
+  mintMessageActionTurnCapabilityForTest,
+  resetPluginRuntimeStateForTest,
+  revokeMessageActionTurnCapabilityForTest,
+  setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createCodexDynamicToolBridge } from "./dynamic-tools.js";
 import type { CodexAttemptLifecycleController } from "./run-attempt-lifecycle-controller.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
 import { createCodexAttemptServerRequestController } from "./run-attempt-server-requests.js";
 import { createCodexDynamicToolExecutionRegistry } from "./run-attempt-tools.js";
 import type { CodexAttemptTurnState } from "./run-attempt-turn-state.js";
 
-function createControllerFixture(
-  attemptToken: string | undefined,
-  observed: Array<unknown>,
-  constructorToken?: string,
-  constructorSessionKey = "agent:test-agent:session",
-  onTrustedCapability?: () => void,
-) {
-  const runAbortController = new AbortController();
-  const materializedTool = wrapToolWithGatewayCallerIdentityForTest(
-    {
-      name: "authority_probe",
-      label: "Authority probe",
-      description: "authority probe",
-      parameters: { type: "object", properties: {} },
-      execute: async () => {
-        await Promise.resolve();
-        const resolution = inspectGatewayToolCallerMessageActionCapabilityForTest(attemptToken);
-        observed.push(resolution);
-        if (resolution.ok && resolution.present) {
-          onTrustedCapability?.();
-        }
-        return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+type AttemptIdentity = {
+  agentId: string;
+  runId: string;
+  sessionId: string;
+  sessionKey: string;
+};
+
+const DOSSIER_CHANNEL = "C-DOSSIERS";
+const mintedTurnCapabilities: string[] = [];
+function downloadFileResult(ctx: ChannelMessageActionContext) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify({ ok: true, path: `/tmp/${String(ctx.params.fileId)}.pdf` }),
       },
+    ],
+    details: { ok: true, path: `/tmp/${String(ctx.params.fileId)}.pdf` },
+  };
+}
+const handleDownloadFile = vi.fn(async (ctx: ChannelMessageActionContext) =>
+  downloadFileResult(ctx),
+);
+
+const slackDownloadPlugin: ChannelPlugin = {
+  id: "slack",
+  meta: {
+    id: "slack",
+    label: "Slack",
+    selectionLabel: "Slack",
+    docsPath: "/channels/slack",
+    blurb: "Test Slack download action",
+  },
+  capabilities: { chatTypes: ["direct", "group"] },
+  config: {
+    listAccountIds: () => ["default"],
+    resolveAccount: () => ({}),
+  },
+  messaging: {
+    normalizeTarget: (raw) => raw,
+    targetResolver: {
+      looksLikeId: () => true,
+      resolveTarget: async ({ normalized }) => ({
+        to: normalized,
+        kind: "group",
+        source: "normalized",
+      }),
     },
-    {
-      agentId: "test-agent",
-      sessionKey: constructorSessionKey,
-      messageActionTurnCapability: constructorToken,
+  },
+  outbound: {
+    deliveryMode: "direct",
+    resolveTarget: ({ to }) => ({ ok: true, to: to?.trim() ?? "" }),
+    sendText: async () => ({ channel: "slack", messageId: "unused" }),
+    sendMedia: async () => ({ channel: "slack", messageId: "unused" }),
+  },
+  actions: {
+    describeMessageTool: () => ({ actions: ["download-file"] }),
+    supportsAction: ({ action }) => action === "download-file",
+    requiresTrustedRequesterSender: ({ action }) => action === "download-file",
+    handleAction: handleDownloadFile,
+  },
+};
+
+function mintAttemptCapability(identity: AttemptIdentity, senderId: string): string {
+  const token = mintMessageActionTurnCapabilityForTest({
+    ...identity,
+    requesterAccountId: "default",
+    requesterSenderId: senderId,
+    toolContext: {
+      currentChannelProvider: "slack",
+      currentChannelId: DOSSIER_CHANNEL,
+      currentMessagingTarget: DOSSIER_CHANNEL,
     },
+  });
+  mintedTurnCapabilities.push(token);
+  return token;
+}
+
+function materializeMessageTool(identity: AttemptIdentity, constructorToken?: string) {
+  const tools = createOpenClawCodingTools({
+    ...identity,
+    cwd: "/tmp/workspace",
+    workspaceDir: "/tmp/workspace",
+    config: {} as never,
+    messageProvider: "slack",
+    messageChannel: "slack",
+    toolPolicyMessageProvider: "slack",
+    agentAccountId: "default",
+    currentChannelId: DOSSIER_CHANNEL,
+    currentMessagingTarget: DOSSIER_CHANNEL,
+    messageActionTurnCapability: constructorToken,
+    modelProvider: "openai",
+    modelId: "gpt-5.6-sol",
+    modelApi: "openai-responses",
+    suppressManagedWebSearch: false,
+    runtimeToolAllowlist: ["message"],
+    forceMessageTool: true,
+    toolConstructionPlan: {
+      includeBaseCodingTools: false,
+      includeShellTools: false,
+      includeChannelTools: false,
+      includeOpenClawTools: true,
+      includePluginTools: false,
+    },
+  });
+  const messageTool = tools.find((tool) => tool.name === "message");
+  if (!messageTool) {
+    throw new Error("Expected the production message tool to be materialized");
+  }
+  return messageTool;
+}
+
+function createControllerFixture(params: {
+  requestIdentity: AttemptIdentity;
+  attemptToken?: string;
+  toolIdentity?: AttemptIdentity;
+  constructorToken?: string;
+}) {
+  const runAbortController = new AbortController();
+  const materializedTool = materializeMessageTool(
+    params.toolIdentity ?? params.requestIdentity,
+    params.constructorToken,
   );
-  const handleToolCall = vi.fn(async () => {
-    await materializedTool.execute?.("call", {});
-    return {
-      success: true,
-      contentItems: [{ type: "inputText" as const, text: "ok" }],
-    };
+  const toolBridge = createCodexDynamicToolBridge({
+    tools: [materializedTool],
+    signal: runAbortController.signal,
   });
   const turnWatches = {
     clearCompletionIdleTimer: vi.fn(),
@@ -53,40 +149,34 @@ function createControllerFixture(
     armCompletionIdleWatch: vi.fn(),
     scheduleProgressWatches: vi.fn(),
   };
-  const trajectoryRecorder = { recordEvent: vi.fn() };
-  const projector = {
-    recordDynamicToolCall: vi.fn(),
-    recordDynamicToolResult: vi.fn(),
-  };
   const resources = {
     prompt: {
       context: {
         runtime: {
           connection: {
             params: {
-              messageActionTurnCapability: attemptToken,
-              sessionKey: "agent:test-agent:session",
+              ...params.requestIdentity,
+              messageActionTurnCapability: params.attemptToken,
               timeoutMs: 1_000,
               provider: "openai",
-              modelId: "test-model",
+              modelId: "gpt-5.6-sol",
             },
             computerUseConfig: { enabled: false },
             runAbortController,
             appServer: {},
-            sessionAgentId: "test-agent",
-            sandboxSessionKey: "agent:test-agent:session",
+            sessionAgentId: params.requestIdentity.agentId,
+            sandboxSessionKey: params.requestIdentity.sessionKey,
           },
         },
         attemptTools: {
-          toolBridge: { handleToolCall },
+          toolBridge,
           toolOutcomeOrdinals: new Map(),
           suppressedDynamicToolOutcomeOrdinals: new Set(),
         },
       },
     },
     state: { thread: { threadId: "thread-1" } },
-    projectorRef: { current: projector },
-    trajectoryRecorder,
+    projectorRef: {},
   } as unknown as CodexAttemptResources;
   const turnRuntime = {
     state: {
@@ -106,152 +196,266 @@ function createControllerFixture(
     scheduleTurnReleaseAfterTerminalDynamicTool: vi.fn(),
     scheduleTerminalDynamicToolReleaseCheck: vi.fn(),
   } as unknown as CodexAttemptLifecycleController;
+  return createCodexAttemptServerRequestController(resources, turnRuntime, lifecycle);
+}
+
+function downloadRequest(callId: string, fileId = `F-${callId}`) {
   return {
-    controller: createCodexAttemptServerRequestController(resources, turnRuntime, lifecycle),
-    handleToolCall,
-    projector,
-    trajectoryRecorder,
+    id: `request-${callId}`,
+    method: "item/tool/call",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId,
+      namespace: null,
+      tool: "message",
+      arguments: {
+        action: "download-file",
+        channel: "slack",
+        channelId: DOSSIER_CHANNEL,
+        fileId,
+      },
+    },
   };
 }
 
-describe("Codex dynamic tool message authority", () => {
-  it("binds pre-materialized tools and isolates concurrent controller attempts", async () => {
-    const firstObserved: Array<unknown> = [];
-    const secondObserved: Array<unknown> = [];
-    const first = createControllerFixture("opaque-first-capability", firstObserved);
-    const second = createControllerFixture("opaque-second-capability", secondObserved);
-    const request = (callId: string) => ({
-      id: `request-${callId}`,
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId,
-        namespace: null,
-        tool: "authority_probe",
-        arguments: {},
-      },
-    });
-    const scope = { threadId: "thread-1", turnId: "turn-1" };
+async function runDownload(controller: ReturnType<typeof createControllerFixture>, callId: string) {
+  return await controller.handleServerRequest(downloadRequest(callId), {
+    threadId: "thread-1",
+    turnId: "turn-1",
+  });
+}
 
-    await expect(
-      Promise.all([
-        first.controller.handleServerRequest(request("first"), scope),
-        second.controller.handleServerRequest(request("second"), scope),
+function expectNoCapabilityLeak(value: unknown, tokens: Array<string | undefined>) {
+  const serialized = JSON.stringify(value);
+  for (const token of tokens) {
+    if (token) {
+      expect(serialized).not.toContain(token);
+    }
+  }
+}
+
+describe("Codex dynamic message download authority", () => {
+  beforeEach(() => {
+    resetPluginRuntimeStateForTest();
+    handleDownloadFile.mockReset().mockImplementation(async (ctx) => downloadFileResult(ctx));
+    setActivePluginRegistry(
+      createTestRegistry([
+        { pluginId: "slack", source: "test", origin: "bundled", plugin: slackDownloadPlugin },
       ]),
-    ).resolves.toEqual([
-      { success: true, contentItems: [{ type: "inputText", text: "ok" }] },
-      { success: true, contentItems: [{ type: "inputText", text: "ok" }] },
-    ]);
-    expect(firstObserved).toEqual([{ ok: true, present: true, matchesExpected: true }]);
-    expect(secondObserved).toEqual([{ ok: true, present: true, matchesExpected: true }]);
-    expect(first.handleToolCall).toHaveBeenCalledOnce();
-    expect(second.handleToolCall).toHaveBeenCalledOnce();
-    expect(inspectGatewayToolCallerMessageActionCapabilityForTest()).toEqual({
-      ok: true,
-      present: false,
-      matchesExpected: true,
-    });
+    );
   });
 
-  it("fails closed when a pre-materialized tool has conflicting authority", async () => {
-    const observed: Array<unknown> = [];
-    const fixture = createControllerFixture(
-      "opaque-attempt-capability",
-      observed,
-      "opaque-constructor-capability",
-    );
-    await fixture.controller.handleServerRequest(
-      {
-        id: "request-conflict",
-        method: "item/tool/call",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          callId: "conflict",
-          namespace: null,
-          tool: "authority_probe",
-          arguments: {},
-        },
+  afterEach(() => {
+    for (const token of mintedTurnCapabilities.splice(0)) {
+      revokeMessageActionTurnCapabilityForTest(token);
+    }
+    resetPluginRuntimeStateForTest();
+  });
+
+  it("downloads through the production-composed message path with current attempt authority", async () => {
+    const identity = {
+      agentId: "agent-a",
+      runId: "run-a",
+      sessionId: "session-a",
+      sessionKey: "agent:agent-a:session-a",
+    };
+    const token = mintAttemptCapability(identity, "sender-a");
+    const controller = createControllerFixture({ requestIdentity: identity, attemptToken: token });
+
+    const response = await runDownload(controller, "positive");
+
+    expect(response).toMatchObject({ success: true });
+    expect(handleDownloadFile).toHaveBeenCalledOnce();
+    expect(handleDownloadFile.mock.calls[0]?.[0]).toMatchObject({
+      action: "download-file",
+      accountId: "default",
+      requesterAccountId: "default",
+      requesterSenderId: "sender-a",
+      params: {
+        channel: "slack",
+        channelId: DOSSIER_CHANNEL,
+        fileId: "F-positive",
       },
-      { threadId: "thread-1", turnId: "turn-1" },
-    );
-    expect(observed).toEqual([{ ok: false, reason: "token_conflict" }]);
-    expect(inspectGatewayToolCallerMessageActionCapabilityForTest()).toEqual({
-      ok: true,
-      present: false,
-      matchesExpected: true,
+      toolContext: {
+        currentChannelProvider: "slack",
+        currentChannelId: DOSSIER_CHANNEL,
+      },
     });
+    expectNoCapabilityLeak(response, [token]);
+  });
+
+  it("keeps revoked pre-materialized constructor authority fail-closed", async () => {
+    const identity = {
+      agentId: "agent-a",
+      runId: "run-revoked",
+      sessionId: "session-revoked",
+      sessionKey: "agent:agent-a:session-revoked",
+    };
+    const token = mintAttemptCapability(identity, "sender-revoked");
+    const controller = createControllerFixture({
+      requestIdentity: identity,
+      attemptToken: token,
+      constructorToken: token,
+    });
+    revokeMessageActionTurnCapabilityForTest(token);
+
+    const response = await runDownload(controller, "revoked");
+
+    expect(response).toMatchObject({ success: false });
+    expect(handleDownloadFile).not.toHaveBeenCalled();
+    expectNoCapabilityLeak(response, [token]);
+  });
+
+  it("does not revive stale constructor authority in an untokened request", async () => {
+    const identity = {
+      agentId: "agent-a",
+      runId: "run-stale",
+      sessionId: "session-stale",
+      sessionKey: "agent:agent-a:session-stale",
+    };
+    const constructorToken = mintAttemptCapability(identity, "sender-stale");
+    const controller = createControllerFixture({
+      requestIdentity: identity,
+      constructorToken,
+    });
+
+    const response = await runDownload(controller, "stale");
+
+    expect(response).toMatchObject({ success: false });
+    expect(handleDownloadFile).not.toHaveBeenCalled();
+    expectNoCapabilityLeak(response, [constructorToken]);
+  });
+
+  it("rejects conflicting constructor and active request capabilities", async () => {
+    const identity = {
+      agentId: "agent-a",
+      runId: "run-conflict",
+      sessionId: "session-conflict",
+      sessionKey: "agent:agent-a:session-conflict",
+    };
+    const activeToken = mintAttemptCapability(identity, "sender-active");
+    const constructorToken = mintAttemptCapability(identity, "sender-constructor");
+    const controller = createControllerFixture({
+      requestIdentity: identity,
+      attemptToken: activeToken,
+      constructorToken,
+    });
+
+    const response = await runDownload(controller, "conflict");
+
+    expect(response).toMatchObject({ success: false });
+    expect(handleDownloadFile).not.toHaveBeenCalled();
+    expectNoCapabilityLeak(response, [activeToken, constructorToken]);
   });
 
   it.each([
-    { name: "tokened attempt", attemptToken: "opaque-attempt-capability" },
-    { name: "untokened attempt", attemptToken: undefined },
-  ])(
-    "rejects a different-session tool during a $name before its trusted Slack callback",
-    async ({ attemptToken }) => {
-      const observed: Array<unknown> = [];
-      const trustedSlackCallback = vi.fn();
-      const fixture = createControllerFixture(
-        attemptToken,
-        observed,
-        "opaque-other-session-capability",
-        "agent:test-agent:other-session",
-        trustedSlackCallback,
-      );
-
-      await fixture.controller.handleServerRequest(
-        {
-          id: "request-cross-session",
-          method: "item/tool/call",
-          params: {
-            threadId: "thread-1",
-            turnId: "turn-1",
-            callId: "cross-session",
-            namespace: null,
-            tool: "authority_probe",
-            arguments: {},
-          },
-        },
-        { threadId: "thread-1", turnId: "turn-1" },
-      );
-
-      expect(observed).toEqual([{ ok: false, reason: "token_conflict" }]);
-      expect(trustedSlackCallback).not.toHaveBeenCalled();
-    },
-  );
-
-  it("keeps the permission value out of Codex requests, transcripts, and stored tool records", async () => {
-    const permissionValue = "opaque-permission-value-that-must-not-be-recorded";
-    const observed: Array<unknown> = [];
-    const fixture = createControllerFixture(permissionValue, observed);
-    const request = {
-      id: "request-no-leak",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "no-leak",
-        namespace: null,
-        tool: "authority_probe",
-        arguments: { visible: "model-authored argument" },
+    {
+      name: "agent",
+      toolIdentity: {
+        agentId: "agent-b",
+        runId: "run-b",
+        sessionId: "session-a",
+        sessionKey: "agent:agent-a:session-a",
       },
+    },
+    {
+      name: "session",
+      toolIdentity: {
+        agentId: "agent-a",
+        runId: "run-a",
+        sessionId: "session-b",
+        sessionKey: "agent:agent-a:session-b",
+      },
+    },
+  ])("rejects a prebuilt message tool from a different $name", async ({ toolIdentity }) => {
+    const requestIdentity = {
+      agentId: "agent-a",
+      runId: "run-a",
+      sessionId: "session-a",
+      sessionKey: "agent:agent-a:session-a",
     };
-
-    const response = await fixture.controller.handleServerRequest(request, {
-      threadId: "thread-1",
-      turnId: "turn-1",
+    const activeToken = mintAttemptCapability(requestIdentity, "sender-a");
+    const controller = createControllerFixture({
+      requestIdentity,
+      attemptToken: activeToken,
+      toolIdentity,
     });
 
-    const externallyRecorded = {
-      request,
-      response,
-      toolBridgeCalls: fixture.handleToolCall.mock.calls,
-      transcriptCalls: fixture.projector.recordDynamicToolCall.mock.calls,
-      transcriptResults: fixture.projector.recordDynamicToolResult.mock.calls,
-      storedTrajectory: fixture.trajectoryRecorder.recordEvent.mock.calls,
+    const response = await runDownload(controller, `cross-${toolIdentity.agentId}`);
+
+    expect(response).toMatchObject({ success: false });
+    expect(handleDownloadFile).not.toHaveBeenCalled();
+    expectNoCapabilityLeak(response, [activeToken]);
+  });
+
+  it("isolates concurrent downloads across different agents and sessions", async () => {
+    const firstIdentity = {
+      agentId: "agent-a",
+      runId: "run-a",
+      sessionId: "session-a",
+      sessionKey: "agent:agent-a:session-a",
     };
-    expect(JSON.stringify(externallyRecorded)).not.toContain(permissionValue);
-    expect(observed).toEqual([{ ok: true, present: true, matchesExpected: true }]);
+    const secondIdentity = {
+      agentId: "agent-b",
+      runId: "run-b",
+      sessionId: "session-b",
+      sessionKey: "agent:agent-b:session-b",
+    };
+    const firstToken = mintAttemptCapability(firstIdentity, "sender-a");
+    const secondToken = mintAttemptCapability(secondIdentity, "sender-b");
+    let entered = 0;
+    let releaseOverlap: (() => void) | undefined;
+    const overlap = new Promise<void>((resolve) => {
+      releaseOverlap = resolve;
+    });
+    handleDownloadFile.mockImplementation(async (ctx) => {
+      entered += 1;
+      if (entered === 2) {
+        releaseOverlap?.();
+      }
+      await overlap;
+      return downloadFileResult(ctx);
+    });
+    const first = createControllerFixture({
+      requestIdentity: firstIdentity,
+      attemptToken: firstToken,
+    });
+    const second = createControllerFixture({
+      requestIdentity: secondIdentity,
+      attemptToken: secondToken,
+    });
+
+    const responses = await Promise.all([
+      runDownload(first, "concurrent-a"),
+      runDownload(second, "concurrent-b"),
+    ]);
+
+    expect(responses).toEqual([
+      expect.objectContaining({ success: true }),
+      expect.objectContaining({ success: true }),
+    ]);
+    expect(handleDownloadFile).toHaveBeenCalledTimes(2);
+    expect(
+      handleDownloadFile.mock.calls.map(([ctx]) => ({
+        fileId: ctx.params.fileId,
+        requesterSenderId: ctx.requesterSenderId,
+        sessionKey: ctx.sessionKey,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        {
+          fileId: "F-concurrent-a",
+          requesterSenderId: "sender-a",
+          sessionKey: firstIdentity.sessionKey,
+        },
+        {
+          fileId: "F-concurrent-b",
+          requesterSenderId: "sender-b",
+          sessionKey: secondIdentity.sessionKey,
+        },
+      ]),
+    );
+    expectNoCapabilityLeak(responses, [firstToken, secondToken]);
   });
 });

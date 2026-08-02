@@ -6,6 +6,11 @@ import {
   wrapToolWithGatewayCallerIdentity,
 } from "../agents/tools/gateway-caller-context.js";
 
+export {
+  mintMessageActionTurnCapability as mintMessageActionTurnCapabilityForTest,
+  revokeMessageActionTurnCapability as revokeMessageActionTurnCapabilityForTest,
+} from "../gateway/message-action-turn-capability.js";
+
 export function inspectGatewayToolCallerMessageActionCapabilityForTest(
   expectedToken?: string,
 ):

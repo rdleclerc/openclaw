@@ -452,13 +452,28 @@ async function executeSendWithResult(params: {
   toolOptions?: Partial<Parameters<typeof createMessageTool>[0]>;
   toolCallId?: string;
 }) {
-  const { config, getRuntimeConfig, ...toolOptions } = params.toolOptions ?? {};
-  const tool = createMessageTool({
+  return await executeSendWithMaterializedTool({
+    action: params.action,
+    tool: materializeSendTool(params.toolOptions),
+    toolCallId: params.toolCallId,
+  });
+}
+
+function materializeSendTool(toolOptionsInput?: Partial<Parameters<typeof createMessageTool>[0]>) {
+  const { config, getRuntimeConfig, ...toolOptions } = toolOptionsInput ?? {};
+  return createMessageTool({
     getRuntimeConfig: getRuntimeConfig ?? (config ? () => config : mocks.getRuntimeConfig),
     runMessageAction: mocks.runMessageAction as never,
     ...toolOptions,
   });
-  const result = await tool.execute(params.toolCallId ?? "1", {
+}
+
+async function executeSendWithMaterializedTool(params: {
+  action: Record<string, unknown>;
+  tool: ReturnType<typeof createMessageTool>;
+  toolCallId?: string;
+}) {
+  const result = await params.tool.execute(params.toolCallId ?? "1", {
     action: "send",
     ...params.action,
   });
@@ -3715,6 +3730,13 @@ describe("message tool sandbox passthrough", () => {
       },
     });
     mintedTurnCapabilities.push(token);
+    const tool = materializeSendTool({
+      agentId: "main",
+      agentSessionKey: "agent:main:runtime-policy",
+      runId: "run-1",
+      sessionId: "session-1",
+      requesterSenderId: "untrusted-constructor-sender",
+    });
 
     const call = await runWithGatewayToolCallerRequestContext(
       {
@@ -3723,16 +3745,10 @@ describe("message tool sandbox passthrough", () => {
         messageActionTurnCapability: token,
       },
       () =>
-        executeSend({
-          toolOptions: {
-            agentId: "main",
-            agentSessionKey: "agent:main:runtime-policy",
-            runId: "run-1",
-            sessionId: "session-1",
-            requesterSenderId: "untrusted-constructor-sender",
-          },
+        executeSendWithMaterializedTool({
+          tool,
           action: { target: "discord:123", message: "hi" },
-        }),
+        }).then(({ call: executedCall }) => executedCall),
     );
 
     expect(call?.messageActionAuthorization).toMatchObject({
@@ -3755,6 +3771,14 @@ describe("message tool sandbox passthrough", () => {
     const activeToken = mint("active-sender");
     const constructorToken = mint("constructor-sender");
     mintedTurnCapabilities.push(activeToken, constructorToken);
+    const tool = materializeSendTool({
+      agentId: "main",
+      agentSessionKey: "agent:main:runtime-policy",
+      runId: "run-1",
+      sessionId: "session-1",
+      messageActionTurnCapability: constructorToken,
+      requesterSenderId: "untrusted-constructor-sender",
+    });
 
     const call = await runWithGatewayToolCallerRequestContext(
       {
@@ -3763,17 +3787,10 @@ describe("message tool sandbox passthrough", () => {
         messageActionTurnCapability: activeToken,
       },
       () =>
-        executeSend({
-          toolOptions: {
-            agentId: "main",
-            agentSessionKey: "agent:main:runtime-policy",
-            runId: "run-1",
-            sessionId: "session-1",
-            messageActionTurnCapability: constructorToken,
-            requesterSenderId: "untrusted-constructor-sender",
-          },
+        executeSendWithMaterializedTool({
+          tool,
           action: { target: "discord:123", message: "hi" },
-        }),
+        }).then(({ call: executedCall }) => executedCall),
     );
 
     expect(call?.messageActionAuthorization).toEqual({
@@ -3871,6 +3888,13 @@ describe("message tool sandbox passthrough", () => {
       requesterSenderId: "trusted-sender",
     });
     revokeMessageActionTurnCapability(token);
+    const tool = materializeSendTool({
+      agentId: "main",
+      agentSessionKey: "agent:main:runtime-policy",
+      runId: "run-1",
+      sessionId: "session-1",
+      requesterSenderId: "untrusted-constructor-sender",
+    });
 
     const call = await runWithGatewayToolCallerRequestContext(
       {
@@ -3879,16 +3903,10 @@ describe("message tool sandbox passthrough", () => {
         messageActionTurnCapability: token,
       },
       () =>
-        executeSend({
-          toolOptions: {
-            agentId: "main",
-            agentSessionKey: "agent:main:runtime-policy",
-            runId: "run-1",
-            sessionId: "session-1",
-            requesterSenderId: "untrusted-constructor-sender",
-          },
+        executeSendWithMaterializedTool({
+          tool,
           action: { target: "discord:123", message: "hi" },
-        }),
+        }).then(({ call: executedCall }) => executedCall),
     );
 
     expect(call?.messageActionAuthorization).toEqual({
