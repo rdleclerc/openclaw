@@ -74,6 +74,7 @@ export function isScopedMessageActionAuthorized(
 
 export type MessageActionTurnCapabilityRejectionReason =
   | "token_missing"
+  | "token_conflict"
   | "token_unknown"
   | "expired"
   | "agent_mismatch"
@@ -92,7 +93,6 @@ type MessageActionTurnCapability = AgentRuntimeMessageActionContext & {
 };
 
 const capabilitiesByToken = new Map<string, MessageActionTurnCapability>();
-
 export function isTrustedMessageActionTurnIngress(provider: string | null | undefined): boolean {
   const normalized = normalizeMessageChannel(provider);
   return normalized !== undefined && isDeliverableMessageChannel(normalized);
