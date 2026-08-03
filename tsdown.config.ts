@@ -160,9 +160,10 @@ function nodeWorkspacePackageBuildConfig(packageDir: string, config: UserConfig 
 
 const bundledPluginBuildEntries = collectBundledPluginBuildEntries();
 const shouldBuildPrivateQaEntries = process.env.OPENCLAW_BUILD_PRIVATE_QA === "1";
+const packagedPrivatePluginSdkRuntimeEntrypoints = ["codex-native-task-runtime"];
 const productionPluginSdkEntrypoints = shouldBuildPrivateQaEntries
   ? pluginSdkEntrypoints
-  : publicPluginSdkEntrypoints;
+  : [...publicPluginSdkEntrypoints, ...packagedPrivatePluginSdkRuntimeEntrypoints];
 
 function buildBundledHookEntries(): Record<string, string> {
   const hooksRoot = path.join(process.cwd(), "src", "hooks", "bundled");

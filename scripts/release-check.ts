@@ -81,12 +81,27 @@ const rootPackageExcludedExtensionDirs = collectRootPackageExcludedExtensionDirs
 const rootPackageExcludedExtensionPrefixes = [...rootPackageExcludedExtensionDirs].map(
   (extensionId) => `dist/extensions/${extensionId}/`,
 );
+const packagedPrivatePluginSdkRuntimeEntrypoints = ["codex-native-task-runtime"] as const;
+const packagedPrivatePluginSdkRuntimeEntrypointSet = new Set<string>(
+  packagedPrivatePluginSdkRuntimeEntrypoints,
+);
+export function listPackagedPrivatePluginSdkRuntimeArtifacts() {
+  return packagedPrivatePluginSdkRuntimeEntrypoints.map((entry) => `dist/plugin-sdk/${entry}.js`);
+}
+export function listForbiddenPrivatePluginSdkPackArtifacts() {
+  return listPrivateLocalOnlyPluginSdkDistArtifacts().filter((artifact) => {
+    const match = /^dist\/plugin-sdk\/([^/]+)\.js$/u.exec(artifact);
+    const entry = match?.[1];
+    return !entry || !packagedPrivatePluginSdkRuntimeEntrypointSet.has(entry);
+  });
+}
 const requiredPathGroups = [
   "npm-shrinkwrap.json",
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
   ["dist/index.js", "dist/index.mjs"],
   ["dist/entry.js", "dist/entry.mjs"],
   ...listPluginSdkDistArtifacts(),
+  ...listPackagedPrivatePluginSdkRuntimeArtifacts(),
   ...listBundledPluginPackArtifacts(),
   ...listStaticExtensionAssetOutputs().filter((relativePath) => {
     const match = /^dist\/extensions\/([^/]+)\//u.exec(relativePath);
@@ -135,7 +150,7 @@ const forbiddenPrefixes = [
   "dist/plugin-sdk/src/plugin-sdk/qa-channel-protocol.d.ts",
   "dist/plugin-sdk/src/plugin-sdk/qa-lab.d.ts",
   "dist/plugin-sdk/src/plugin-sdk/qa-runtime.d.ts",
-  ...listPrivateLocalOnlyPluginSdkDistArtifacts(),
+  ...listForbiddenPrivatePluginSdkPackArtifacts(),
   "dist/qa-runtime-",
   "dist/plugin-sdk/.tsbuildinfo",
   "docs/.generated/",

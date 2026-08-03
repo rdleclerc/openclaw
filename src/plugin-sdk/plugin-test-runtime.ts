@@ -1,5 +1,39 @@
 // Focused public test helpers for plugin runtime, registry, and setup fixtures.
 
+import type { AnyAgentTool } from "../agents/tools/common.js";
+import {
+  resolveGatewayToolCallerMessageActionCapability,
+  wrapToolWithGatewayCallerIdentity,
+} from "../agents/tools/gateway-caller-context.js";
+
+export {
+  mintMessageActionTurnCapability as mintMessageActionTurnCapabilityForTest,
+  revokeMessageActionTurnCapability as revokeMessageActionTurnCapabilityForTest,
+} from "../gateway/message-action-turn-capability.js";
+
+export function inspectGatewayToolCallerMessageActionCapabilityForTest(
+  expectedToken?: string,
+):
+  | { ok: false; reason: "token_conflict" }
+  | { ok: true; present: boolean; matchesExpected: boolean } {
+  const resolution = resolveGatewayToolCallerMessageActionCapability(undefined);
+  if (!resolution.ok) {
+    return resolution;
+  }
+  return {
+    ok: true,
+    present: Boolean(resolution.token),
+    matchesExpected: resolution.token === expectedToken,
+  };
+}
+
+export function wrapToolWithGatewayCallerIdentityForTest(
+  tool: AnyAgentTool,
+  identity: { agentId: string; sessionKey: string; messageActionTurnCapability?: string },
+): AnyAgentTool {
+  return wrapToolWithGatewayCallerIdentity(tool, identity);
+}
+
 export { setDefaultChannelPluginRegistryForTests } from "../commands/channel-test-registry.js";
 export {
   createEmptyPluginRegistry,
