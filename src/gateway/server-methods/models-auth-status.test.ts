@@ -34,9 +34,6 @@ const mocks = vi.hoisted(() => ({
   removeProviderAuthProfilesWithLock: vi.fn(
     async (): Promise<AuthProfileStore | null> => ({ version: 1, profiles: {} }),
   ),
-  resolvePersistedAuthProfileOwnerAgentDir: vi.fn(
-    (params: { agentDir?: string }) => params.agentDir,
-  ),
   clearRuntimeAuthProfileStoreSnapshots: vi.fn(),
   refreshActiveProviderAuthRuntimeSnapshot: vi.fn(async () => false),
   clearCurrentProviderAuthState: vi.fn(),
@@ -67,7 +64,6 @@ vi.mock("../../agents/auth-profiles.js", async () => {
     listProfilesForProvider: mocks.listProfilesForProvider,
     removeAuthProfilesWithLock: mocks.removeAuthProfilesWithLock,
     removeProviderAuthProfilesWithLock: mocks.removeProviderAuthProfilesWithLock,
-    resolvePersistedAuthProfileOwnerAgentDir: mocks.resolvePersistedAuthProfileOwnerAgentDir,
     clearRuntimeAuthProfileStoreSnapshots: mocks.clearRuntimeAuthProfileStoreSnapshots,
   };
 });
@@ -230,9 +226,6 @@ function resetAuthStatusMocks(): void {
   mocks.listProfilesForProvider.mockReturnValue([]);
   mocks.removeAuthProfilesWithLock.mockResolvedValue({ version: 1, profiles: {} });
   mocks.removeProviderAuthProfilesWithLock.mockResolvedValue({ version: 1, profiles: {} });
-  mocks.resolvePersistedAuthProfileOwnerAgentDir.mockImplementation(
-    (params: { agentDir?: string }) => params.agentDir,
-  );
   mocks.buildAuthHealthSummary.mockReturnValue({
     now: 0,
     warnAfterMs: 0,
@@ -1307,9 +1300,8 @@ describe("models.authLogout", () => {
     expect((payload as ModelAuthLogoutResult).abortedRunIds).toEqual(["run-openrouter"]);
   });
 
-  it("removes inherited main-store auth profiles", async () => {
+  it("delegates inherited provider removal to the coordinated profile helper", async () => {
     mocks.listProfilesForProvider.mockReturnValue(["openrouter:main"]);
-    mocks.resolvePersistedAuthProfileOwnerAgentDir.mockReturnValue(undefined);
     const opts = createLogoutOptions({ provider: "openrouter" });
 
     await logoutHandler(opts);
@@ -1318,15 +1310,12 @@ describe("models.authLogout", () => {
       provider: "openrouter",
       agentDir: "/tmp/agent",
     });
-    expect(mocks.removeProviderAuthProfilesWithLock).toHaveBeenCalledWith({
-      provider: "openrouter",
-      agentDir: undefined,
-    });
+    expect(mocks.removeProviderAuthProfilesWithLock).toHaveBeenCalledTimes(1);
     const [ok] = firstRespondCall(opts) ?? [];
     expect(ok).toBe(true);
   });
 
-  it("cleans requester references when targeted auth is inherited", async () => {
+  it("delegates inherited targeted removal to the coordinated profile helper", async () => {
     const profileId = "openrouter:main";
     mocks.ensureAuthProfileStoreWithoutExternalProfiles.mockReturnValue({
       version: 1,
@@ -1341,7 +1330,6 @@ describe("models.authLogout", () => {
       },
     });
     mocks.listProfilesForProvider.mockReturnValue([profileId]);
-    mocks.resolvePersistedAuthProfileOwnerAgentDir.mockReturnValue(undefined);
     const opts = createLogoutOptions({ provider: "openrouter", profileIds: [profileId] });
 
     await logoutHandler(opts);
@@ -1350,10 +1338,7 @@ describe("models.authLogout", () => {
       profileIds: [profileId],
       agentDir: "/tmp/agent",
     });
-    expect(mocks.removeAuthProfilesWithLock).toHaveBeenCalledWith({
-      profileIds: [profileId],
-      agentDir: undefined,
-    });
+    expect(mocks.removeAuthProfilesWithLock).toHaveBeenCalledTimes(1);
     const [ok] = firstRespondCall(opts) ?? [];
     expect(ok).toBe(true);
   });

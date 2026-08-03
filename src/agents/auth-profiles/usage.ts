@@ -607,6 +607,22 @@ function updateUsageStatsEntry(
   store.usageStats[profileId] = updater(store.usageStats[profileId]);
 }
 
+function syncUsageStatsEntry(
+  store: AuthProfileStore,
+  profileId: string,
+  updated: AuthProfileStore,
+): void {
+  const next = updated.usageStats?.[profileId];
+  if (next) {
+    store.usageStats = { ...store.usageStats, [profileId]: next };
+  } else if (store.usageStats) {
+    delete store.usageStats[profileId];
+    if (Object.keys(store.usageStats).length === 0) {
+      store.usageStats = undefined;
+    }
+  }
+}
+
 function keepActiveWindowOrRecompute(params: {
   existingUntil: number | undefined;
   now: number;
@@ -759,6 +775,7 @@ export async function markAuthProfileFailure(params: {
   let updateTime = 0;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
+    persistedOwnerProfileId: profileId,
     updater: (freshStore) => {
       const profileValue = freshStore.profiles[profileId];
       if (!profileValue || isAuthCooldownBypassedForProvider(profileValue.provider)) {
@@ -804,7 +821,7 @@ export async function markAuthProfileFailure(params: {
     },
   });
   if (updated) {
-    store.usageStats = updated.usageStats;
+    syncUsageStatsEntry(store, profileId, updated);
     if (nextStats) {
       logAuthProfileFailureStateChange({
         runId,
@@ -897,6 +914,7 @@ export async function markAuthProfileBlockedUntil(params: {
   let updateTime = 0;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
+    persistedOwnerProfileId: profileId,
     updater: (freshStore) => {
       const profileLocal = freshStore.profiles[profileId];
       if (!profileLocal || isAuthCooldownBypassedForProvider(profileLocal.provider)) {
@@ -920,7 +938,7 @@ export async function markAuthProfileBlockedUntil(params: {
     },
   });
   if (updated) {
-    store.usageStats = updated.usageStats;
+    syncUsageStatsEntry(store, profileId, updated);
     if (nextStats) {
       logAuthProfileFailureStateChange({
         runId,
@@ -971,6 +989,7 @@ export async function clearAuthProfileCooldown(params: {
   const { store, profileId, agentDir } = params;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
+    persistedOwnerProfileId: profileId,
     updater: (freshStore) => {
       if (!freshStore.usageStats?.[profileId]) {
         return false;
@@ -981,7 +1000,7 @@ export async function clearAuthProfileCooldown(params: {
     },
   });
   if (updated) {
-    store.usageStats = updated.usageStats;
+    syncUsageStatsEntry(store, profileId, updated);
     return;
   }
   if (updated === null) {

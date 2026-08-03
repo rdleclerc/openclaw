@@ -3,6 +3,8 @@
  * Protects identity checks and persistence behavior when sub-agents refresh a
  * shared profile.
  */
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -10,7 +12,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { resetFileLockStateForTest } from "../../infra/file-lock.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { testing as externalAuthTesting } from "./external-auth.test-support.js";
-import "./oauth-file-lock-passthrough.test-support.js";
 import { getOAuthProviderRuntimeMocks } from "./oauth-common-mocks.test-support.js";
 import {
   OAUTH_AGENT_ENV_KEYS,
@@ -24,11 +25,15 @@ import {
 } from "./oauth-test-utils.js";
 import { resolveApiKeyForProfile } from "./oauth.js";
 import { resetOAuthRefreshQueuesForTest } from "./oauth.test-support.js";
+import { resolveAuthProfileOrder } from "./order.js";
+import { resolveAuthProfileDatabasePath } from "./sqlite.js";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
   ensureAuthProfileStore,
+  loadAuthProfileStoreForRuntime,
   saveAuthProfileStore,
 } from "./store.js";
+import { testing as storeTesting } from "./store.test-support.js";
 import type { AuthProfileStore, OAuthCredential } from "./types.js";
 
 const {
@@ -96,6 +101,7 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
     envSnapshot.restore();
     resetFileLockStateForTest();
     externalAuthTesting.resetResolveExternalAuthProfilesForTest();
+    storeTesting.resetRuntimeSnapshotPublisherForTest();
     clearRuntimeAuthProfileStoreSnapshots();
     resetOAuthRefreshQueuesForTest();
   });
@@ -106,14 +112,33 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
 
   it("mirrors refreshed Codex OAuth credentials into the main store", async () => {
     const profileId = "openai:default";
+    const backupId = "openai:backup";
     const provider = "openai";
     const accountId = "acct-shared";
     const freshExpiry = Date.now() + 60 * 60 * 1000;
+    const blockedUntil = Date.now() + 30 * 60 * 1000;
 
     const subAgentDir = path.join(tempRoot, "agents", "sub-mirror", "agent");
     await fs.mkdir(subAgentDir, { recursive: true });
-    saveAuthProfileStore(createExpiredOauthStore({ profileId, provider, accountId }), subAgentDir);
-    saveAuthProfileStore(createExpiredOauthStore({ profileId, provider, accountId }), mainAgentDir);
+    const childStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(childStore, profileId).expires = Date.now() - 30_000;
+    childStore.usageStats = {
+      [profileId]: { blockedUntil, blockedReason: "subscription_limit", blockedSource: "wham" },
+    };
+    childStore.lastGood = { openai: profileId };
+    const mainStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(mainStore, profileId).expires = Date.now() - 60_000;
+    mainStore.profiles[backupId] = {
+      type: "oauth",
+      provider,
+      access: "backup-access",
+      refresh: "backup-refresh",
+      expires: freshExpiry,
+      accountId: "acct-backup",
+    };
+    mainStore.order = { openai: [profileId, backupId] };
+    saveAuthProfileStore(childStore, subAgentDir);
+    saveAuthProfileStore(mainStore, mainAgentDir);
 
     refreshProviderOAuthCredentialWithPluginMock.mockImplementationOnce(
       async () =>
@@ -147,6 +172,140 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
         accountId,
       },
     );
+    expect(mainRaw.usageStats?.[profileId]).toEqual(childStore.usageStats[profileId]);
+    expect(mainRaw.lastGood?.openai).toBe(profileId);
+    expect(readAuthProfileStoreForTest(subAgentDir).usageStats?.[profileId]).toEqual(
+      childStore.usageStats[profileId],
+    );
+    const effective = loadAuthProfileStoreForRuntime(subAgentDir);
+    expect(effective.usageStats?.[profileId]?.blockedUntil).toBe(blockedUntil);
+    expect(resolveAuthProfileOrder({ store: effective, provider })).toEqual([backupId, profileId]);
+  });
+
+  it("reads child credential and lifecycle state under one nested transaction before mirroring", async () => {
+    const profileId = "openai:default";
+    const provider = "openai";
+    const accountId = "acct-shared";
+    const freshExpiry = Date.now() + 60 * 60 * 1000;
+    const subAgentDir = path.join(tempRoot, "agents", "sub-locked-snapshot", "agent");
+    await fs.mkdir(subAgentDir, { recursive: true });
+    const childStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(childStore, profileId).expires = Date.now() - 30_000;
+    childStore.usageStats = { [profileId]: { lastUsed: 1 } };
+    const mainStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(mainStore, profileId).expires = Date.now() - 60_000;
+    saveAuthProfileStore(childStore, subAgentDir);
+    saveAuthProfileStore(mainStore, mainAgentDir);
+
+    refreshProviderOAuthCredentialWithPluginMock.mockResolvedValueOnce({
+      type: "oauth",
+      provider,
+      access: "first-refresh-access",
+      refresh: "first-refresh-token",
+      expires: freshExpiry,
+      accountId,
+    } as never);
+
+    const runtimeStore = ensureAuthProfileStore(subAgentDir);
+    const markerPath = path.join(tempRoot, `child-writer-${caseIndex}.locked`);
+    let intercepted = false;
+    let writerDone: Promise<void> | undefined;
+    storeTesting.setRuntimeSnapshotPublisherForTest((publish) => {
+      publish();
+      if (intercepted) return;
+      intercepted = true;
+      const writer = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+        import { writeFileSync } from "node:fs";
+        import { DatabaseSync } from "node:sqlite";
+        const database = new DatabaseSync(process.env.AUTH_CHILD_DATABASE_PATH);
+        database.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+        const storeRow = database.prepare(
+          "SELECT store_json FROM auth_profile_store WHERE store_key = 'primary'",
+        ).get();
+        const stateRow = database.prepare(
+          "SELECT state_json FROM auth_profile_state WHERE state_key = 'primary'",
+        ).get();
+        const store = JSON.parse(storeRow.store_json);
+        const state = JSON.parse(stateRow.state_json);
+        store.profiles[process.env.AUTH_PROFILE_ID] = JSON.parse(process.env.AUTH_ADVANCED_CREDENTIAL);
+        state.usageStats = {
+          ...(state.usageStats ?? {}),
+          [process.env.AUTH_PROFILE_ID]: { blockedUntil: Number(process.env.AUTH_BLOCKED_UNTIL) },
+        };
+        database.prepare(
+          "UPDATE auth_profile_store SET store_json = ?, updated_at = ? WHERE store_key = 'primary'",
+        ).run(JSON.stringify(store), Date.now());
+        database.prepare(
+          "UPDATE auth_profile_state SET state_json = ?, updated_at = ? WHERE state_key = 'primary'",
+        ).run(JSON.stringify(state), Date.now());
+        writeFileSync(process.env.AUTH_LOCKED_MARKER, "locked");
+        setTimeout(() => {
+          database.exec("COMMIT");
+          database.close();
+        }, 500);
+      `,
+        ],
+        {
+          env: {
+            ...process.env,
+            AUTH_CHILD_DATABASE_PATH: resolveAuthProfileDatabasePath(subAgentDir),
+            AUTH_PROFILE_ID: profileId,
+            AUTH_ADVANCED_CREDENTIAL: JSON.stringify({
+              type: "oauth",
+              provider,
+              access: "second-refresh-access",
+              refresh: "second-refresh-token",
+              expires: freshExpiry + 60_000,
+              accountId,
+            }),
+            AUTH_BLOCKED_UNTIL: String(Date.now() + 30 * 60 * 1000),
+            AUTH_LOCKED_MARKER: markerPath,
+          },
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
+      let stderr = "";
+      writer.stderr?.setEncoding("utf8");
+      writer.stderr?.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      writerDone = new Promise((resolve, reject) => {
+        writer.once("error", reject);
+        writer.once("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`child writer exited ${code}: ${stderr}`));
+        });
+      });
+      const waitArray = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(markerPath) && Date.now() < deadline) {
+        Atomics.wait(waitArray, 0, 0, 10);
+      }
+      if (!existsSync(markerPath)) throw new Error("child writer did not acquire its transaction");
+    });
+
+    const startedAt = Date.now();
+    const result = await resolveApiKeyForProfileInTest(resolveApiKeyForProfile, {
+      store: runtimeStore,
+      profileId,
+      agentDir: subAgentDir,
+    });
+    await writerDone;
+
+    expect(intercepted).toBe(true);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(400);
+    expect(result?.apiKey).toBe("first-refresh-access");
+    expect(requireOAuthCredential(readAuthProfileStoreForTest(subAgentDir), profileId).access).toBe(
+      "second-refresh-access",
+    );
+    expect(
+      requireOAuthCredential(readAuthProfileStoreForTest(mainAgentDir), profileId).access,
+    ).toBe("cached-access-token");
   });
 
   it("does not mirror when refresh was performed from the main agent itself", async () => {
@@ -495,14 +654,23 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
     // The plugin-refreshed branch in doRefreshOAuthTokenWithLock has its own
     // mirror call; cover it separately so the branch is not orphaned.
     const profileId = "anthropic:plugin";
+    const unrelatedId = "openai:unrelated";
     const provider = "anthropic";
     const accountId = "acct-plugin";
     const freshExpiry = Date.now() + 60 * 60 * 1000;
 
     const subAgentDir = path.join(tempRoot, "agents", "sub-plugin", "agent");
     await fs.mkdir(subAgentDir, { recursive: true });
-    saveAuthProfileStore(createExpiredOauthStore({ profileId, provider, accountId }), subAgentDir);
-    saveAuthProfileStore(createExpiredOauthStore({ profileId, provider, accountId }), mainAgentDir);
+    const childStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(childStore, profileId).expires = Date.now() - 30_000;
+    const mainStore = createExpiredOauthStore({ profileId, provider, accountId });
+    requireOAuthCredential(mainStore, profileId).expires = Date.now() - 60_000;
+    mainStore.profiles[unrelatedId] = { type: "api_key", provider: "openai", key: "fixture" };
+    mainStore.usageStats = { [profileId]: { lastUsed: 1 }, [unrelatedId]: { lastUsed: 9 } };
+    mainStore.lastGood = { anthropic: profileId, openai: unrelatedId };
+    mainStore.order = { openai: [unrelatedId] };
+    saveAuthProfileStore(childStore, subAgentDir);
+    saveAuthProfileStore(mainStore, mainAgentDir);
 
     // Plugin returns a truthy refreshed credential — this takes the plugin
     // branch instead of falling through to getOAuthApiKey.
@@ -528,5 +696,10 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
     expect(mainCredential.access).toBe("plugin-refreshed-access");
     expect(mainCredential.refresh).toBe("plugin-refreshed-refresh");
     expect(mainCredential.expires).toBe(freshExpiry);
+    expect(mainRaw.usageStats?.[profileId]).toBeUndefined();
+    expect(mainRaw.lastGood?.anthropic).toBeUndefined();
+    expect(mainRaw.usageStats?.[unrelatedId]).toEqual({ lastUsed: 9 });
+    expect(mainRaw.lastGood?.openai).toBe(unrelatedId);
+    expect(mainRaw.order?.openai).toEqual([unrelatedId]);
   });
 });

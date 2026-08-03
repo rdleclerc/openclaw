@@ -22,6 +22,7 @@ import { resolveAgentDir, resolveDefaultAgentId } from "../agents/agent-scope.js
 import {
   listProfilesForProvider,
   loadAuthProfileStoreForRuntime,
+  removeProviderAuthProfilesWithLock,
 } from "../agents/auth-profiles.js";
 import { updateAuthProfileStoreWithLock } from "../agents/auth-profiles/store.js";
 import { buildExplicitSessionIdSessionKey } from "../agents/command/session.js";
@@ -951,31 +952,36 @@ async function runModelAuthLogout(provider: string, agent?: string) {
   const agentDir = resolveAgentDir(cfg, agentId);
   const store = loadAuthProfileStoreForRuntime(agentDir);
   const profileIds = listProfilesForProvider(store, provider);
-  const updated = await updateAuthProfileStoreWithLock({
-    agentDir,
-    updater: (nextStore) => {
-      let changed = false;
-      for (const profileId of profileIds) {
-        if (nextStore.profiles[profileId]) {
-          delete nextStore.profiles[profileId];
-          changed = true;
-        }
-        if (nextStore.usageStats?.[profileId]) {
-          delete nextStore.usageStats[profileId];
-          changed = true;
-        }
-      }
-      if (nextStore.order?.[provider]) {
-        delete nextStore.order[provider];
-        changed = true;
-      }
-      if (nextStore.lastGood?.[provider]) {
-        delete nextStore.lastGood[provider];
-        changed = true;
-      }
-      return changed;
-    },
-  });
+  const hasOAuthProfile = profileIds.some(
+    (profileId) => store.profiles[profileId]?.type === "oauth",
+  );
+  const updated = hasOAuthProfile
+    ? await removeProviderAuthProfilesWithLock({ provider, agentDir })
+    : await updateAuthProfileStoreWithLock({
+        agentDir,
+        updater: (nextStore) => {
+          let changed = false;
+          for (const profileId of profileIds) {
+            if (nextStore.profiles[profileId]) {
+              delete nextStore.profiles[profileId];
+              changed = true;
+            }
+            if (nextStore.usageStats?.[profileId]) {
+              delete nextStore.usageStats[profileId];
+              changed = true;
+            }
+          }
+          if (nextStore.order?.[provider]) {
+            delete nextStore.order[provider];
+            changed = true;
+          }
+          if (nextStore.lastGood?.[provider]) {
+            delete nextStore.lastGood[provider];
+            changed = true;
+          }
+          return changed;
+        },
+      });
   if (!updated) {
     throw new Error(`Failed to remove saved auth profiles for provider ${provider}.`);
   }
