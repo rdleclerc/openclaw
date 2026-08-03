@@ -29,6 +29,11 @@ const mocks = vi.hoisted(() => ({
   setRuntimeConfigSnapshot: vi.fn(),
   loadAuthProfileStoreForRuntime: vi.fn(() => ({ profiles: {}, order: {} })),
   listProfilesForProvider: vi.fn(() => []),
+  removeProviderAuthProfilesWithLock: vi.fn(async () => ({
+    version: 1,
+    profiles: {},
+    order: {},
+  })),
   resolveApiKeyForProvider: vi.fn(),
   resolveAgentDir: vi.fn((_cfg: unknown, agentId: string) => `/tmp/agent-${agentId}`),
   updateAuthProfileStoreWithLock: vi.fn(
@@ -264,6 +269,8 @@ vi.mock("../agents/auth-profiles.js", () => ({
     mocks.loadAuthProfileStoreForRuntime as unknown as typeof import("../agents/auth-profiles.js").loadAuthProfileStoreForRuntime,
   listProfilesForProvider:
     mocks.listProfilesForProvider as typeof import("../agents/auth-profiles.js").listProfilesForProvider,
+  removeProviderAuthProfilesWithLock:
+    mocks.removeProviderAuthProfilesWithLock as typeof import("../agents/auth-profiles.js").removeProviderAuthProfilesWithLock,
 }));
 
 vi.mock("../agents/model-auth.js", () => ({
@@ -487,6 +494,11 @@ describe("capability cli", () => {
       .mockResolvedValue([{ id: "gpt-5.4", provider: "openai", name: "GPT-5.4" }] as never);
     mocks.loadAuthProfileStoreForRuntime.mockReset().mockReturnValue({ profiles: {}, order: {} });
     mocks.listProfilesForProvider.mockReset().mockReturnValue([]);
+    mocks.removeProviderAuthProfilesWithLock.mockReset().mockResolvedValue({
+      version: 1,
+      profiles: {},
+      order: {},
+    } as never);
     mocks.resolveApiKeyForProvider.mockReset().mockRejectedValue(new Error("no auth profile"));
     mocks.resolveAgentDir.mockClear();
     mocks.resolveTtsConfig.mockReset().mockReturnValue({});
@@ -3218,6 +3230,36 @@ describe("capability cli", () => {
     expect(mocks.runtime.writeJson).toHaveBeenCalledWith({
       provider: "openai",
       removedProfiles: ["openai:default"],
+    });
+  });
+
+  it("routes inherited OAuth logout through the ownership coordinator", async () => {
+    mocks.loadAuthProfileStoreForRuntime.mockReturnValue({
+      profiles: {
+        "openai:inherited": {
+          type: "oauth",
+          provider: "openai",
+          access: "inherited-access",
+          refresh: "inherited-refresh",
+        },
+      },
+      order: { openai: ["openai:inherited"] },
+    } as never);
+    mocks.listProfilesForProvider.mockReturnValue(["openai:inherited"] as never);
+
+    await runRegisteredCli({
+      register: registerCapabilityCli as (program: Command) => void,
+      argv: ["capability", "model", "auth", "logout", "--provider", "openai", "--json"],
+    });
+
+    expect(mocks.removeProviderAuthProfilesWithLock).toHaveBeenCalledWith({
+      provider: "openai",
+      agentDir: "/tmp/agent-main",
+    });
+    expect(mocks.updateAuthProfileStoreWithLock).not.toHaveBeenCalled();
+    expect(mocks.runtime.writeJson).toHaveBeenCalledWith({
+      provider: "openai",
+      removedProfiles: ["openai:inherited"],
     });
   });
 

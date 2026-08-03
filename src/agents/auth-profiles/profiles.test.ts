@@ -3,9 +3,12 @@
  * Covers locked upserts, order promotion, last-good clearing, legacy OAuth file
  * imports, and credential normalization.
  */
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveOAuthDir } from "../../config/paths.js";
 import {
@@ -21,6 +24,7 @@ import {
   clearLastGoodProfileWithLock,
   promoteAuthProfileInOrder,
   removeAuthProfilesWithLock,
+  removeProviderAuthProfilesWithLock,
   upsertAuthProfileWithLock,
 } from "./profiles.js";
 import {
@@ -41,6 +45,7 @@ import {
   restoreAuthProfileStorePersistenceSnapshot,
   saveAuthProfileStoreIfPersistenceSnapshotMatches,
   saveAuthProfileStore,
+  updateAuthProfileStoreWithLock,
 } from "./store.js";
 import { testing as storeTesting } from "./store.test-support.js";
 import type { AuthProfileStore, RuntimeAuthProfileStore } from "./types.js";
@@ -120,7 +125,832 @@ function expectOAuthCredentialFields(
   return credential;
 }
 
+function spawnAuthFixture(source: string, env: Record<string, string>) {
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const done = new Promise<string>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) =>
+      code === 0 ? resolve(stdout) : reject(new Error(`fixture exited ${code}: ${stderr}`)),
+    );
+  });
+  const waitFor = async (text: string) => {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (stdout.includes(text)) return;
+      if (child.exitCode !== null) throw new Error(`fixture exited before ${text}: ${stderr}`);
+      await delay(10);
+    }
+    throw new Error(`fixture did not emit ${text}: ${stderr}`);
+  };
+  return { child, done, waitFor };
+}
+
+function spawnAuthRaceWorker(env: Record<string, string>) {
+  const storeUrl = new URL("./store.ts", import.meta.url).href;
+  const persistedUrl = new URL("./persisted.ts", import.meta.url).href;
+  const profilesUrl = new URL("./profiles.ts", import.meta.url).href;
+  const sqliteUrl = new URL("./sqlite.ts", import.meta.url).href;
+  const upsertUrl = new URL("./upsert-with-lock.ts", import.meta.url).href;
+  const agentDbUrl = new URL("../../state/openclaw-agent-db.ts", import.meta.url).href;
+  return spawnAuthFixture(
+    `
+      const { updateAuthProfileStoreWithLock } = await import(${JSON.stringify(storeUrl)});
+      const { loadPersistedAuthProfileStore } = await import(${JSON.stringify(persistedUrl)});
+      const { removeAuthProfilesWithLock } = await import(${JSON.stringify(profilesUrl)});
+      const { runAuthProfileWriteTransaction } = await import(${JSON.stringify(sqliteUrl)});
+      const { upsertAuthProfileWithLock } = await import(${JSON.stringify(upsertUrl)});
+      const { closeOpenClawAgentDatabasesForTest } = await import(${JSON.stringify(agentDbUrl)});
+      console.log("ready");
+      await new Promise((resolve) => process.stdin.once("data", resolve));
+      const started = Date.now();
+      const profileId = process.env.AUTH_RACE_PROFILE_ID;
+      const childDir = process.env.AUTH_RACE_CHILD_DIR;
+      const action = process.env.AUTH_RACE_ACTION;
+      const takeover = action === "takeover";
+      let result;
+      if (action === "upsert") {
+        result = await upsertAuthProfileWithLock({
+          agentDir: childDir,
+          profileId,
+          credential: JSON.parse(process.env.AUTH_RACE_CREDENTIAL),
+        });
+      } else if (action === "remove") {
+        result = await removeAuthProfilesWithLock({
+          agentDir: childDir,
+          profileIds: [profileId],
+        });
+      } else {
+        result = await updateAuthProfileStoreWithLock({
+            agentDir: takeover ? undefined : childDir,
+            persistedOwnerProfileId: takeover ? undefined : profileId,
+            updater: (store) => {
+              if (takeover) {
+                const source = runAuthProfileWriteTransaction(childDir, (database) =>
+                  loadPersistedAuthProfileStore(childDir, { database }),
+                );
+                const credential = source?.profiles[profileId];
+                if (!credential) return false;
+                store.profiles[profileId] = structuredClone(credential);
+                const usage = source.usageStats?.[profileId];
+                if (usage) store.usageStats = { ...store.usageStats, [profileId]: structuredClone(usage) };
+              } else {
+                store.usageStats = {
+                  ...store.usageStats,
+                  [profileId]: { blockedUntil: Number(process.env.AUTH_RACE_BLOCKED_UNTIL) },
+                };
+              }
+              return true;
+            },
+          });
+      }
+      closeOpenClawAgentDatabasesForTest();
+      console.log(JSON.stringify({ ok: result !== null, elapsedMs: Date.now() - started }));
+    `,
+    env,
+  );
+}
+
+function spawnAuthLockHolder(
+  databasePath: string,
+  replacement?: AuthProfileStore["profiles"][string],
+) {
+  return spawnAuthFixture(
+    `
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(process.env.AUTH_RACE_DATABASE_PATH);
+      db.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+      if (process.env.AUTH_RACE_REPLACEMENT) {
+        const row = db.prepare("SELECT store_json FROM auth_profile_store WHERE store_key = 'primary'").get();
+        const store = JSON.parse(row.store_json);
+        store.profiles[process.env.AUTH_RACE_PROFILE_ID] = JSON.parse(process.env.AUTH_RACE_REPLACEMENT);
+        db.prepare("UPDATE auth_profile_store SET store_json = ?, updated_at = ? WHERE store_key = 'primary'")
+          .run(JSON.stringify(store), Date.now());
+      }
+      console.log("locked");
+      await new Promise((resolve) => process.stdin.once("data", resolve));
+      db.exec("COMMIT");
+      db.close();
+    `,
+    {
+      AUTH_RACE_DATABASE_PATH: databasePath,
+      AUTH_RACE_PROFILE_ID: "openai:primary",
+      ...(replacement ? { AUTH_RACE_REPLACEMENT: JSON.stringify(replacement) } : {}),
+    },
+  );
+}
+
+async function waitForSqliteWriteLock(databasePath: string): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const probe = new DatabaseSync(databasePath);
+    probe.exec("PRAGMA busy_timeout = 0");
+    try {
+      probe.exec("BEGIN IMMEDIATE; ROLLBACK");
+    } catch {
+      probe.close();
+      return;
+    }
+    probe.close();
+    await delay(10);
+  }
+  throw new Error(`database did not become write-locked: ${databasePath}`);
+}
+
+function authRaceResult(stdout: string): { ok: boolean; elapsedMs: number } {
+  const line = stdout
+    .trim()
+    .split("\n")
+    .findLast((entry) => entry.startsWith("{"));
+  if (!line) throw new Error(`missing race result: ${stdout}`);
+  return JSON.parse(line) as { ok: boolean; elapsedMs: number };
+}
+
 describe("promoteAuthProfileInOrder", () => {
+  it("publishes a child-owner update before releasing the coordinating main transaction", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-child-publication-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const expires = Date.now() + 120_000;
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "main-old",
+              refresh: "refresh",
+              expires: expires - 60_000,
+              accountId: "acct",
+            },
+          },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [profileId]: {
+                type: "oauth",
+                provider: "openai",
+                access: "child-new",
+                refresh: "refresh",
+                expires,
+                accountId: "acct",
+              },
+            },
+          },
+          childDir,
+        );
+        let publishedWhileMainLocked = false;
+        storeTesting.setRuntimeSnapshotPublisherForTest((publish) => {
+          const probe = new DatabaseSync(resolveAuthProfileDatabasePath());
+          probe.exec("PRAGMA busy_timeout = 0");
+          expect(() => probe.exec("BEGIN IMMEDIATE")).toThrow();
+          probe.close();
+          publishedWhileMainLocked = true;
+          publish();
+        });
+
+        await updateAuthProfileStoreWithLock({
+          agentDir: childDir,
+          persistedOwnerProfileId: profileId,
+          updater: (store) => {
+            store.usageStats = { [profileId]: { lastUsed: 7 } };
+            return true;
+          },
+        });
+
+        expect(publishedWhileMainLocked).toBe(true);
+        expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]).toEqual({
+          lastUsed: 7,
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("serializes a direct child OAuth upsert behind the main ownership snapshot", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-upsert-race-",
+      async ({ stateDir, agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        const mainCredential = {
+          type: "oauth" as const,
+          provider: "openai",
+          access: "main-before-snapshot",
+          refresh: "main-refresh",
+          expires: now + 60_000,
+          accountId: "acct",
+        };
+        const mainSnapshot = {
+          ...mainCredential,
+          access: "main-snapshot",
+          expires: now + 120_000,
+        };
+        const upsertCredential = {
+          ...mainCredential,
+          access: "direct-upsert",
+          refresh: "direct-upsert-refresh",
+          expires: now + 180_000,
+        };
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: { [profileId]: mainCredential },
+        });
+        saveAuthProfileStore({ version: AUTH_STORE_VERSION, profiles: {} }, childDir);
+
+        const mainHolder = spawnAuthLockHolder(resolveAuthProfileDatabasePath(), mainSnapshot);
+        await mainHolder.waitFor("locked");
+        const upsert = spawnAuthRaceWorker({
+          OPENCLAW_STATE_DIR: stateDir,
+          AUTH_RACE_ACTION: "upsert",
+          AUTH_RACE_PROFILE_ID: profileId,
+          AUTH_RACE_CHILD_DIR: childDir,
+          AUTH_RACE_CREDENTIAL: JSON.stringify(upsertCredential),
+        });
+        try {
+          await upsert.waitFor("ready");
+          upsert.child.stdin.end("go\n");
+          const completedWhileMainSnapshotHeld = await Promise.race([
+            upsert.done.then(() => true),
+            delay(500).then(() => false),
+          ]);
+          expect(completedWhileMainSnapshotHeld).toBe(false);
+          mainHolder.child.stdin.end("release\n");
+          await mainHolder.done;
+          expect(authRaceResult(await upsert.done).ok).toBe(true);
+        } finally {
+          if (mainHolder.child.exitCode === null) {
+            mainHolder.child.stdin.end("release\n");
+            await mainHolder.done;
+          }
+        }
+
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+          access: "direct-upsert",
+          refresh: "direct-upsert-refresh",
+        });
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toBeUndefined();
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("writes a child-targeted different OAuth identity to the child owner", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-upsert-identity-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        const mainCredential = {
+          type: "oauth" as const,
+          provider: "openai",
+          access: "main-account-a",
+          refresh: "main-refresh-a",
+          expires: now + 180_000,
+          accountId: "account-a",
+        };
+        const inheritedChildCredential = {
+          ...mainCredential,
+          access: "child-stale-account-a",
+          expires: now + 120_000,
+        };
+        const replacement = {
+          ...mainCredential,
+          access: "child-account-b",
+          refresh: "child-refresh-b",
+          expires: now + 240_000,
+          accountId: "account-b",
+        };
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: { [profileId]: inheritedChildCredential },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: { [profileId]: mainCredential },
+        });
+
+        await upsertAuthProfileWithLock({
+          agentDir: childDir,
+          profileId,
+          credential: replacement,
+        });
+
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+          access: "main-account-a",
+          accountId: "account-a",
+        });
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toMatchObject({
+          access: "child-account-b",
+          accountId: "account-b",
+        });
+        expect(loadAuthProfileStoreForRuntime(childDir).profiles[profileId]).toMatchObject({
+          access: "child-account-b",
+          accountId: "account-b",
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("adopts the authoritative inherited OAuth credential over a freshness regression", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-upsert-freshness-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        const mainCredential = {
+          type: "oauth" as const,
+          provider: "openai",
+          access: "main-fresh",
+          refresh: "main-refresh",
+          expires: now + 180_000,
+          accountId: "account-a",
+        };
+        const inheritedChildCredential = {
+          ...mainCredential,
+          access: "child-stale",
+          expires: now + 120_000,
+        };
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: { [profileId]: inheritedChildCredential },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: { [profileId]: mainCredential },
+        });
+
+        const updated = await upsertAuthProfileWithLock({
+          agentDir: childDir,
+          profileId,
+          credential: {
+            ...mainCredential,
+            access: "regressing-upsert",
+            refresh: "regressing-refresh",
+            expires: now + 60_000,
+          },
+        });
+
+        expect(updated?.profiles[profileId]).toMatchObject({ access: "main-fresh" });
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+          access: "main-fresh",
+          expires: now + 180_000,
+        });
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toMatchObject({
+          access: "child-stale",
+          expires: now + 120_000,
+        });
+        expect(loadAuthProfileStoreForRuntime(childDir).profiles[profileId]).toMatchObject({
+          access: "main-fresh",
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("removes main and stale child OAuth material after a child snapshot", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-remove-race-",
+      async ({ stateDir, agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        const mainCredential = {
+          type: "oauth" as const,
+          provider: "openai",
+          access: "main-current",
+          refresh: "main-refresh",
+          expires: now + 180_000,
+          accountId: "account-a",
+        };
+        const childSnapshot = {
+          ...mainCredential,
+          access: "child-stale-snapshot",
+          expires: now + 60_000,
+        };
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: { [profileId]: mainCredential },
+        });
+        saveAuthProfileStore({ version: AUTH_STORE_VERSION, profiles: {} }, childDir);
+
+        const childHolder = spawnAuthLockHolder(
+          resolveAuthProfileDatabasePath(childDir),
+          childSnapshot,
+        );
+        await childHolder.waitFor("locked");
+        const removal = spawnAuthRaceWorker({
+          OPENCLAW_STATE_DIR: stateDir,
+          AUTH_RACE_ACTION: "remove",
+          AUTH_RACE_PROFILE_ID: profileId,
+          AUTH_RACE_CHILD_DIR: childDir,
+        });
+        try {
+          await removal.waitFor("ready");
+          removal.child.stdin.end("go\n");
+          await waitForSqliteWriteLock(resolveAuthProfileDatabasePath());
+          const completedWhileChildSnapshotHeld = await Promise.race([
+            removal.done.then(() => true),
+            delay(500).then(() => false),
+          ]);
+          expect(completedWhileChildSnapshotHeld).toBe(false);
+          childHolder.child.stdin.end("release\n");
+          await childHolder.done;
+          expect(authRaceResult(await removal.done).ok).toBe(true);
+        } finally {
+          if (childHolder.child.exitCode === null) {
+            childHolder.child.stdin.end("release\n");
+            await childHolder.done;
+          }
+        }
+
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toBeUndefined();
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toBeUndefined();
+        expect(loadAuthProfileStoreForRuntime(childDir).profiles[profileId]).toBeUndefined();
+      },
+      { clearOAuthDir: true },
+    );
+  }, 10_000);
+
+  it("preserves a different-identity main OAuth profile during child-targeted removal", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-remove-identity-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "main-account-a",
+              refresh: "main-refresh-a",
+              expires: now + 180_000,
+              accountId: "account-a",
+            },
+          },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [profileId]: {
+                type: "oauth",
+                provider: "openai",
+                access: "child-account-b",
+                refresh: "child-refresh-b",
+                expires: now + 240_000,
+                accountId: "account-b",
+              },
+            },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+
+        await removeAuthProfilesWithLock({ agentDir: childDir, profileIds: [profileId] });
+
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toBeUndefined();
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+          access: "main-account-a",
+          accountId: "account-a",
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("preserves a different-identity main OAuth profile during provider-wide force cleanup", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-provider-remove-identity-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "main-account-a",
+              refresh: "main-refresh-a",
+              expires: now + 180_000,
+              accountId: "account-a",
+            },
+          },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [profileId]: {
+                type: "oauth",
+                provider: "openai",
+                access: "child-account-b",
+                refresh: "child-refresh-b",
+                expires: now + 240_000,
+                accountId: "account-b",
+              },
+              "openai:child-token": {
+                type: "token",
+                provider: "openai",
+                token: "child-token",
+              },
+            },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+
+        await removeProviderAuthProfilesWithLock({ provider: "openai", agentDir: childDir });
+
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles).toEqual({});
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+          access: "main-account-a",
+          accountId: "account-a",
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("does not leak main lifecycle state into a child-owned OAuth overlay", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-oauth-lifecycle-overlay-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "main-account-a",
+              refresh: "main-refresh-a",
+              expires: now + 180_000,
+              accountId: "account-a",
+            },
+          },
+          usageStats: { [profileId]: { blockedUntil: now + 60_000 } },
+          lastGood: { openai: profileId },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [profileId]: {
+                type: "oauth",
+                provider: "openai",
+                access: "child-account-b",
+                refresh: "child-refresh-b",
+                expires: now + 240_000,
+                accountId: "account-b",
+              },
+            },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+
+        const runtime = loadAuthProfileStoreForRuntime(childDir);
+        expect(runtime.profiles[profileId]).toMatchObject({ accountId: "account-b" });
+        expect(runtime.usageStats?.[profileId]).toBeUndefined();
+        expect(runtime.lastGood?.openai).toBeUndefined();
+        expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]).toEqual({
+          blockedUntil: now + 60_000,
+        });
+        expect(loadPersistedAuthProfileStore()?.lastGood?.openai).toBe(profileId);
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("keeps parent non-OAuth credentials while removing provider auth from child scope", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-provider-remove-scope-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openrouter:oauth";
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [profileId]: {
+                type: "oauth",
+                provider: "openrouter",
+                access: "child-stale-oauth",
+                refresh: "child-stale-refresh",
+                expires: Date.now() + 60_000,
+              },
+              "openrouter:child-token": {
+                type: "token",
+                provider: "openrouter",
+                token: "child-token",
+              },
+              "anthropic:child-key": {
+                type: "api_key",
+                provider: "anthropic",
+                key: "anthropic-key",
+              },
+            },
+          },
+          childDir,
+          { filterExternalAuthProfiles: false },
+        );
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openrouter",
+              access: "main-oauth",
+              refresh: "main-refresh",
+              expires: Date.now() + 120_000,
+            },
+            "openrouter:main-key": {
+              type: "api_key",
+              provider: "openrouter",
+              key: "main-key",
+            },
+          },
+        });
+
+        await removeProviderAuthProfilesWithLock({
+          provider: "openrouter",
+          agentDir: childDir,
+        });
+
+        expect(loadPersistedAuthProfileStore()?.profiles).toMatchObject({
+          "openrouter:main-key": { type: "api_key", key: "main-key" },
+        });
+        expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toBeUndefined();
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles).toMatchObject({
+          "anthropic:child-key": { type: "api_key", key: "anthropic-key" },
+        });
+        expect(
+          loadPersistedAuthProfileStore(childDir)?.profiles["openrouter:child-token"],
+        ).toBeUndefined();
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[profileId]).toBeUndefined();
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("serializes writer-first, takeover-first, and main-lock timeout interleavings", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-owner-races-",
+      async ({ stateDir, agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:primary";
+        const now = Date.now();
+        const mainCredential = {
+          type: "oauth" as const,
+          provider: "openai",
+          access: "main-old",
+          refresh: "refresh",
+          expires: now + 60_000,
+          accountId: "acct",
+        };
+        const childCredential = {
+          ...mainCredential,
+          access: "child-new",
+          expires: now + 120_000,
+        };
+        const seed = () => {
+          saveAuthProfileStore({
+            version: AUTH_STORE_VERSION,
+            profiles: { [profileId]: mainCredential },
+            usageStats: { [profileId]: { lastUsed: 0 } },
+          });
+          saveAuthProfileStore(
+            {
+              version: AUTH_STORE_VERSION,
+              profiles: { [profileId]: childCredential },
+              usageStats: { [profileId]: { lastUsed: 1 } },
+            },
+            childDir,
+          );
+        };
+        const worker = (action: "update" | "takeover", blockedUntil: number) =>
+          spawnAuthRaceWorker({
+            OPENCLAW_STATE_DIR: stateDir,
+            AUTH_RACE_ACTION: action,
+            AUTH_RACE_PROFILE_ID: profileId,
+            AUTH_RACE_CHILD_DIR: childDir,
+            AUTH_RACE_BLOCKED_UNTIL: String(blockedUntil),
+          });
+        const start = async (fixture: ReturnType<typeof spawnAuthRaceWorker>) => {
+          await fixture.waitFor("ready");
+          fixture.child.stdin.end("go\n");
+        };
+        const release = async (fixture: ReturnType<typeof spawnAuthLockHolder>) => {
+          if (fixture.child.exitCode === null) fixture.child.stdin.end("release\n");
+          await fixture.done;
+        };
+        const mainPath = resolveAuthProfileDatabasePath();
+        const childPath = resolveAuthProfileDatabasePath(childDir);
+
+        seed();
+        const childHolder = spawnAuthLockHolder(childPath);
+        await childHolder.waitFor("locked");
+        try {
+          const writer = worker("update", now + 300_000);
+          await start(writer);
+          await waitForSqliteWriteLock(mainPath);
+          const takeover = worker("takeover", 0);
+          await start(takeover);
+          await release(childHolder);
+          expect(authRaceResult(await writer.done).ok).toBe(true);
+          expect(authRaceResult(await takeover.done).ok).toBe(true);
+        } finally {
+          if (childHolder.child.exitCode === null) await release(childHolder);
+        }
+        expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]?.blockedUntil).toBe(
+          now + 300_000,
+        );
+        expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]?.blockedUntil).toBe(
+          now + 300_000,
+        );
+
+        seed();
+        const mainHolder = spawnAuthLockHolder(mainPath, {
+          ...childCredential,
+          access: "main-takeover",
+          expires: now + 180_000,
+        });
+        await mainHolder.waitFor("locked");
+        const takeoverFollower = worker("update", now + 400_000);
+        try {
+          await start(takeoverFollower);
+          const completedWhileHeld = await Promise.race([
+            takeoverFollower.done.then(() => true),
+            delay(500).then(() => false),
+          ]);
+          expect(completedWhileHeld).toBe(false);
+          await release(mainHolder);
+          expect(authRaceResult(await takeoverFollower.done).ok).toBe(true);
+        } finally {
+          if (mainHolder.child.exitCode === null) await release(mainHolder);
+        }
+        expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]?.blockedUntil).toBe(
+          now + 400_000,
+        );
+        expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]).toEqual({
+          lastUsed: 1,
+        });
+
+        seed();
+        const slowMainHolder = spawnAuthLockHolder(mainPath);
+        await slowMainHolder.waitFor("locked");
+        const timedOut = worker("update", now + 500_000);
+        try {
+          await start(timedOut);
+          const result = authRaceResult(await timedOut.done);
+          expect(result.ok).toBe(false);
+          expect(result.elapsedMs).toBeGreaterThanOrEqual(4_500);
+        } finally {
+          await release(slowMainHolder);
+        }
+        expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]).toEqual({
+          lastUsed: 1,
+        });
+      },
+      { clearOAuthDir: true },
+    );
+  }, 20_000);
+
   it("refreshes inherited main selection state without advancing credential ownership", async () => {
     await withAuthProfileTestState(
       "openclaw-auth-profile-main-selection-",
@@ -1282,6 +2112,40 @@ describe("promoteAuthProfileInOrder", () => {
 
       expect(loadAuthProfileStoreForRuntime(agentDir).lastGood).toBeUndefined();
     });
+  });
+
+  it("clears an inherited main lastGood pointer from requested child scope", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-clear-inherited-lastgood-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const profileId = "openai:default";
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [profileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "stale-access-token",
+              refresh: "stale-refresh-token",
+              expires: Date.now() - 60_000,
+            },
+          },
+          lastGood: { openai: profileId },
+        });
+        saveAuthProfileStore({ version: AUTH_STORE_VERSION, profiles: {} }, childDir);
+
+        await clearLastGoodProfileWithLock({
+          agentDir: childDir,
+          provider: "openai",
+          profileId,
+        });
+
+        expect(loadPersistedAuthProfileStore()?.lastGood).toBeUndefined();
+        expect(loadPersistedAuthProfileStore(childDir)?.lastGood).toBeUndefined();
+      },
+      { clearOAuthDir: true },
+    );
   });
 
   it("removes selected profiles while preserving unrelated provider credentials", async () => {

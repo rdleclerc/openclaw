@@ -23,7 +23,6 @@ import {
   listProfilesForProvider,
   removeAuthProfilesWithLock,
   removeProviderAuthProfilesWithLock,
-  resolvePersistedAuthProfileOwnerAgentDir,
 } from "../../agents/auth-profiles.js";
 import type { AuthCredentialReasonCode } from "../../agents/auth-profiles/credential-state.js";
 import {
@@ -212,65 +211,6 @@ function createAuthLogoutAbortOps(context: GatewayRequestContext): ChatAbortOps 
     broadcast: context.broadcast,
     nodeSendToSession: context.nodeSendToSession,
   };
-}
-
-// Auth profiles can be adopted by a provider-specific owner agent dir. Logout
-// must remove every owning store or stale profiles reappear on the next status
-// read and provider-auth warmup.
-async function removeProviderAuthProfilesAcrossOwnerStores(params: {
-  provider: string;
-  agentDir: string;
-  profileIds: string[];
-}): Promise<boolean> {
-  const ownerAgentDirs = new Set<string | undefined>([params.agentDir]);
-  for (const profileId of params.profileIds) {
-    ownerAgentDirs.add(
-      resolvePersistedAuthProfileOwnerAgentDir({
-        agentDir: params.agentDir,
-        profileId,
-      }),
-    );
-  }
-  for (const ownerAgentDir of ownerAgentDirs) {
-    const updatedStore = await removeProviderAuthProfilesWithLock({
-      provider: params.provider,
-      agentDir: ownerAgentDir,
-    });
-    if (!updatedStore) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Targeted UI logout preserves API-key and unrelated profiles. Ownership is
-// resolved before each locked store mutation so inherited profiles stay gone.
-async function removeAuthProfilesAcrossOwnerStores(params: {
-  agentDir: string;
-  profileIds: string[];
-}): Promise<boolean> {
-  const profilesByOwner = new Map<string | undefined, Set<string>>([
-    [params.agentDir, new Set(params.profileIds)],
-  ]);
-  for (const profileId of params.profileIds) {
-    const ownerAgentDir = resolvePersistedAuthProfileOwnerAgentDir({
-      agentDir: params.agentDir,
-      profileId,
-    });
-    const ownerProfiles = profilesByOwner.get(ownerAgentDir) ?? new Set<string>();
-    ownerProfiles.add(profileId);
-    profilesByOwner.set(ownerAgentDir, ownerProfiles);
-  }
-  for (const [ownerAgentDir, profileIds] of profilesByOwner) {
-    const updatedStore = await removeAuthProfilesWithLock({
-      profileIds: [...profileIds],
-      agentDir: ownerAgentDir,
-    });
-    if (!updatedStore) {
-      return false;
-    }
-  }
-  return true;
 }
 
 // UI expiry fields are emitted only when both timestamp and remaining duration
@@ -596,11 +536,10 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
         return;
       }
       const removed = selection.profileIds
-        ? await removeAuthProfilesAcrossOwnerStores({ agentDir, profileIds: removedProfiles })
-        : await removeProviderAuthProfilesAcrossOwnerStores({
+        ? await removeAuthProfilesWithLock({ agentDir, profileIds: removedProfiles })
+        : await removeProviderAuthProfilesWithLock({
             provider,
             agentDir,
-            profileIds: removedProfiles,
           });
       if (!removed) {
         respond(
