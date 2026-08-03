@@ -614,6 +614,40 @@ describe("resolveSlackMedia", () => {
     expect(media[0]?.contentType).toBe("video/mp4");
   });
 
+  it("forwards Slack Markdown metadata when the download response is force-download", async () => {
+    saveMediaBufferMock.mockResolvedValue(createSavedMedia("/tmp/nippon-soda.md", "text/markdown"));
+    mockFetch.mockResolvedValueOnce(
+      new Response(Buffer.from("# Nippon Soda\n"), {
+        status: 200,
+        headers: { "content-type": "application/force-download" },
+      }),
+    );
+
+    const result = await resolveSlackMedia({
+      files: [
+        {
+          id: "F0BMLP5JBTP",
+          name: "Nippon Soda.md",
+          mimetype: "text/markdown",
+          url_private_download: "https://files.slack.com/files-pri/T1-F0BMLP5JBTP/Nippon-Soda.md",
+        },
+      ],
+      token: "slack-test-token",
+      maxBytes: 1024 * 1024,
+    });
+
+    const media = expectSlackMediaResult(result);
+    expect(media[0]?.placeholder).toContain("Nippon Soda.md");
+    const saveOptions = requireRecord(
+      requireMockCall(saveRemoteMediaMock, 0, "saveRemoteMedia")[0],
+      "saveRemoteMedia options",
+    );
+    expect(saveOptions).toMatchObject({
+      filePathHint: "Nippon Soda.md",
+      fallbackContentType: "text/markdown",
+    });
+  });
+
   it("falls through to next file when first file returns error", async () => {
     saveMediaBufferMock.mockResolvedValue(createSavedMedia("/tmp/test.jpg", "image/jpeg"));
 
