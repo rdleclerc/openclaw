@@ -2495,9 +2495,8 @@ describe("runCodexAppServerSideQuestion", () => {
 
     await expect(
       runCodexAppServerSideQuestion(
-sideParams({
-  agentId: "main",
-  opts: { runId: "side-run" },
+        sideParams({
+          agentId: "main",
           sessionKey: runSessionKey,
           sandboxSessionKey,
           messageProvider: "slack",
