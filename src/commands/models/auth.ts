@@ -1061,7 +1061,8 @@ export async function runModelsAuthLoginFlow(
     // profile and no auth flow started. This is the documented escape
     // hatch for stuck OAuth credentials (expired token, swapped account,
     // etc.) where `auth login` would otherwise short-circuit on the cached
-    // profile.
+    // profile. The removal helper coordinates inherited OAuth copies while
+    // keeping non-OAuth credentials scoped to this agent.
     try {
       const clearedStore = await removeProviderAuthProfilesWithLock({
         provider: selectedProvider.id,

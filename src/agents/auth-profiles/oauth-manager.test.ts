@@ -528,7 +528,7 @@ describe("createOAuthManager", () => {
     });
   });
 
-  it("force-persists a refreshed credential after a same-identity CAS race", async () => {
+  it("adopts newer same-identity material after a refresh CAS race", async () => {
     await withOAuthTempRoot("oauth-manager-cas-same-identity-", async (tempRoot) => {
       const agentDir = path.join(tempRoot, "agents", "main", "agent");
       await fs.mkdir(agentDir, { recursive: true });
@@ -587,17 +587,80 @@ describe("createOAuthManager", () => {
         agentDir,
       });
 
-      expect(result?.apiKey).toBe("rotated-access");
+      expect(result?.apiKey).toBe("stale-race-access");
       const persisted = ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
         allowKeychainPrompt: false,
       });
       expect(persisted.profiles[profileId]).toMatchObject({
         type: "oauth",
-        access: "rotated-access",
-        refresh: "rotated-refresh",
+        access: "stale-race-access",
+        refresh: "consumed-race-refresh",
         accountId: "acct-123",
       });
     });
+  });
+
+  it("re-resolves child ownership after a main-selected network refresh", async () => {
+    await withOAuthAgentDirs(
+      "oauth-manager-main-to-child-takeover-",
+      async ({ mainAgentDir, agentDir }) => {
+        const profileId = "openai:oauth";
+        const expired = createCredential({
+          access: "main-expired-access",
+          refresh: "main-expired-refresh",
+          expires: Date.now() - 60_000,
+          accountId: "acct-123",
+        });
+        const childTakeover = createCredential({
+          access: "child-takeover-access",
+          refresh: "child-takeover-refresh",
+          expires: Date.now() + 10 * 60_000,
+          accountId: "acct-123",
+        });
+        saveAuthProfileStore({ version: 1, profiles: { [profileId]: expired } }, mainAgentDir, {
+          filterExternalAuthProfiles: false,
+        });
+
+        const manager = createOAuthManager({
+          buildApiKey: async (_provider, credential) => credential.access,
+          refreshCredential: vi.fn(async () => {
+            saveAuthProfileStore(
+              { version: 1, profiles: { [profileId]: childTakeover } },
+              agentDir,
+              { filterExternalAuthProfiles: false },
+            );
+            return {
+              access: "main-attempt-access",
+              refresh: "main-attempt-refresh",
+              expires: Date.now() + 60 * 60_000,
+            };
+          }),
+          readBootstrapCredential: () => null,
+          isRefreshTokenReusedError: () => false,
+        });
+
+        const result = await manager.resolveOAuthAccess({
+          store: ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+            allowKeychainPrompt: false,
+          }),
+          profileId,
+          credential: expired,
+          agentDir,
+        });
+
+        expect(result?.apiKey).toBe("child-takeover-access");
+        expect(
+          ensureAuthProfileStoreWithoutExternalProfiles(mainAgentDir, {
+            allowKeychainPrompt: false,
+          }).profiles[profileId],
+        ).toMatchObject({ access: "main-expired-access", refresh: "main-expired-refresh" });
+        expect(
+          ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+            allowKeychainPrompt: false,
+          }).profiles[profileId],
+        ).toMatchObject({ access: "child-takeover-access", refresh: "child-takeover-refresh" });
+      },
+    );
   });
 
   it("uses a different-identity stored credential after a CAS race", async () => {

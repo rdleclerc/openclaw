@@ -39,10 +39,7 @@ import {
   hasRuntimeAuthProfileStoreSnapshot,
   setRuntimeAuthProfileStoreSnapshot,
 } from "./runtime-snapshots.js";
-import {
-  loadAuthProfileStoreForSecretsRuntime,
-  resolvePersistedAuthProfileOwnerAgentDir,
-} from "./store.js";
+import { loadAuthProfileStoreForSecretsRuntime } from "./store.js";
 import type { AuthProfileCredential, AuthProfileStore, OAuthCredential } from "./types.js";
 
 function listOAuthProviderIds(): string[] {
@@ -450,19 +447,12 @@ export async function resolveApiKeyForProfile(
     const surfacedCause =
       error instanceof OAuthManagerRefreshError && error.cause ? error.cause : error;
     if (isRefreshTokenReusedError(surfacedCause)) {
-      const ownerAgentDir = resolvePersistedAuthProfileOwnerAgentDir({
-        agentDir: params.agentDir,
-        profileId,
-      });
-      await clearLastGoodProfileWithLock({
+      const clearedStore = await clearLastGoodProfileWithLock({
         provider: cred.provider,
         profileId,
-        agentDir: ownerAgentDir,
+        agentDir: params.agentDir,
       });
-      if (
-        params.agentDir !== ownerAgentDir &&
-        hasRuntimeAuthProfileStoreSnapshot(params.agentDir)
-      ) {
+      if (clearedStore && hasRuntimeAuthProfileStoreSnapshot(params.agentDir)) {
         const snapshot = getRuntimeAuthProfileStoreSnapshot(params.agentDir);
         const providerKey = resolveProviderIdForAuth(cred.provider);
         if (snapshot?.lastGood?.[providerKey] === profileId) {
