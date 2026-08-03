@@ -1,5 +1,5 @@
 import { resolveProviderAuthProfileId } from "../../../plugins/provider-runtime.js";
-import type { AuthProfileStore } from "../../auth-profiles.js";
+import { loadAuthProfileStoreForRuntime, type AuthProfileStore } from "../../auth-profiles.js";
 import { resolveExternalCliAuthOverlayScopeFromSelection } from "../../auth-profiles/external-cli-auth-selection.js";
 import type { AgentHarness } from "../../harness/types.js";
 import {
@@ -20,6 +20,27 @@ import type { RunEmbeddedAgentParams } from "./params.js";
 
 type ModelResolution = Awaited<ReturnType<typeof resolveModelAsync>>;
 type RuntimeModel = NonNullable<ModelResolution["model"]>;
+
+function loadEmbeddedRunAuthProfileStore(params: {
+  agentDir: string;
+  config: RunEmbeddedAgentParams["config"];
+  externalCliProviderIds: Iterable<string>;
+}): AuthProfileStore {
+  // A gateway can retain a process-local snapshot from before OAuth was added.
+  // Embedded runs must read the durable store so the Codex harness receives the
+  // same profile that the supported auth-status commands report.
+  return loadAuthProfileStoreForRuntime(params.agentDir, {
+    config: params.config,
+    externalCliProviderIds: params.externalCliProviderIds,
+    allowKeychainPrompt: false,
+    readOnly: true,
+  });
+}
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.embeddedRunAuthPlanTestApi")] =
+    { loadEmbeddedRunAuthProfileStore };
+}
 
 export async function prepareEmbeddedRunAuthPlan(params: {
   runParams: RunEmbeddedAgentParams;
@@ -86,9 +107,10 @@ export async function prepareEmbeddedRunAuthPlan(params: {
   params.markStage?.("scope");
 
   const attemptAuthProfileStore = usesOpenAIAuthRouting
-    ? ensureAuthProfileStore(params.agentDir, {
+    ? loadEmbeddedRunAuthProfileStore({
+        agentDir: params.agentDir,
+        config: runParams.config,
         externalCliProviderIds: [OPENAI_PROVIDER_ID],
-        allowKeychainPrompt: false,
       })
     : initialPluginHarnessOwnsTransport
       ? ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, {
