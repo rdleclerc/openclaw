@@ -387,7 +387,8 @@ function isGenericResponseContentType(value?: string | null): boolean {
     !normalized ||
     normalized === "application/octet-stream" ||
     normalized === "binary/octet-stream" ||
-    normalized === "application/zip"
+    normalized === "application/zip" ||
+    normalized === "application/force-download"
   );
 }
 
