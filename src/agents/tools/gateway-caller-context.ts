@@ -6,7 +6,7 @@ import { copyChannelAgentToolMeta } from "../channel-tools.js";
 import { copyToolTerminalPresentation } from "../tool-terminal-presentation.js";
 import type { AnyAgentTool } from "./common.js";
 
-export type GatewayToolCallerIdentity = {
+type GatewayToolCallerIdentity = {
   agentId: string;
   sessionKey: string;
   // Trusted run context, carried separately from model-authored tool arguments.
@@ -30,7 +30,7 @@ type GatewayToolCallerSource = {
   messageActionTurnCapability?: string;
 };
 
-export type GatewayToolCallerMessageActionCapabilityResolution =
+type GatewayToolCallerMessageActionCapabilityResolution =
   | { ok: true; token?: string }
   | { ok: false; reason: "token_conflict" };
 

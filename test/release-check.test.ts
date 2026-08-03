@@ -9,11 +9,7 @@ import {
   LOCAL_BUILD_METADATA_DIST_PATHS,
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
 } from "../scripts/lib/package-dist-inventory.ts";
-import {
-  listForbiddenPrivatePluginSdkPackArtifacts,
-  listPackagedPrivatePluginSdkRuntimeArtifacts,
-  listPluginSdkDistArtifacts,
-} from "../scripts/lib/plugin-sdk-entries.mjs";
+import { listPluginSdkDistArtifacts } from "../scripts/lib/plugin-sdk-entries.mjs";
 import {
   WORKSPACE_TEMPLATE_PACK_PATHS,
   createWorkspaceBootstrapSmokeEnv,
@@ -38,6 +34,8 @@ import {
   PACKED_CLI_SMOKE_COMMANDS,
   PACKED_COMPLETION_SMOKE_ARGS,
   packageNameFromSpecifier,
+  listForbiddenPrivatePluginSdkPackArtifacts,
+  listPackagedPrivatePluginSdkRuntimeArtifacts,
   resolvePackedTarballPath,
   resolveReleaseNpmCommand,
   resolveMissingPackBuildHint,
