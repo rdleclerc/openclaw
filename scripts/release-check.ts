@@ -40,9 +40,8 @@ import {
 } from "./lib/package-dist-inventory.ts";
 import { collectBundledPluginPackageDependencySpecs } from "./lib/plugin-package-dependencies.mjs";
 import {
-  listForbiddenPrivatePluginSdkPackArtifacts,
-  listPackagedPrivatePluginSdkRuntimeArtifacts,
   listPluginSdkDistArtifacts,
+  listPrivateLocalOnlyPluginSdkDistArtifacts,
 } from "./lib/plugin-sdk-entries.mjs";
 import {
   runInstalledWorkspaceBootstrapSmoke,
@@ -82,6 +81,20 @@ const rootPackageExcludedExtensionDirs = collectRootPackageExcludedExtensionDirs
 const rootPackageExcludedExtensionPrefixes = [...rootPackageExcludedExtensionDirs].map(
   (extensionId) => `dist/extensions/${extensionId}/`,
 );
+const packagedPrivatePluginSdkRuntimeEntrypoints = ["codex-native-task-runtime"] as const;
+const packagedPrivatePluginSdkRuntimeEntrypointSet = new Set<string>(
+  packagedPrivatePluginSdkRuntimeEntrypoints,
+);
+export function listPackagedPrivatePluginSdkRuntimeArtifacts() {
+  return packagedPrivatePluginSdkRuntimeEntrypoints.map((entry) => `dist/plugin-sdk/${entry}.js`);
+}
+export function listForbiddenPrivatePluginSdkPackArtifacts() {
+  return listPrivateLocalOnlyPluginSdkDistArtifacts().filter((artifact) => {
+    const match = /^dist\/plugin-sdk\/([^/]+)\.js$/u.exec(artifact);
+    const entry = match?.[1];
+    return !entry || !packagedPrivatePluginSdkRuntimeEntrypointSet.has(entry);
+  });
+}
 const requiredPathGroups = [
   "npm-shrinkwrap.json",
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,

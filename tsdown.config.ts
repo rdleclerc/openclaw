@@ -8,7 +8,6 @@ import {
 } from "./scripts/lib/bundled-plugin-build-entries.mjs";
 import {
   buildPluginSdkEntrySources,
-  packagedPrivatePluginSdkRuntimeEntrypoints,
   pluginSdkEntrypoints,
   publicPluginSdkEntrypoints,
 } from "./scripts/lib/plugin-sdk-entries.mjs";
@@ -161,6 +160,7 @@ function nodeWorkspacePackageBuildConfig(packageDir: string, config: UserConfig 
 
 const bundledPluginBuildEntries = collectBundledPluginBuildEntries();
 const shouldBuildPrivateQaEntries = process.env.OPENCLAW_BUILD_PRIVATE_QA === "1";
+const packagedPrivatePluginSdkRuntimeEntrypoints = ["codex-native-task-runtime"];
 const productionPluginSdkEntrypoints = shouldBuildPrivateQaEntries
   ? pluginSdkEntrypoints
   : [...publicPluginSdkEntrypoints, ...packagedPrivatePluginSdkRuntimeEntrypoints];
