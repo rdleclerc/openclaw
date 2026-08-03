@@ -142,12 +142,22 @@ function createControllerFixture(params: {
     tools: [materializedTool],
     signal: runAbortController.signal,
   });
+  const handleToolCall = vi.fn(toolBridge.handleToolCall);
+  toolBridge.handleToolCall = handleToolCall;
   const turnWatches = {
     clearCompletionIdleTimer: vi.fn(),
     disarmAssistantCompletionIdleWatch: vi.fn(),
     touchActivity: vi.fn(),
     armCompletionIdleWatch: vi.fn(),
     scheduleProgressWatches: vi.fn(),
+  };
+  const projector = {
+    recordDynamicToolCall: vi.fn(),
+    recordDynamicToolResult: vi.fn(),
+  };
+  const trajectoryRecorder = {
+    recordEvent: vi.fn(),
+    flush: vi.fn(async () => undefined),
   };
   const resources = {
     prompt: {
@@ -176,7 +186,8 @@ function createControllerFixture(params: {
       },
     },
     state: { thread: { threadId: "thread-1" } },
-    projectorRef: {},
+    projectorRef: { current: projector },
+    trajectoryRecorder,
   } as unknown as CodexAttemptResources;
   const turnRuntime = {
     state: {
@@ -196,7 +207,12 @@ function createControllerFixture(params: {
     scheduleTurnReleaseAfterTerminalDynamicTool: vi.fn(),
     scheduleTerminalDynamicToolReleaseCheck: vi.fn(),
   } as unknown as CodexAttemptLifecycleController;
-  return createCodexAttemptServerRequestController(resources, turnRuntime, lifecycle);
+  return {
+    controller: createCodexAttemptServerRequestController(resources, turnRuntime, lifecycle),
+    handleToolCall,
+    projector,
+    trajectoryRecorder,
+  };
 }
 
 function downloadRequest(callId: string, fileId = `F-${callId}`) {
@@ -219,8 +235,8 @@ function downloadRequest(callId: string, fileId = `F-${callId}`) {
   };
 }
 
-async function runDownload(controller: ReturnType<typeof createControllerFixture>, callId: string) {
-  return await controller.handleServerRequest(downloadRequest(callId), {
+async function runDownload(fixture: ReturnType<typeof createControllerFixture>, callId: string) {
+  return await fixture.controller.handleServerRequest(downloadRequest(callId), {
     threadId: "thread-1",
     turnId: "turn-1",
   });
@@ -233,6 +249,28 @@ function expectNoCapabilityLeak(value: unknown, tokens: Array<string | undefined
       expect(serialized).not.toContain(token);
     }
   }
+}
+
+function expectNoCapabilityLeakAcrossSurfaces(params: {
+  fixture: ReturnType<typeof createControllerFixture>;
+  request: unknown;
+  response: unknown;
+  tokens: Array<string | undefined>;
+}) {
+  expectNoCapabilityLeak(
+    {
+      request: params.request,
+      response: params.response,
+      toolBridgeCalls: params.fixture.handleToolCall.mock.calls,
+      bridgeCalls: handleDownloadFile.mock.calls,
+      projectorCalls: [
+        params.fixture.projector.recordDynamicToolCall.mock.calls,
+        params.fixture.projector.recordDynamicToolResult.mock.calls,
+      ],
+      trajectoryRecords: params.fixture.trajectoryRecorder.recordEvent.mock.calls,
+    },
+    params.tokens,
+  );
 }
 
 describe("Codex dynamic message download authority", () => {
@@ -263,7 +301,11 @@ describe("Codex dynamic message download authority", () => {
     const token = mintAttemptCapability(identity, "sender-a");
     const controller = createControllerFixture({ requestIdentity: identity, attemptToken: token });
 
-    const response = await runDownload(controller, "positive");
+    const request = downloadRequest("positive");
+    const response = await controller.controller.handleServerRequest(request, {
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
 
     expect(response).toMatchObject({ success: true });
     expect(handleDownloadFile).toHaveBeenCalledOnce();
@@ -282,7 +324,12 @@ describe("Codex dynamic message download authority", () => {
         currentChannelId: DOSSIER_CHANNEL,
       },
     });
-    expectNoCapabilityLeak(response, [token]);
+    expectNoCapabilityLeakAcrossSurfaces({
+      fixture: controller,
+      request,
+      response,
+      tokens: [token],
+    });
   });
 
   it("keeps revoked pre-materialized constructor authority fail-closed", async () => {
