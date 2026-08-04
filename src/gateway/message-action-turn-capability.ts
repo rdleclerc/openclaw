@@ -23,7 +23,7 @@ export type AgentRuntimeMessageActionContext = {
   toolContext?: ChannelThreadingToolContext;
 };
 
-export type MessageActionTurnCapabilityRejectionReason =
+type MessageActionTurnCapabilityRejectionReason =
   | "token_missing"
   | "token_conflict"
   | "token_unknown"
@@ -33,7 +33,7 @@ export type MessageActionTurnCapabilityRejectionReason =
   | "session_key_mismatch"
   | "session_id_mismatch";
 
-export type MessageActionTurnCapabilityResolution =
+type MessageActionTurnCapabilityResolution =
   | { ok: true; context: AgentRuntimeMessageActionContext }
   | { ok: false; reason: MessageActionTurnCapabilityRejectionReason };
 

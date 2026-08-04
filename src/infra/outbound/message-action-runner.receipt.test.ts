@@ -176,7 +176,7 @@ describe("receipt-bound Slack message actions", () => {
       authorization: { messageSentReceiptPluginId: undefined },
     },
     { name: "a root send", expected: false, params: { topLevel: true } },
-  ] satisfies Case[])("binds only $name", async (testCase) => {
+  ] as Case[])("binds only $name", async (testCase) => {
     const action = input();
     const authorization = action.messageActionAuthorization;
     if (!authorization?.toolContext) {

@@ -18,6 +18,9 @@ import {
 import { clearSessionStoreCacheForTest } from "../../config/sessions/store.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveMessageActionTurnCapability } from "../../gateway/message-action-turn-capability.js";
+import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
+import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
+import { createDiagnosticLogRecordCapture } from "../../logging/test-helpers/diagnostic-log-capture.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
@@ -30,49 +33,11 @@ import { FailoverError } from "../failover-error.js";
 import {
   persistAcpTurnTranscript,
   persistCliTurnTranscript,
-  resolveMessageActionTurnCapabilityMintBoundary,
   runAgentAttempt as runAgentAttemptImpl,
 } from "./attempt-execution.js";
 import { resolveClaudeCliProjectDirForWorkspace } from "./claude-cli-project-dir.js";
 
 type RunAgentAttemptParams = Parameters<typeof runAgentAttemptImpl>[0];
-
-describe("message action capability mint diagnostics", () => {
-  it("reports only categorical boundary facts", () => {
-    const diagnostic = resolveMessageActionTurnCapabilityMintBoundary({
-      requestMessageId: "1785660529.966149",
-      messageChannel: "slack",
-      sessionKey: "agent:main:slack:channel:c0bly1apgh5",
-      currentChannelId: "C0BLY1APGH5",
-      capability: "opaque-secret-token",
-    });
-
-    expect(diagnostic).toEqual({
-      requestMessageIdPresent: true,
-      trustedIngress: true,
-      sessionKeyPresent: true,
-      channelContextPresent: true,
-      capabilityMinted: true,
-    });
-    expect(JSON.stringify(diagnostic)).not.toContain("opaque-secret-token");
-  });
-
-  it("identifies a missing trusted request id before mint", () => {
-    expect(
-      resolveMessageActionTurnCapabilityMintBoundary({
-        messageChannel: "slack",
-        sessionKey: "agent:main:slack:channel:c0bly1apgh5",
-        currentChannelId: "C0BLY1APGH5",
-      }),
-    ).toEqual({
-      requestMessageIdPresent: false,
-      trustedIngress: true,
-      sessionKeyPresent: true,
-      channelContextPresent: true,
-      capabilityMinted: false,
-    });
-  });
-});
 
 const runAgentAttempt = (
   params: Omit<RunAgentAttemptParams, "lifecycleGeneration"> &
@@ -2560,6 +2525,13 @@ describe("CLI attempt execution", () => {
     const runId = "trusted-slack-message-capability";
     const sessionKey = `agent:main:direct:${runId}`;
     let capability: string | undefined;
+    resetDiagnosticEventsForTest();
+    const logCapture = createDiagnosticLogRecordCapture();
+    setLoggerOverride({
+      level: "info",
+      consoleLevel: "silent",
+      file: path.join(tmpDir, "message-action-mint.log"),
+    });
     runEmbeddedAgentMock.mockImplementationOnce(async (input: Record<string, unknown>) => {
       capability = input.messageActionTurnCapability as string | undefined;
       expect(
@@ -2587,35 +2559,59 @@ describe("CLI attempt execution", () => {
       return { meta: { durationMs: 1 } } satisfies EmbeddedAgentRunResult;
     });
 
-    await runOpenClawEmbeddedAttemptForTest({
-      runId,
-      messageChannel: "slack",
-      opts: {
-        messageProvider: "slack",
-        requestMessageId: "1785648163.012979",
-        inputProvenance: {
-          kind: "internal_system",
-          messageSentReceiptPluginId: "gaia-workflow-preflight",
-        },
-      },
-      runContext: {
-        accountId: "default",
-        senderId: "U028EKM2A",
-        currentChannelId: "C0BLY1APGH5",
-        currentThreadTs: "1785648163.012979",
-      },
-    });
-
-    expect(capability).toEqual(expect.any(String));
-    expect(
-      resolveMessageActionTurnCapability({
-        token: capability,
-        agentId: "main",
+    try {
+      await runOpenClawEmbeddedAttemptForTest({
         runId,
-        sessionKey,
-        sessionId: `session-${runId}`,
-      }),
-    ).toBeUndefined();
+        messageChannel: "slack",
+        opts: {
+          messageProvider: "slack",
+          requestMessageId: "1785648163.012979",
+          inputProvenance: {
+            kind: "internal_system",
+            messageSentReceiptPluginId: "gaia-workflow-preflight",
+          },
+        },
+        runContext: {
+          accountId: "default",
+          senderId: "U028EKM2A",
+          currentChannelId: "C0BLY1APGH5",
+          currentThreadTs: "1785648163.012979",
+        },
+      });
+
+      if (typeof capability !== "string") {
+        throw new Error("expected an opaque message-action capability");
+      }
+      await logCapture.flush();
+      const boundaryRecord = logCapture.records.find(
+        (record) => record.message === "message action turn capability mint boundary",
+      );
+      if (!boundaryRecord) {
+        throw new Error("expected message-action capability mint boundary diagnostic");
+      }
+      expect(boundaryRecord.attributes).toMatchObject({
+        requestMessageIdPresent: true,
+        trustedIngress: true,
+        sessionKeyPresent: true,
+        channelContextPresent: true,
+        capabilityMinted: true,
+      });
+      expect(JSON.stringify(boundaryRecord)).not.toContain(capability);
+      expect(
+        resolveMessageActionTurnCapability({
+          token: capability,
+          agentId: "main",
+          runId,
+          sessionKey,
+          sessionId: `session-${runId}`,
+        }),
+      ).toBeUndefined();
+    } finally {
+      logCapture.cleanup();
+      resetDiagnosticEventsForTest();
+      resetLogger();
+      setLoggerOverride(null);
+    }
   });
 
   it("does not mint a message-action capability without host-owned request identity", async () => {

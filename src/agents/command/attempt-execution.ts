@@ -94,7 +94,7 @@ export {
 
 const log = createSubsystemLogger("agents/agent-command");
 
-export function resolveMessageActionTurnCapabilityMintBoundary(params: {
+function resolveMessageActionTurnCapabilityMintBoundary(params: {
   requestMessageId?: string;
   messageChannel?: string;
   sessionKey?: string;
