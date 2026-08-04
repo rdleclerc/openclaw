@@ -212,7 +212,9 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
     let writerDone: Promise<void> | undefined;
     storeTesting.setRuntimeSnapshotPublisherForTest((publish) => {
       publish();
-      if (intercepted) return;
+      if (intercepted) {
+        return;
+      }
       intercepted = true;
       const writer = spawn(
         process.execPath,
@@ -277,8 +279,11 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
       writerDone = new Promise((resolve, reject) => {
         writer.once("error", reject);
         writer.once("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`child writer exited ${code}: ${stderr}`));
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`child writer exited ${code}: ${stderr}`));
+          }
         });
       });
       const waitArray = new Int32Array(new SharedArrayBuffer(4));
@@ -286,7 +291,9 @@ describe("resolveApiKeyForProfile OAuth refresh mirror-to-main (#26322)", () => 
       while (!existsSync(markerPath) && Date.now() < deadline) {
         Atomics.wait(waitArray, 0, 0, 10);
       }
-      if (!existsSync(markerPath)) throw new Error("child writer did not acquire its transaction");
+      if (!existsSync(markerPath)) {
+        throw new Error("child writer did not acquire its transaction");
+      }
     });
 
     const startedAt = Date.now();

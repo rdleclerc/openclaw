@@ -48,7 +48,7 @@ import {
   updateAuthProfileStoreWithLock,
 } from "./store.js";
 import { testing as storeTesting } from "./store.test-support.js";
-import type { AuthProfileStore, RuntimeAuthProfileStore } from "./types.js";
+import type { AuthProfileStore, OAuthCredential, RuntimeAuthProfileStore } from "./types.js";
 
 type ExpectedOAuthCredentialFields = {
   provider: string;
@@ -285,7 +285,7 @@ function authRaceResult(stdout: string): { ok: boolean; elapsedMs: number } {
 
 type AuthOwnerRaceHarness = {
   childDir: string;
-  childCredential: AuthProfileStore["profiles"][string];
+  childCredential: OAuthCredential;
   profileId: string;
   now: number;
   mainPath: string;
