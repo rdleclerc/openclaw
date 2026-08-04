@@ -25,6 +25,7 @@ import type { GatewayClientMode, GatewayClientName } from "../../utils/message-c
 import { throwIfAborted } from "./abort.js";
 import { resolveOutboundChannelPlugin } from "./channel-resolution.js";
 import type { OutboundSendDeps } from "./deliver.js";
+import type { QueuedReplyPayloadSendingHook } from "./delivery-queue.js";
 import { collectActionMediaSourceHints } from "./message-action-params.js";
 import type { MessagePollResult, MessageSendResult } from "./message.js";
 import { sendMessage, sendPoll } from "./message.js";
@@ -64,6 +65,8 @@ type OutboundSendContext = {
   inboundEventKind?: InboundEventKind;
   gateway?: OutboundGatewayContext;
   toolContext?: ChannelThreadingToolContext;
+  /** Host-issued final receipt authority; never populated from model action args. */
+  replyPayloadSendingHook?: QueuedReplyPayloadSendingHook;
   deps?: OutboundSendDeps;
   dryRun: boolean;
   mirror?: OutboundMirror;
@@ -146,6 +149,7 @@ async function sendCoreMessage(params: {
     dryRun: params.ctx.dryRun,
     bestEffort: params.bestEffort ?? undefined,
     queuePolicy: params.queuePolicy,
+    replyPayloadSendingHook: params.ctx.replyPayloadSendingHook,
     deps: params.ctx.deps,
     gateway: params.ctx.gateway,
     mirror: params.ctx.mirror,
@@ -299,7 +303,8 @@ export async function executeSendAction(params: {
     mediaUrls: params.mediaUrls,
     audioAsVoice: params.asVoice === true,
   };
-  const queuePolicy = params.bestEffort === false ? "required" : "best_effort";
+  const queuePolicy =
+    params.ctx.replyPayloadSendingHook || params.bestEffort === false ? "required" : "best_effort";
   const pluginPreparation = await preparePluginSendPayload({
     ctx: params.ctx,
     to: params.to,

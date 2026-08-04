@@ -1685,6 +1685,14 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           messageActionAuthorization: {
             requesterAccountId: trustedTurnContext?.requesterAccountId,
             requesterSenderId: trustedTurnContext?.requesterSenderId,
+            ...(trustedTurnContext
+              ? {
+                  runId: trustedTurnContext.runId,
+                  sessionKey: trustedTurnContext.sessionKey,
+                  sessionId: trustedTurnContext.sessionId,
+                  messageSentReceiptPluginId: trustedTurnContext.messageSentReceiptPluginId,
+                }
+              : {}),
             toolContext: trustedTurnContext?.toolContext,
           },
           senderIsOwner: options?.senderIsOwner,

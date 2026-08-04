@@ -13,9 +13,13 @@ const MAX_ACTIVE_CAPABILITIES = 4096;
 
 export type AgentRuntimeMessageActionContext = {
   expiresAtMs: number;
+  /** Private current-turn correlation facts; never exposed to model tool arguments. */
+  runId?: string;
+  sessionKey?: string;
   sessionId?: string;
   requesterAccountId?: string;
   requesterSenderId?: string;
+  messageSentReceiptPluginId?: string;
   toolContext?: ChannelThreadingToolContext;
 };
 
@@ -104,6 +108,7 @@ export function mintMessageActionTurnCapability(params: {
   sessionId?: string;
   requesterAccountId?: string;
   requesterSenderId?: string;
+  messageSentReceiptPluginId?: string;
   toolContext?: ChannelThreadingToolContext;
   ttlMs?: number;
   nowMs?: number;
@@ -130,6 +135,7 @@ export function mintMessageActionTurnCapability(params: {
     sessionId: normalizeOptionalString(params.sessionId),
     requesterAccountId: normalizeOptionalString(params.requesterAccountId),
     requesterSenderId: normalizeOptionalString(params.requesterSenderId),
+    messageSentReceiptPluginId: normalizeOptionalString(params.messageSentReceiptPluginId),
     toolContext: copyToolContext(params.toolContext),
   });
   return token;
@@ -172,9 +178,12 @@ export function resolveMessageActionTurnCapabilityDiagnostic(params: {
     ok: true,
     context: {
       expiresAtMs: capability.expiresAtMs,
+      runId: capability.runId,
+      sessionKey: capability.sessionKey,
       sessionId: capability.sessionId,
       requesterAccountId: capability.requesterAccountId,
       requesterSenderId: capability.requesterSenderId,
+      messageSentReceiptPluginId: capability.messageSentReceiptPluginId,
       toolContext: copyToolContext(capability.toolContext),
     },
   };

@@ -23,6 +23,7 @@ import {
   type OutboundDeliveryQueuePolicy,
   type OutboundSendDeps,
 } from "./deliver.js";
+import type { QueuedReplyPayloadSendingHook } from "./delivery-queue-storage.js";
 import {
   resolveOutboundMessageGatewayOptions,
   type OutboundMessageGatewayOptionsInput,
@@ -83,6 +84,8 @@ type MessageSendParams = {
   dryRun?: boolean;
   bestEffort?: boolean;
   queuePolicy?: OutboundDeliveryQueuePolicy;
+  /** Private host-bound receipt hook for a durable direct send. */
+  replyPayloadSendingHook?: QueuedReplyPayloadSendingHook;
   payloads?: ReplyPayload[];
   mediaAccess?: OutboundMediaAccess;
   deps?: OutboundSendDeps;
@@ -416,6 +419,7 @@ export async function sendMessage(params: MessageSendParams): Promise<MessageSen
       deps: params.deps,
       bestEffort: params.bestEffort,
       ...(requireUnknownSendReconciliation ? { requireUnknownSendReconciliation: true } : {}),
+      replyPayloadSendingHook: params.replyPayloadSendingHook,
       durability:
         params.bestEffort || params.queuePolicy === "best_effort" ? "best_effort" : "required",
       signal: params.abortSignal,

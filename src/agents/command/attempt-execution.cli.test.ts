@@ -2571,8 +2571,12 @@ describe("CLI attempt execution", () => {
           sessionId: `session-${runId}`,
         }),
       ).toMatchObject({
+        runId,
+        sessionKey,
+        sessionId: `session-${runId}`,
         requesterAccountId: "default",
         requesterSenderId: "U028EKM2A",
+        messageSentReceiptPluginId: "gaia-workflow-preflight",
         toolContext: {
           currentChannelProvider: "slack",
           currentChannelId: "C0BLY1APGH5",
@@ -2589,6 +2593,10 @@ describe("CLI attempt execution", () => {
       opts: {
         messageProvider: "slack",
         requestMessageId: "1785648163.012979",
+        inputProvenance: {
+          kind: "internal_system",
+          messageSentReceiptPluginId: "gaia-workflow-preflight",
+        },
       },
       runContext: {
         accountId: "default",
