@@ -95,4 +95,99 @@ describe("resolveModelProviderRouteOverridePresence", () => {
       }),
     ).toBe("present");
   });
+
+  it("does not let a provider private-network opt-in block an official model endpoint", () => {
+    expect(
+      resolveModelProviderRouteOverridePresence({
+        provider: "openai",
+        modelId: "gpt-5.6-sol",
+        config: {
+          models: {
+            providers: {
+              openai: {
+                baseUrl: "http://127.0.0.1:9999/openai/v1",
+                request: { allowPrivateNetwork: true },
+                models: [
+                  model("gpt-5.6-sol", {
+                    api: "openai-chatgpt-responses",
+                    baseUrl: "https://chatgpt.com/backend-api/codex",
+                  }),
+                ],
+              },
+            },
+          },
+        } as never,
+      }),
+    ).toBe("none");
+  });
+
+  it("does not treat native reasoning metadata as a transport override", () => {
+    expect(
+      resolveModelProviderRouteOverridePresence({
+        provider: "openai",
+        modelId: "gpt-5.6-sol",
+        config: {
+          models: {
+            providers: {
+              openai: {
+                models: [
+                  model("gpt-5.6-sol", {
+                    api: "openai-chatgpt-responses",
+                    baseUrl: "https://chatgpt.com/backend-api/codex",
+                    compat: {
+                      supportsReasoningEffort: true,
+                      supportedReasoningEfforts: ["none", "xhigh", "max"],
+                    },
+                  }),
+                ],
+              },
+            },
+          },
+        } as never,
+      }),
+    ).toBe("none");
+  });
+
+  it("keeps the private-network opt-in blocking for a custom model endpoint", () => {
+    expect(
+      resolveModelProviderRouteOverridePresence({
+        provider: "openai",
+        modelId: "gpt-custom",
+        config: {
+          models: {
+            providers: {
+              openai: {
+                request: { allowPrivateNetwork: true },
+                models: [model("gpt-custom", { baseUrl: "http://127.0.0.1:9999/v1" })],
+              },
+            },
+          },
+        } as never,
+      }),
+    ).toBe("present");
+  });
+
+  it("keeps other provider transport overrides blocking for an official model endpoint", () => {
+    expect(
+      resolveModelProviderRouteOverridePresence({
+        provider: "openai",
+        modelId: "gpt-5.6-sol",
+        config: {
+          models: {
+            providers: {
+              openai: {
+                request: { headers: { "x-test": "custom" } },
+                models: [
+                  model("gpt-5.6-sol", {
+                    api: "openai-chatgpt-responses",
+                    baseUrl: "https://chatgpt.com/backend-api/codex",
+                  }),
+                ],
+              },
+            },
+          },
+        } as never,
+      }),
+    ).toBe("present");
+  });
 });

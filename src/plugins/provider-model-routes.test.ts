@@ -435,7 +435,6 @@ describe("provider model route adapter", () => {
 
   it.each([
     ["provider headers", { headers: { "x-route": "custom" } }, {}],
-    ["provider request", { request: { allowPrivateNetwork: true } }, {}],
     ["provider local service", { localService: { command: "/custom-provider" } }, {}],
     ["provider auth header", { authHeader: false }, {}],
     ["provider request timeout", { timeoutSeconds: 90 }, {}],
@@ -461,6 +460,76 @@ describe("provider model route adapter", () => {
     resolveProviderModelRoutes({
       provider: "openai",
       modelId: "gpt-5.5",
+      config,
+      env: {},
+      surface: { resolveModelRoutes },
+    });
+
+    expect(resolveModelRoutes.mock.calls[0]?.[0]).toMatchObject({
+      requestTransportOverrides: "present",
+    });
+  });
+
+  it("allows the private-network flag on an official OpenAI route", () => {
+    const resolveModelRoutes = vi.fn((_context: ProviderResolveModelRoutesContext) => ({
+      kind: "indeterminate" as const,
+    }));
+    const config = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "http://127.0.0.1:9999/openai/v1",
+            request: { allowPrivateNetwork: true },
+            models: [
+              {
+                id: "gpt-5.6-sol",
+                api: "openai-chatgpt-responses",
+                baseUrl: "https://chatgpt.com/backend-api/codex",
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    resolveProviderModelRoutes({
+      provider: "openai",
+      modelId: "gpt-5.6-sol",
+      config,
+      env: {},
+      surface: { resolveModelRoutes },
+    });
+
+    expect(resolveModelRoutes.mock.calls[0]?.[0]).toMatchObject({
+      requestTransportOverrides: "none",
+    });
+  });
+
+  it("keeps the private-network flag on a private route", () => {
+    const resolveModelRoutes = vi.fn((_context: ProviderResolveModelRoutesContext) => ({
+      kind: "indeterminate" as const,
+    }));
+    const config = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "http://127.0.0.1:9999/openai/v1",
+            request: { allowPrivateNetwork: true },
+            models: [
+              {
+                id: "local-model",
+                api: "openai-responses",
+                baseUrl: "http://127.0.0.1:4000/v1",
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    resolveProviderModelRoutes({
+      provider: "openai",
+      modelId: "local-model",
       config,
       env: {},
       surface: { resolveModelRoutes },

@@ -1,5 +1,5 @@
 import { resolveProviderAuthProfileId } from "../../../plugins/provider-runtime.js";
-import type { AuthProfileStore } from "../../auth-profiles.js";
+import { loadAuthProfileStoreForRuntime, type AuthProfileStore } from "../../auth-profiles.js";
 import { resolveExternalCliAuthOverlayScopeFromSelection } from "../../auth-profiles/external-cli-auth-selection.js";
 import type { AgentHarness } from "../../harness/types.js";
 import {
@@ -20,6 +20,31 @@ import type { RunEmbeddedAgentParams } from "./params.js";
 
 type ModelResolution = Awaited<ReturnType<typeof resolveModelAsync>>;
 type RuntimeModel = NonNullable<ModelResolution["model"]>;
+
+function loadEmbeddedRunAuthProfileStore(params: {
+  agentDir: string;
+  config: RunEmbeddedAgentParams["config"];
+  externalCliProviderIds: Iterable<string>;
+  usesOpenAIAuthRouting?: boolean;
+}): AuthProfileStore {
+  const options = {
+    config: params.config,
+    externalCliProviderIds: params.externalCliProviderIds,
+    allowKeychainPrompt: false,
+  };
+  if (params.usesOpenAIAuthRouting === false) {
+    return ensureAuthProfileStore(params.agentDir, options);
+  }
+  // A gateway can retain a process-local snapshot from before OpenAI OAuth was added.
+  // Read the durable store for each OpenAI run while preserving provider pins
+  // through the config-aware external-auth overlay.
+  return loadAuthProfileStoreForRuntime(params.agentDir, { ...options, readOnly: true });
+}
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.embeddedRunAuthPlanTestApi")] =
+    { loadEmbeddedRunAuthProfileStore };
+}
 
 export async function prepareEmbeddedRunAuthPlan(params: {
   runParams: RunEmbeddedAgentParams;
@@ -86,18 +111,22 @@ export async function prepareEmbeddedRunAuthPlan(params: {
   params.markStage?.("scope");
 
   const attemptAuthProfileStore = usesOpenAIAuthRouting
-    ? ensureAuthProfileStore(params.agentDir, {
+    ? loadEmbeddedRunAuthProfileStore({
+        agentDir: params.agentDir,
+        config: runParams.config,
         externalCliProviderIds: [OPENAI_PROVIDER_ID],
-        allowKeychainPrompt: false,
+        usesOpenAIAuthRouting,
       })
     : initialPluginHarnessOwnsTransport
       ? ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, {
           allowKeychainPrompt: false,
         })
       : externalCliAuthScope.providerIds
-        ? ensureAuthProfileStore(params.agentDir, {
+        ? loadEmbeddedRunAuthProfileStore({
+            agentDir: params.agentDir,
+            config: runParams.config,
             externalCliProviderIds: externalCliAuthScope.providerIds,
-            allowKeychainPrompt: false,
+            usesOpenAIAuthRouting,
           })
         : (noExternalAuthStore ??
           ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, {

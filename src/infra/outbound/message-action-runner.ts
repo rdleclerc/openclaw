@@ -65,6 +65,7 @@ import {
   resolveMessageChannelSelection,
 } from "./channel-selection.js";
 import type { OutboundSendDeps } from "./deliver.js";
+import type { QueuedReplyPayloadSendingHook } from "./delivery-queue.js";
 import { shouldUseInternalSourceReplySink } from "./internal-source-reply.js";
 import { normalizeMessageActionInput } from "./message-action-normalization.js";
 import { hasPotentialPluginActionParam } from "./message-action-param-keys.js";
@@ -142,6 +143,10 @@ export type RunMessageActionParams = {
   messageActionAuthorization?: {
     requesterAccountId?: string;
     requesterSenderId?: string;
+    runId?: string;
+    sessionKey?: string;
+    sessionId?: string;
+    messageSentReceiptPluginId?: string;
     toolContext?: ChannelThreadingToolContext;
   };
   sessionId?: string;
@@ -388,6 +393,86 @@ function normalizeTargetForAccountBinding(channel: ChannelId, target: string): s
   } catch {
     return undefined;
   }
+}
+
+function normalizeMessageContextId(value: string | number | undefined): string | undefined {
+  return value === undefined ? undefined : normalizeOptionalString(String(value));
+}
+
+/**
+ * Binds one final receipt only when host-issued current-turn identity matches
+ * the resolved same-source send. Model-authored routing fields cannot arm it.
+ */
+function buildTrustedSameSourceReceiptHook(params: {
+  input: RunMessageActionParams;
+  channel: ChannelId;
+  accountId?: string | null;
+  to: string;
+  resolvedThreadId?: string;
+  resolvedReplyToId?: string;
+}): QueuedReplyPayloadSendingHook | undefined {
+  const authorization = params.input.messageActionAuthorization;
+  const toolContext = authorization?.toolContext;
+  const channel = normalizeOptionalLowercaseString(params.channel);
+  const trustedChannel = normalizeOptionalLowercaseString(toolContext?.currentChannelProvider);
+  const trustedTargetInput =
+    normalizeOptionalString(toolContext?.currentMessagingTarget) ??
+    normalizeOptionalString(toolContext?.currentChannelId);
+  const trustedTarget = trustedTargetInput
+    ? normalizeTargetForAccountBinding(params.channel, trustedTargetInput)
+    : undefined;
+  const resolvedTarget = normalizeTargetForAccountBinding(params.channel, params.to);
+  const accountId = normalizeOptionalString(params.accountId);
+  const requesterAccountId = normalizeOptionalString(authorization?.requesterAccountId);
+  const requesterSenderId = normalizeOptionalString(authorization?.requesterSenderId);
+  const runId = normalizeOptionalString(authorization?.runId);
+  const sessionKey = normalizeOptionalString(authorization?.sessionKey);
+  const sessionId = normalizeOptionalString(authorization?.sessionId);
+  const receiptPluginId = normalizeOptionalString(authorization?.messageSentReceiptPluginId);
+  const currentMessageId = normalizeMessageContextId(toolContext?.currentMessageId);
+  const currentThreadId = normalizeOptionalString(toolContext?.currentThreadTs);
+  const resolvedThreadId = normalizeOptionalString(params.resolvedThreadId);
+  const resolvedReplyToId = normalizeOptionalString(params.resolvedReplyToId);
+  const replyToMatchesTrustedSource =
+    resolvedReplyToId === currentThreadId || resolvedReplyToId === currentMessageId;
+
+  if (
+    !channel ||
+    channel !== trustedChannel ||
+    !trustedTarget ||
+    trustedTarget !== resolvedTarget ||
+    !accountId ||
+    accountId !== requesterAccountId ||
+    !requesterSenderId ||
+    !runId ||
+    !sessionKey ||
+    !sessionId ||
+    sessionKey !== normalizeOptionalString(params.input.sessionKey) ||
+    sessionId !== normalizeOptionalString(params.input.sessionId) ||
+    !receiptPluginId ||
+    !currentMessageId ||
+    !currentThreadId ||
+    currentThreadId !== resolvedThreadId ||
+    !replyToMatchesTrustedSource
+  ) {
+    return undefined;
+  }
+
+  return {
+    kind: "final",
+    channel: trustedChannel,
+    sessionKey,
+    runId,
+    messageSentReceiptPluginId: receiptPluginId,
+    context: {
+      channelId: trustedChannel,
+      accountId: requesterAccountId,
+      conversationId: trustedTarget,
+      sessionKey,
+      runId,
+      messageId: currentMessageId,
+    },
+  };
 }
 
 function inferPeerKindForAccountBinding(channel: ChannelId, target: string): ChatType | undefined {
@@ -818,6 +903,8 @@ async function handleBroadcastAction(
         });
         const sendResult = await runMessageAction({
           ...input,
+          // One source-thread receipt must never fan out through broadcast recursion.
+          messageActionAuthorization: undefined,
           action: "send",
           params: {
             ...params,
@@ -1254,6 +1341,15 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
     requesterSenderE164: input.requesterSenderE164,
   });
 
+  const receiptHook = buildTrustedSameSourceReceiptHook({
+    input,
+    channel,
+    accountId,
+    to,
+    resolvedThreadId,
+    resolvedReplyToId,
+  });
+
   // Gateway action ownership wins even when this process has a render-capable
   // outbound adapter; credentials and account selection may exist only remotely.
   const gatewayPluginAction = await runGatewayPluginMessageActionOrNull({
@@ -1320,6 +1416,7 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
       inboundEventKind: input.inboundEventKind,
       gateway,
       toolContext: input.toolContext,
+      replyPayloadSendingHook: receiptHook,
       deps: input.deps,
       dryRun,
       mirror:
@@ -1346,7 +1443,7 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
     asVoice: sendPayload.asVoice,
     gifPlayback: sendPayload.gifPlayback,
     forceDocument: sendPayload.forceDocument,
-    bestEffort: sendPayload.bestEffort,
+    bestEffort: receiptHook ? false : sendPayload.bestEffort,
     replyToId: resolvedReplyToId ?? undefined,
     replyToIdSource: resolvedReplyToId ? (replyToIsExplicit ? "explicit" : "implicit") : undefined,
     threadId: resolvedThreadId ?? undefined,

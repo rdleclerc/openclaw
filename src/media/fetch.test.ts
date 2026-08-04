@@ -1068,6 +1068,30 @@ describe("readRemoteMediaBuffer", () => {
     await expect(fs.readFile(saved.path)).resolves.toStrictEqual(Buffer.from([1, 2, 3]));
   });
 
+  it("preserves Slack Markdown metadata when the response is force-download", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(makeStream([Buffer.from("# Nippon Soda\n")]), {
+          status: 200,
+          headers: { "content-type": "application/force-download" },
+        }),
+    );
+
+    const saved = await saveRemoteMedia({
+      url: "https://files.slack.com/files-pri/T1-F0BMLP5JBTP/Nippon-Soda.md",
+      fetchImpl,
+      lookupFn: makeLookupFn(),
+      filePathHint: "Nippon Soda.md",
+      fallbackContentType: "text/markdown",
+      maxBytes: 1024,
+    });
+
+    expect(saved.fileName).toBe("Nippon Soda.md");
+    expect(saved.contentType).toBe("text/markdown");
+    expect(saved.path).toMatch(/[a-f0-9-]{36}\.md$/);
+    await expect(fs.readFile(saved.path)).resolves.toStrictEqual(Buffer.from("# Nippon Soda\n"));
+  });
+
   it("normalizes Windows-style response filenames and caller hints on POSIX hosts", async () => {
     const fetchImpl = vi.fn(
       async () =>

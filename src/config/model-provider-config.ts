@@ -47,6 +47,52 @@ function hasNonEmptyRecord(value: unknown): boolean {
   return record !== undefined && Object.keys(record).length > 0;
 }
 
+const RUNTIME_MODEL_COMPAT_KEYS = new Set(["supportsReasoningEffort", "supportedReasoningEfforts"]);
+
+function hasMeaningfulModelCompat(value: unknown): boolean {
+  const record = readRecord(value);
+  return (
+    record !== undefined && Object.keys(record).some((key) => !RUNTIME_MODEL_COMPAT_KEYS.has(key))
+  );
+}
+
+function isOfficialOpenAIEndpoint(provider: string, baseUrl: unknown): boolean {
+  if (normalizeProviderId(provider) !== "openai" || typeof baseUrl !== "string") {
+    return false;
+  }
+  try {
+    const url = new URL(baseUrl.trim());
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "api.openai.com" || url.hostname === "chatgpt.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The private-network opt-in is only transport-relevant for private routes.
+ * An OpenAI model row with its own official endpoint does not inherit the
+ * provider's local-network safety switch in a way Codex must reproduce.
+ */
+function hasMeaningfulProviderRequestOverride(params: {
+  provider: string;
+  request: unknown;
+  effectiveBaseUrl: unknown;
+}): boolean {
+  const request = readRecord(params.request);
+  if (!request || Object.keys(request).length === 0) {
+    return false;
+  }
+  const onlyPrivateNetworkOptIn = Object.keys(request).every(
+    (key) => key === "allowPrivateNetwork",
+  );
+  return (
+    !onlyPrivateNetworkOptIn || !isOfficialOpenAIEndpoint(params.provider, params.effectiveBaseUrl)
+  );
+}
+
 /** Projects authored request behavior without exposing values or local commands. */
 export function resolveModelProviderRouteOverridePresence(params: {
   provider: string;
@@ -58,10 +104,26 @@ export function resolveModelProviderRouteOverridePresence(params: {
   if (!providerConfig) {
     return "none";
   }
+  const canonicalize = (modelId: string) => {
+    const normalized = normalizeModelId(params.provider, modelId);
+    const canonical = params.canonicalizeModelId?.(normalized).trim();
+    return canonical || normalized;
+  };
+  const modelId = params.modelId ? canonicalize(params.modelId) : undefined;
+  const configuredModel = modelId
+    ? resolveMergedModelProviderModels({
+        models: providerConfig.models,
+        normalizeModelId: canonicalize,
+      }).get(modelId)
+    : undefined;
   if (
     readRecord(providerConfig.localService) !== undefined ||
     hasNonEmptyRecord(providerConfig.headers) ||
-    hasNonEmptyRecord(providerConfig.request) ||
+    hasMeaningfulProviderRequestOverride({
+      provider: params.provider,
+      request: providerConfig.request,
+      effectiveBaseUrl: configuredModel?.baseUrl ?? providerConfig.baseUrl,
+    }) ||
     hasNonEmptyRecord(providerConfig.params) ||
     typeof providerConfig.authHeader === "boolean" ||
     typeof providerConfig.timeoutSeconds === "number"
@@ -71,20 +133,10 @@ export function resolveModelProviderRouteOverridePresence(params: {
   if (!params.modelId) {
     return "none";
   }
-  const canonicalize = (modelId: string) => {
-    const normalized = normalizeModelId(params.provider, modelId);
-    const canonical = params.canonicalizeModelId?.(normalized).trim();
-    return canonical || normalized;
-  };
-  const modelId = canonicalize(params.modelId);
-  const configuredModel = resolveMergedModelProviderModels({
-    models: providerConfig.models,
-    normalizeModelId: canonicalize,
-  }).get(modelId);
   return configuredModel &&
     (hasNonEmptyRecord(configuredModel.headers) ||
       hasNonEmptyRecord(configuredModel.params) ||
-      hasNonEmptyRecord(configuredModel.compat))
+      hasMeaningfulModelCompat(configuredModel.compat))
     ? "present"
     : "none";
 }
