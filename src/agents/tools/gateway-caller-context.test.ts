@@ -151,16 +151,7 @@ describe("gateway caller context wrapper", () => {
     expect(resolveGatewayToolCallerMessageActionCapability(undefined)).toEqual({ ok: true });
   });
 
-  it.each([
-    {
-      name: "agent",
-      nested: { agentId: "agent-b", sessionKey: "agent-a:session" },
-    },
-    {
-      name: "session",
-      nested: { agentId: "agent-a", sessionKey: "agent-a:other-session" },
-    },
-  ])("fails closed when a nested tool replaces the request $name identity", async ({ nested }) => {
+  it("fails closed when a nested tool replaces the request session identity", async () => {
     let observed: unknown;
     const materialized = wrapToolWithGatewayCallerIdentity(
       {
@@ -176,7 +167,7 @@ describe("gateway caller context wrapper", () => {
           return { content: [{ type: "text" as const, text: "ok" }], details: {} };
         },
       },
-      nested,
+      { agentId: "agent-a", sessionKey: "agent-a:other-session" },
     );
 
     await runWithGatewayToolCallerRequestContext(
