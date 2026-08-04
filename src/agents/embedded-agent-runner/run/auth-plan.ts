@@ -25,16 +25,20 @@ function loadEmbeddedRunAuthProfileStore(params: {
   agentDir: string;
   config: RunEmbeddedAgentParams["config"];
   externalCliProviderIds: Iterable<string>;
+  usesOpenAIAuthRouting?: boolean;
 }): AuthProfileStore {
-  // A gateway can retain a process-local snapshot from before OAuth was added.
-  // Embedded runs must read the durable store so the Codex harness receives the
-  // same profile that the supported auth-status commands report.
-  return loadAuthProfileStoreForRuntime(params.agentDir, {
+  const options = {
     config: params.config,
     externalCliProviderIds: params.externalCliProviderIds,
     allowKeychainPrompt: false,
-    readOnly: true,
-  });
+  };
+  if (params.usesOpenAIAuthRouting === false) {
+    return ensureAuthProfileStore(params.agentDir, options);
+  }
+  // A gateway can retain a process-local snapshot from before OpenAI OAuth was added.
+  // Read the durable store for each OpenAI run while preserving provider pins
+  // through the config-aware external-auth overlay.
+  return loadAuthProfileStoreForRuntime(params.agentDir, { ...options, readOnly: true });
 }
 
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
@@ -111,15 +115,18 @@ export async function prepareEmbeddedRunAuthPlan(params: {
         agentDir: params.agentDir,
         config: runParams.config,
         externalCliProviderIds: [OPENAI_PROVIDER_ID],
+        usesOpenAIAuthRouting,
       })
     : initialPluginHarnessOwnsTransport
       ? ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, {
           allowKeychainPrompt: false,
         })
       : externalCliAuthScope.providerIds
-        ? ensureAuthProfileStore(params.agentDir, {
+        ? loadEmbeddedRunAuthProfileStore({
+            agentDir: params.agentDir,
+            config: runParams.config,
             externalCliProviderIds: externalCliAuthScope.providerIds,
-            allowKeychainPrompt: false,
+            usesOpenAIAuthRouting,
           })
         : (noExternalAuthStore ??
           ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, {
