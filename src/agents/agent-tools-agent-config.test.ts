@@ -13,6 +13,7 @@ import "./test-helpers/fast-openclaw-tools.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveChannelGroupToolsPolicy } from "../config/group-policy.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createSessionConversationTestRegistry } from "../test-utils/session-conversation-registry.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
 import { resolveEffectiveToolPolicy } from "./agent-tools.policy.js";
@@ -511,6 +512,59 @@ describe("Agent-specific tool filtering", () => {
     expect(nonOwnerTools).not.toContain("gateway");
     expect(nonOwnerTools).not.toContain("nodes");
     expect(nonOwnerTools).not.toContain("openclaw");
+  });
+
+  it("allows only cron when a non-owner group explicitly grants cron", () => {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "slack",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({
+              id: "slack",
+              capabilities: { chatTypes: ["direct", "channel", "thread"] },
+            }),
+            groups: {
+              resolveToolPolicy: ({ groupId }: { groupId?: string }) =>
+                groupId === "C-CRON" ? { alsoAllow: ["cron"] } : undefined,
+            },
+          },
+        },
+      ]),
+    );
+    const baseOptions = {
+      config: {
+        channels: {
+          slack: {
+            channels: {
+              "C-CRON": {
+                tools: { alsoAllow: ["cron"] },
+              },
+            },
+          },
+        },
+      },
+      messageProvider: "slack",
+      senderIsOwner: false,
+      workspaceDir: "/tmp/test-slack-cron-policy",
+      agentDir: "/tmp/agent-slack-cron-policy",
+    } as const;
+    const tools = createOpenClawCodingTools({
+      ...baseOptions,
+      sessionKey: "agent:main:slack:channel:C-CRON:thread:123.456",
+    }).map((tool) => tool.name);
+    const noGrantTools = createOpenClawCodingTools({
+      ...baseOptions,
+      sessionKey: "agent:main:slack:channel:C-NO-CRON:thread:123.456",
+    }).map((tool) => tool.name);
+
+    expect(tools).toContain("cron");
+    expect(noGrantTools).not.toContain("cron");
+    expect(tools).not.toContain("gateway");
+    expect(tools).not.toContain("nodes");
+    expect(tools).not.toContain("computer");
+    expect(tools).not.toContain("openclaw");
   });
 
   it("should let agent per-sender policy override global sender wildcard", () => {

@@ -89,6 +89,7 @@ import {
   buildDefaultToolPolicyPipelineSteps,
 } from "./tool-policy-pipeline.js";
 import {
+  collectExplicitAllowlist,
   expandToolGroups,
   hasRestrictiveAllowPolicy,
   mergeAlsoAllowPolicy,
@@ -117,6 +118,21 @@ function hasExplicitDenyPolicy(policy?: { deny?: string[] }): boolean {
   return (
     Array.isArray(policy?.deny) &&
     policy.deny.some((entry) => typeof entry === "string" && entry.trim())
+  );
+}
+
+function resolveOwnerOnlyCoreToolDenylist(params: {
+  senderIsOwner?: boolean;
+  groupPolicy?: { allow?: string[]; deny?: string[] };
+}): string[] {
+  if (params.senderIsOwner !== false) {
+    return [];
+  }
+  const explicitGroupAllows = new Set(
+    collectExplicitAllowlist([params.groupPolicy]).map((name) => normalizeToolName(name)),
+  );
+  return GATEWAY_OWNER_ONLY_CORE_TOOLS.filter(
+    (name) => name !== "cron" || !explicitGroupAllows.has("cron"),
   );
 }
 
@@ -796,8 +812,10 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
           workspaceOnly: applyPatchWorkspaceOnly,
         });
   options?.recordToolPrepStage?.("shell-tools");
-  const ownerOnlyCoreToolDenylist =
-    options?.senderIsOwner === false ? [...GATEWAY_OWNER_ONLY_CORE_TOOLS] : [];
+  const ownerOnlyCoreToolDenylist = resolveOwnerOnlyCoreToolDenylist({
+    senderIsOwner: options?.senderIsOwner,
+    groupPolicy,
+  });
   const ownerOnlyCoreToolPolicy =
     ownerOnlyCoreToolDenylist.length > 0 ? { deny: ownerOnlyCoreToolDenylist } : undefined;
   const pluginToolAllowlist = appendRuntimePluginToolGrant(
