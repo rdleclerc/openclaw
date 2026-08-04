@@ -149,8 +149,12 @@ function spawnAuthFixture(source: string, env: Record<string, string>) {
   });
   const waitFor = async (text: string) => {
     for (let attempt = 0; attempt < 1_000; attempt += 1) {
-      if (stdout.includes(text)) return;
-      if (child.exitCode !== null) throw new Error(`fixture exited before ${text}: ${stderr}`);
+      if (stdout.includes(text)) {
+        return;
+      }
+      if (child.exitCode !== null) {
+        throw new Error(`fixture exited before ${text}: ${stderr}`);
+      }
       await delay(10);
     }
     throw new Error(`fixture did not emit ${text}: ${stderr}`);
@@ -273,8 +277,98 @@ function authRaceResult(stdout: string): { ok: boolean; elapsedMs: number } {
     .trim()
     .split("\n")
     .findLast((entry) => entry.startsWith("{"));
-  if (!line) throw new Error(`missing race result: ${stdout}`);
+  if (!line) {
+    throw new Error(`missing race result: ${stdout}`);
+  }
   return JSON.parse(line) as { ok: boolean; elapsedMs: number };
+}
+
+type AuthOwnerRaceHarness = {
+  childDir: string;
+  childCredential: AuthProfileStore["profiles"][string];
+  profileId: string;
+  now: number;
+  mainPath: string;
+  childPath: string;
+  seed: () => void;
+  worker: (
+    action: "update" | "takeover",
+    blockedUntil: number,
+  ) => ReturnType<typeof spawnAuthRaceWorker>;
+  start: (fixture: ReturnType<typeof spawnAuthRaceWorker>) => Promise<void>;
+  release: (fixture: ReturnType<typeof spawnAuthLockHolder>) => Promise<void>;
+};
+
+async function withAuthOwnerRaceState(
+  run: (harness: AuthOwnerRaceHarness) => Promise<void>,
+): Promise<void> {
+  await withAuthProfileTestState(
+    "openclaw-auth-owner-races-",
+    async ({ stateDir, agentDirFor }) => {
+      const childDir = agentDirFor("child");
+      const profileId = "openai:primary";
+      const now = Date.now();
+      const mainCredential = {
+        type: "oauth" as const,
+        provider: "openai",
+        access: "main-old",
+        refresh: "refresh",
+        expires: now + 60_000,
+        accountId: "acct",
+      };
+      const childCredential = {
+        ...mainCredential,
+        access: "child-new",
+        expires: now + 120_000,
+      };
+      const seed = () => {
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: { [profileId]: mainCredential },
+          usageStats: { [profileId]: { lastUsed: 0 } },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: { [profileId]: childCredential },
+            usageStats: { [profileId]: { lastUsed: 1 } },
+          },
+          childDir,
+        );
+      };
+      const worker = (action: "update" | "takeover", blockedUntil: number) =>
+        spawnAuthRaceWorker({
+          OPENCLAW_STATE_DIR: stateDir,
+          AUTH_RACE_ACTION: action,
+          AUTH_RACE_PROFILE_ID: profileId,
+          AUTH_RACE_CHILD_DIR: childDir,
+          AUTH_RACE_BLOCKED_UNTIL: String(blockedUntil),
+        });
+      const start = async (fixture: ReturnType<typeof spawnAuthRaceWorker>) => {
+        await fixture.waitFor("ready");
+        fixture.child.stdin.end("go\n");
+      };
+      const release = async (fixture: ReturnType<typeof spawnAuthLockHolder>) => {
+        if (fixture.child.exitCode === null) {
+          fixture.child.stdin.end("release\n");
+        }
+        await fixture.done;
+      };
+      await run({
+        childDir,
+        childCredential,
+        profileId,
+        now,
+        mainPath: resolveAuthProfileDatabasePath(),
+        childPath: resolveAuthProfileDatabasePath(childDir),
+        seed,
+        worker,
+        start,
+        release,
+      });
+    },
+    { clearOAuthDir: true },
+  );
 }
 
 describe("promoteAuthProfileInOrder", () => {
@@ -828,60 +922,9 @@ describe("promoteAuthProfileInOrder", () => {
     );
   });
 
-  it("serializes writer-first, takeover-first, and main-lock timeout interleavings", async () => {
-    await withAuthProfileTestState(
-      "openclaw-auth-owner-races-",
-      async ({ stateDir, agentDirFor }) => {
-        const childDir = agentDirFor("child");
-        const profileId = "openai:primary";
-        const now = Date.now();
-        const mainCredential = {
-          type: "oauth" as const,
-          provider: "openai",
-          access: "main-old",
-          refresh: "refresh",
-          expires: now + 60_000,
-          accountId: "acct",
-        };
-        const childCredential = {
-          ...mainCredential,
-          access: "child-new",
-          expires: now + 120_000,
-        };
-        const seed = () => {
-          saveAuthProfileStore({
-            version: AUTH_STORE_VERSION,
-            profiles: { [profileId]: mainCredential },
-            usageStats: { [profileId]: { lastUsed: 0 } },
-          });
-          saveAuthProfileStore(
-            {
-              version: AUTH_STORE_VERSION,
-              profiles: { [profileId]: childCredential },
-              usageStats: { [profileId]: { lastUsed: 1 } },
-            },
-            childDir,
-          );
-        };
-        const worker = (action: "update" | "takeover", blockedUntil: number) =>
-          spawnAuthRaceWorker({
-            OPENCLAW_STATE_DIR: stateDir,
-            AUTH_RACE_ACTION: action,
-            AUTH_RACE_PROFILE_ID: profileId,
-            AUTH_RACE_CHILD_DIR: childDir,
-            AUTH_RACE_BLOCKED_UNTIL: String(blockedUntil),
-          });
-        const start = async (fixture: ReturnType<typeof spawnAuthRaceWorker>) => {
-          await fixture.waitFor("ready");
-          fixture.child.stdin.end("go\n");
-        };
-        const release = async (fixture: ReturnType<typeof spawnAuthLockHolder>) => {
-          if (fixture.child.exitCode === null) fixture.child.stdin.end("release\n");
-          await fixture.done;
-        };
-        const mainPath = resolveAuthProfileDatabasePath();
-        const childPath = resolveAuthProfileDatabasePath(childDir);
-
+  it("serializes a main-owner writer before a child takeover", async () => {
+    await withAuthOwnerRaceState(
+      async ({ childDir, childPath, mainPath, now, profileId, release, seed, start, worker }) => {
         seed();
         const childHolder = spawnAuthLockHolder(childPath);
         await childHolder.waitFor("locked");
@@ -895,7 +938,9 @@ describe("promoteAuthProfileInOrder", () => {
           expect(authRaceResult(await writer.done).ok).toBe(true);
           expect(authRaceResult(await takeover.done).ok).toBe(true);
         } finally {
-          if (childHolder.child.exitCode === null) await release(childHolder);
+          if (childHolder.child.exitCode === null) {
+            await release(childHolder);
+          }
         }
         expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]?.blockedUntil).toBe(
           now + 300_000,
@@ -903,7 +948,23 @@ describe("promoteAuthProfileInOrder", () => {
         expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]?.blockedUntil).toBe(
           now + 300_000,
         );
+      },
+    );
+  });
 
+  it("serializes a child-owner update behind a main takeover", async () => {
+    await withAuthOwnerRaceState(
+      async ({
+        childCredential,
+        childDir,
+        mainPath,
+        now,
+        profileId,
+        release,
+        seed,
+        start,
+        worker,
+      }) => {
         seed();
         const mainHolder = spawnAuthLockHolder(mainPath, {
           ...childCredential,
@@ -922,7 +983,9 @@ describe("promoteAuthProfileInOrder", () => {
           await release(mainHolder);
           expect(authRaceResult(await takeoverFollower.done).ok).toBe(true);
         } finally {
-          if (mainHolder.child.exitCode === null) await release(mainHolder);
+          if (mainHolder.child.exitCode === null) {
+            await release(mainHolder);
+          }
         }
         expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]?.blockedUntil).toBe(
           now + 400_000,
@@ -930,7 +993,13 @@ describe("promoteAuthProfileInOrder", () => {
         expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]).toEqual({
           lastUsed: 1,
         });
+      },
+    );
+  });
 
+  it("times out a child-owner update without mutating the child store while main is locked", async () => {
+    await withAuthOwnerRaceState(
+      async ({ childDir, mainPath, now, profileId, release, seed, start, worker }) => {
         seed();
         const slowMainHolder = spawnAuthLockHolder(mainPath);
         await slowMainHolder.waitFor("locked");
@@ -947,9 +1016,8 @@ describe("promoteAuthProfileInOrder", () => {
           lastUsed: 1,
         });
       },
-      { clearOAuthDir: true },
     );
-  }, 20_000);
+  });
 
   it("refreshes inherited main selection state without advancing credential ownership", async () => {
     await withAuthProfileTestState(
