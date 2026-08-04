@@ -199,7 +199,7 @@ function spawnAuthRaceWorker(env: Record<string, string>) {
       } else {
         result = await updateAuthProfileStoreWithLock({
             agentDir: takeover ? undefined : childDir,
-            persistedOwnerProfileId: takeover ? undefined : profileId,
+            ...(takeover ? {} : { ownership: { mode: "persisted-profile", profileId } }),
             updater: (store) => {
               if (takeover) {
                 const source = runAuthProfileWriteTransaction(childDir, (database) =>
@@ -372,7 +372,7 @@ async function withAuthOwnerRaceState(
 }
 
 describe("promoteAuthProfileInOrder", () => {
-  it("publishes a child-owner update before releasing the coordinating main transaction", async () => {
+  it("publishes a child-owner update after the coordinating main transaction commits", async () => {
     await withAuthProfileTestState(
       "openclaw-auth-child-publication-",
       async ({ agentDirFor }) => {
@@ -408,29 +408,100 @@ describe("promoteAuthProfileInOrder", () => {
           },
           childDir,
         );
-        let publishedWhileMainLocked = false;
+        let publishedAfterMainCommit = false;
         storeTesting.setRuntimeSnapshotPublisherForTest((publish) => {
           const probe = new DatabaseSync(resolveAuthProfileDatabasePath());
           probe.exec("PRAGMA busy_timeout = 0");
-          expect(() => probe.exec("BEGIN IMMEDIATE")).toThrow();
+          expect(() => probe.exec("BEGIN IMMEDIATE; ROLLBACK")).not.toThrow();
           probe.close();
-          publishedWhileMainLocked = true;
+          publishedAfterMainCommit = true;
           publish();
         });
 
         await updateAuthProfileStoreWithLock({
           agentDir: childDir,
-          persistedOwnerProfileId: profileId,
+          ownership: { mode: "persisted-profile", profileId },
           updater: (store) => {
             store.usageStats = { [profileId]: { lastUsed: 7 } };
             return true;
           },
         });
 
-        expect(publishedWhileMainLocked).toBe(true);
+        expect(publishedAfterMainCommit).toBe(true);
         expect(loadPersistedAuthProfileStore(childDir)?.usageStats?.[profileId]).toEqual({
           lastUsed: 7,
         });
+      },
+      { clearOAuthDir: true },
+    );
+  });
+
+  it("withholds publication and invalidates snapshots after an outer main rollback", async () => {
+    await withAuthProfileTestState(
+      "openclaw-auth-coordinated-rollback-",
+      async ({ agentDirFor }) => {
+        const childDir = agentDirFor("child");
+        const inheritedProfileId = "openai:inherited";
+        const localProfileId = "openai:local";
+        saveAuthProfileStore({
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            [inheritedProfileId]: {
+              type: "oauth",
+              provider: "openai",
+              access: "main-access",
+              refresh: "main-refresh",
+              expires: Date.now() + 60_000,
+              accountId: "acct-main",
+            },
+          },
+        });
+        saveAuthProfileStore(
+          {
+            version: AUTH_STORE_VERSION,
+            profiles: {
+              [localProfileId]: {
+                type: "api_key",
+                provider: "openai",
+                key: "sk-local",
+              },
+            },
+          },
+          childDir,
+        );
+        replaceRuntimeAuthProfileStoreSnapshots([
+          { store: loadAuthProfileStoreForRuntime() },
+          { agentDir: childDir, store: loadAuthProfileStoreForRuntime(childDir) },
+        ]);
+        const mainDatabase = openOpenClawAgentDatabase({
+          agentId: "main",
+          path: resolveAuthProfileDatabasePath(),
+        });
+        mainDatabase.db.exec(`
+          CREATE TRIGGER reject_coordinated_main_auth_update
+          BEFORE UPDATE ON auth_profile_store
+          BEGIN
+            SELECT RAISE(ABORT, 'injected coordinating main failure');
+          END;
+        `);
+        let publicationCount = 0;
+        storeTesting.setRuntimeSnapshotPublisherForTest((publish) => {
+          publicationCount += 1;
+          publish();
+        });
+
+        const result = await removeAuthProfilesWithLock({
+          agentDir: childDir,
+          profileIds: [localProfileId, inheritedProfileId],
+        });
+        mainDatabase.db.exec("DROP TRIGGER reject_coordinated_main_auth_update;");
+
+        expect(result).toBeNull();
+        expect(publicationCount).toBe(0);
+        expect(loadPersistedAuthProfileStore(childDir)?.profiles[localProfileId]).toBeUndefined();
+        expect(loadPersistedAuthProfileStore()?.profiles[inheritedProfileId]).toBeDefined();
+        expect(getRuntimeAuthProfileStoreSnapshot()).toBeUndefined();
+        expect(getRuntimeAuthProfileStoreSnapshot(childDir)).toBeUndefined();
       },
       { clearOAuthDir: true },
     );

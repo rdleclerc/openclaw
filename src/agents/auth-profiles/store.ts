@@ -971,22 +971,45 @@ function mergeRuntimeExternalProfileState(params: {
   return merged;
 }
 
+type AuthProfileStoreOwnershipMode =
+  | {
+      mode: "persisted-profile";
+      profileId: string;
+    }
+  | {
+      mode: "oauth-upsert";
+      profileId: string;
+      credential: OAuthCredential;
+    }
+  | {
+      mode: "local-and-inherited-oauth";
+      updateInherited: (store: AuthProfileStore, localStore: AuthProfileStore) => boolean;
+    };
+
+type AuthProfileStoreUpdateContext = {
+  ownerAgentDir: string | undefined;
+};
+
 /** Apply an auth store update inside the SQLite write lock. */
 export async function updateAuthProfileStoreWithLock(params: {
   agentDir?: string;
-  inheritedOAuthUpdater?: (store: AuthProfileStore, localStore: AuthProfileStore) => boolean;
-  persistedOwnerProfileId?: string;
-  persistedOwnerNextOAuthCredential?: OAuthCredential;
+  ownership?: AuthProfileStoreOwnershipMode;
   saveOptions?: SaveAuthProfileStoreOptions;
-  updater: (store: AuthProfileStore) => boolean;
+  updater: (store: AuthProfileStore, context?: AuthProfileStoreUpdateContext) => boolean;
 }): Promise<AuthProfileStore | null> {
   let ownerAgentDir = params.agentDir;
+  let childWriteCommitted = false;
+  let publishLocalRuntimeSnapshots: (() => void) | undefined;
   let publishRuntimeSnapshots: (() => void) | undefined;
   let store: AuthProfileStore;
   try {
-    const profileId = params.persistedOwnerProfileId;
+    const ownership = params.ownership;
+    const profileId =
+      ownership?.mode === "persisted-profile" || ownership?.mode === "oauth-upsert"
+        ? ownership.profileId
+        : undefined;
     const coordinatesInheritedOwner =
-      (profileId !== undefined || params.inheritedOAuthUpdater !== undefined) &&
+      ownership !== undefined &&
       params.agentDir !== undefined &&
       resolveAuthStorePath(params.agentDir) !== resolveAuthStorePath();
     if (coordinatesInheritedOwner) {
@@ -1004,30 +1027,22 @@ export async function updateAuthProfileStoreWithLock(params: {
         let localStore!: AuthProfileStore;
         let localOwns = false;
         let shouldUpdateOwner = true;
-        let publishLocal: (() => void) | undefined;
+        let localStoreBeforeUpdate: AuthProfileStore | undefined;
         runAuthProfileWriteTransaction(localAgentDir, (localDatabase) => {
           localStore = loadAuthProfileStoreForAgent(localAgentDir, {
             database: localDatabase,
             readOnly: true,
             syncExternalCli: false,
           });
-          if (params.inheritedOAuthUpdater) {
-            const localStoreBeforeUpdate = cloneAuthProfileStore(localStore);
+          if (ownership.mode === "local-and-inherited-oauth") {
+            localStoreBeforeUpdate = cloneAuthProfileStore(localStore);
             ownerAgentDir = localAgentDir;
-            if (params.updater(localStore)) {
-              publishLocal = saveAuthProfileStoreInTransaction(
+            if (params.updater(localStore, { ownerAgentDir: localAgentDir })) {
+              publishLocalRuntimeSnapshots = saveAuthProfileStoreInTransaction(
                 localStore,
                 localAgentDir,
                 params.saveOptions,
                 localDatabase,
-              );
-            }
-            if (params.inheritedOAuthUpdater(mainStore, localStoreBeforeUpdate)) {
-              publishRuntimeSnapshots = saveAuthProfileStoreInTransaction(
-                mainStore,
-                undefined,
-                params.saveOptions,
-                mainDatabase,
               );
             }
             return;
@@ -1042,19 +1057,23 @@ export async function updateAuthProfileStoreWithLock(params: {
               localStore,
               mainStore,
             }) === localAgentDir;
-          if (params.persistedOwnerNextOAuthCredential) {
+          if (ownership.mode === "oauth-upsert") {
             const destination = resolveOAuthUpsertOwnerFromIntendedCredential({
               agentDir: localAgentDir,
               profileId,
-              credential: params.persistedOwnerNextOAuthCredential,
+              credential: ownership.credential,
               localStore,
               mainStore,
             });
             localOwns = destination.ownerAgentDir === localAgentDir;
             shouldUpdateOwner = destination.shouldWrite;
           }
-          if (localOwns && shouldUpdateOwner && params.updater(localStore)) {
-            publishLocal = saveAuthProfileStoreInTransaction(
+          if (
+            localOwns &&
+            shouldUpdateOwner &&
+            params.updater(localStore, { ownerAgentDir: localAgentDir })
+          ) {
+            publishLocalRuntimeSnapshots = saveAuthProfileStoreInTransaction(
               localStore,
               localAgentDir,
               params.saveOptions,
@@ -1062,17 +1081,27 @@ export async function updateAuthProfileStoreWithLock(params: {
             );
           }
         });
-        if (params.inheritedOAuthUpdater) {
-          publishRuntimeSnapshotsAfterCommit(publishLocal);
+        childWriteCommitted = publishLocalRuntimeSnapshots !== undefined;
+        if (ownership.mode === "local-and-inherited-oauth") {
+          if (
+            localStoreBeforeUpdate &&
+            ownership.updateInherited(mainStore, localStoreBeforeUpdate)
+          ) {
+            publishRuntimeSnapshots = saveAuthProfileStoreInTransaction(
+              mainStore,
+              undefined,
+              params.saveOptions,
+              mainDatabase,
+            );
+          }
           return localStore;
         }
         if (localOwns) {
           ownerAgentDir = localAgentDir;
-          publishRuntimeSnapshotsAfterCommit(publishLocal);
           return localStore;
         }
         ownerAgentDir = undefined;
-        if (shouldUpdateOwner && params.updater(mainStore)) {
+        if (shouldUpdateOwner && params.updater(mainStore, { ownerAgentDir: undefined })) {
           publishRuntimeSnapshots = saveAuthProfileStoreInTransaction(
             mainStore,
             undefined,
@@ -1089,7 +1118,13 @@ export async function updateAuthProfileStoreWithLock(params: {
           readOnly: true,
           syncExternalCli: false,
         });
-        const shouldSave = params.updater(loadedStore);
+        const semanticOwnerAgentDir =
+          ownerAgentDir && resolveAuthStorePath(ownerAgentDir) !== resolveAuthStorePath()
+            ? ownerAgentDir
+            : undefined;
+        const shouldSave = params.updater(loadedStore, {
+          ownerAgentDir: semanticOwnerAgentDir,
+        });
         if (shouldSave) {
           publishRuntimeSnapshots = saveAuthProfileStoreInTransaction(
             loadedStore,
@@ -1102,14 +1137,28 @@ export async function updateAuthProfileStoreWithLock(params: {
       });
     }
   } catch (error) {
+    if (childWriteCommitted) {
+      // Independent child durability cannot roll back with the coordinating main
+      // transaction. Invalidate snapshots so the durable partial result is reread.
+      clearRuntimeAuthProfileStoreSnapshotsImpl();
+    }
     const message = error instanceof Error ? error.message : String(error);
     log.warn(`auth profile store update failed: ${message}`, {
       agentDir: ownerAgentDir,
+      childWriteCommitted,
       error: message,
     });
     return null;
   }
-  publishRuntimeSnapshotsAfterCommit(publishRuntimeSnapshots);
+  const publishCoordinatedRuntimeSnapshots =
+    publishLocalRuntimeSnapshots || publishRuntimeSnapshots
+      ? () => {
+          publishLocalRuntimeSnapshots?.();
+          publishRuntimeSnapshots?.();
+        }
+      : undefined;
+  // Cross-database writes publish only after the coordinating main commit.
+  publishRuntimeSnapshotsAfterCommit(publishCoordinatedRuntimeSnapshots);
   return store;
 }
 

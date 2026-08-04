@@ -21,6 +21,7 @@ import {
 import {
   areOAuthCredentialsEquivalent,
   hasMatchingOAuthIdentity,
+  hasOAuthIdentity,
   hasUsableOAuthCredential,
   isSafeToAdoptBootstrapOAuthIdentity,
   isSafeToAdoptMainStoreOAuthIdentity,
@@ -469,7 +470,7 @@ export function createOAuthManager(adapter: OAuthManagerAdapter) {
     let saved = false;
     const result = await updateAuthProfileStoreWithLock({
       agentDir: params.agentDir,
-      persistedOwnerProfileId: params.profileId,
+      ownership: { mode: "persisted-profile", profileId: params.profileId },
       updater: (store) => {
         const existing = store.profiles[params.profileId];
         const expectedCredentials = Array.isArray(params.expected)
@@ -504,35 +505,33 @@ export function createOAuthManager(adapter: OAuthManagerAdapter) {
   async function resolveOAuthCredentialAfterPersistMiss(params: {
     agentDir?: string;
     profileId: string;
-    expected: OAuthCredential | OAuthCredential[];
+    attemptedOwnerAgentDir?: string;
     refreshed: OAuthCredential;
   }): Promise<OAuthCredential | null> {
-    // Single locked pass decides both outcomes so no relog can slip between a
-    // pre-read and the update. Persist only over material this refresh actually
-    // attempted; otherwise adopt the newer current credential for this call.
+    // Same-owner refresh losers must persist their newly rotated token. Only a
+    // relog or a main/child owner transition may displace that token family.
     let adopted: OAuthCredential | null = null;
     const result = await updateAuthProfileStoreWithLock({
       agentDir: params.agentDir,
-      persistedOwnerProfileId: params.profileId,
-      updater: (store) => {
+      ownership: { mode: "persisted-profile", profileId: params.profileId },
+      updater: (store, context) => {
         const existing = store.profiles[params.profileId];
         if (existing?.type !== "oauth" || existing.provider !== params.refreshed.provider) {
           return false;
         }
-        const expectedCredentials = Array.isArray(params.expected)
-          ? params.expected
-          : [params.expected];
-        if (
-          expectedCredentials.some((expected) =>
-            areOAuthCredentialsEquivalent(existing, expected),
-          ) &&
-          hasMatchingOAuthIdentity(existing, params.refreshed)
-        ) {
+        const ownerTransition = context?.ownerAgentDir !== params.attemptedOwnerAgentDir;
+        const sameIdentity = hasMatchingOAuthIdentity(existing, params.refreshed);
+        if (sameIdentity && !ownerTransition) {
           store.profiles[params.profileId] = { ...params.refreshed };
           adopted = params.refreshed;
           return true;
         }
-        adopted = hasUsableOAuthCredential(existing) ? existing : null;
+        const identityTransition =
+          hasOAuthIdentity(existing) && hasOAuthIdentity(params.refreshed) && !sameIdentity;
+        adopted =
+          (ownerTransition || identityTransition) && hasUsableOAuthCredential(existing)
+            ? existing
+            : null;
         return false;
       },
     });
@@ -693,7 +692,7 @@ export function createOAuthManager(adapter: OAuthManagerAdapter) {
           const recovered = await resolveOAuthCredentialAfterPersistMiss({
             agentDir: params.agentDir,
             profileId: params.profileId,
-            expected: expectedCredentials,
+            attemptedOwnerAgentDir: ownerAgentDir,
             refreshed: refreshedCredentials,
           });
           if (!recovered) {

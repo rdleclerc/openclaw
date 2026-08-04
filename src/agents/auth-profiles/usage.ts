@@ -775,7 +775,7 @@ export async function markAuthProfileFailure(params: {
   let updateTime = 0;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
-    persistedOwnerProfileId: profileId,
+    ownership: { mode: "persisted-profile", profileId },
     updater: (freshStore) => {
       const profileValue = freshStore.profiles[profileId];
       if (!profileValue || isAuthCooldownBypassedForProvider(profileValue.provider)) {
@@ -914,7 +914,7 @@ export async function markAuthProfileBlockedUntil(params: {
   let updateTime = 0;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
-    persistedOwnerProfileId: profileId,
+    ownership: { mode: "persisted-profile", profileId },
     updater: (freshStore) => {
       const profileLocal = freshStore.profiles[profileId];
       if (!profileLocal || isAuthCooldownBypassedForProvider(profileLocal.provider)) {
@@ -989,7 +989,7 @@ export async function clearAuthProfileCooldown(params: {
   const { store, profileId, agentDir } = params;
   const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
     agentDir,
-    persistedOwnerProfileId: profileId,
+    ownership: { mode: "persisted-profile", profileId },
     updater: (freshStore) => {
       if (!freshStore.usageStats?.[profileId]) {
         return false;

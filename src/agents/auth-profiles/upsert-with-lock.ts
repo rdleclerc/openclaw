@@ -18,8 +18,11 @@ export async function upsertAuthProfileWithLock(params: {
     agentDir: params.agentDir,
     ...(credential.type === "oauth"
       ? {
-          persistedOwnerProfileId: params.profileId,
-          persistedOwnerNextOAuthCredential: credential,
+          ownership: {
+            mode: "oauth-upsert" as const,
+            profileId: params.profileId,
+            credential,
+          },
         }
       : {}),
     saveOptions: {

@@ -528,7 +528,7 @@ describe("createOAuthManager", () => {
     });
   });
 
-  it("adopts newer same-identity material after a refresh CAS race", async () => {
+  it("persists its rotated same-identity token after a refresh CAS race", async () => {
     await withOAuthTempRoot("oauth-manager-cas-same-identity-", async (tempRoot) => {
       const agentDir = path.join(tempRoot, "agents", "main", "agent");
       await fs.mkdir(agentDir, { recursive: true });
@@ -587,14 +587,14 @@ describe("createOAuthManager", () => {
         agentDir,
       });
 
-      expect(result?.apiKey).toBe("stale-race-access");
+      expect(result?.apiKey).toBe("rotated-access");
       const persisted = ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
         allowKeychainPrompt: false,
       });
       expect(persisted.profiles[profileId]).toMatchObject({
         type: "oauth",
-        access: "stale-race-access",
-        refresh: "consumed-race-refresh",
+        access: "rotated-access",
+        refresh: "rotated-refresh",
         accountId: "acct-123",
       });
     });

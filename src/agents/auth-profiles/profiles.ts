@@ -275,24 +275,27 @@ export async function removeProviderAuthProfilesWithLock(params: {
   };
   return await updateAuthProfileStoreWithLock({
     agentDir: params.agentDir,
-    inheritedOAuthUpdater: (store, localStore) => {
-      const mainOwnedOAuthProfileIds = new Set(
-        listProfilesForProvider(store, params.provider).filter((profileId) => {
-          const mainCredential = store.profiles[profileId];
-          if (mainCredential?.type !== "oauth") {
-            return false;
-          }
-          const localCredential = localStore.profiles[profileId];
-          return (
-            !localCredential ||
-            shouldUseMainOwnerForLocalOAuthCredential({
-              local: localCredential,
-              main: mainCredential,
-            })
-          );
-        }),
-      );
-      return removeProfileIdsFromStore(store, mainOwnedOAuthProfileIds);
+    ownership: {
+      mode: "local-and-inherited-oauth",
+      updateInherited: (store, localStore) => {
+        const mainOwnedOAuthProfileIds = new Set(
+          listProfilesForProvider(store, params.provider).filter((profileId) => {
+            const mainCredential = store.profiles[profileId];
+            if (mainCredential?.type !== "oauth") {
+              return false;
+            }
+            const localCredential = localStore.profiles[profileId];
+            return (
+              !localCredential ||
+              shouldUseMainOwnerForLocalOAuthCredential({
+                local: localCredential,
+                main: mainCredential,
+              })
+            );
+          }),
+        );
+        return removeProfileIdsFromStore(store, mainOwnedOAuthProfileIds);
+      },
     },
     updater: (store) => removeProviderProfiles(store, false),
   });
@@ -306,24 +309,27 @@ export async function removeAuthProfilesWithLock(params: {
   const profileIds = new Set(dedupeProfileIds([...params.profileIds]));
   return await updateAuthProfileStoreWithLock({
     agentDir: params.agentDir,
-    inheritedOAuthUpdater: (store, localStore) => {
-      const inheritedOAuthProfileIds = new Set(
-        [...profileIds].filter((profileId) => {
-          const mainCredential = store.profiles[profileId];
-          if (mainCredential?.type !== "oauth") {
-            return false;
-          }
-          const localCredential = localStore.profiles[profileId];
-          return (
-            !localCredential ||
-            shouldUseMainOwnerForLocalOAuthCredential({
-              local: localCredential,
-              main: mainCredential,
-            })
-          );
-        }),
-      );
-      return removeProfileIdsFromStore(store, inheritedOAuthProfileIds);
+    ownership: {
+      mode: "local-and-inherited-oauth",
+      updateInherited: (store, localStore) => {
+        const inheritedOAuthProfileIds = new Set(
+          [...profileIds].filter((profileId) => {
+            const mainCredential = store.profiles[profileId];
+            if (mainCredential?.type !== "oauth") {
+              return false;
+            }
+            const localCredential = localStore.profiles[profileId];
+            return (
+              !localCredential ||
+              shouldUseMainOwnerForLocalOAuthCredential({
+                local: localCredential,
+                main: mainCredential,
+              })
+            );
+          }),
+        );
+        return removeProfileIdsFromStore(store, inheritedOAuthProfileIds);
+      },
     },
     updater: (store) => removeProfileIdsFromStore(store, profileIds),
   });
@@ -338,7 +344,7 @@ export async function clearLastGoodProfileWithLock(params: {
   const providerKey = resolveProviderIdForAuth(params.provider);
   return await updateAuthProfileStoreWithLock({
     agentDir: params.agentDir,
-    persistedOwnerProfileId: params.profileId,
+    ownership: { mode: "persisted-profile", profileId: params.profileId },
     updater: (store) => {
       const lastGoodKey = findProviderAuthStateKey(store.lastGood, providerKey);
       if (!lastGoodKey || store.lastGood?.[lastGoodKey] !== params.profileId) {
@@ -365,7 +371,7 @@ export async function markAuthProfileSuccess(params: {
   const lastUsed = Date.now();
   const updated = await updateAuthProfileStoreWithLock({
     agentDir,
-    persistedOwnerProfileId: profileId,
+    ownership: { mode: "persisted-profile", profileId },
     updater: (freshStore) => {
       const profile = freshStore.profiles[profileId];
       if (!profile || resolveProviderIdForAuth(profile.provider) !== providerKey) {
