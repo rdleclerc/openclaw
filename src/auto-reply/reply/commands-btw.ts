@@ -53,6 +53,11 @@ export const handleBtwCommand: CommandHandler = defineAuthorizedTextCommand(
       const groupId = resolveGroupSessionKey(params.ctx)?.id ?? targetSessionEntry.groupId;
       const runId = params.opts?.runId ?? `btw-${randomUUID()}`;
       const currentChannelProvider = normalizeAnyChannelId(params.ctx.Provider);
+      const currentThreadId = params.ctx.MessageThreadId ?? params.ctx.TransportThreadId;
+      const currentThreadTs =
+        currentThreadId === undefined || currentThreadId === null
+          ? undefined
+          : String(currentThreadId).trim() || undefined;
       const capabilitySessionKey = params.ctx.RuntimePolicySessionKey ?? params.sessionKey;
       const messageActionTurnCapability =
         isTrustedMessageActionTurnIngress(params.ctx.Provider) &&
@@ -72,7 +77,10 @@ export const handleBtwCommand: CommandHandler = defineAuthorizedTextCommand(
                 currentChatType: chatType,
                 currentMessagingTarget: messageTo,
                 currentChannelProvider,
+                currentThreadTs,
                 currentMessageId: params.ctx.MessageSidFull ?? params.ctx.MessageSid,
+                sameChannelThreadRequired:
+                  currentChannelProvider === "slack" && Boolean(currentThreadTs),
               },
             })
           : undefined;

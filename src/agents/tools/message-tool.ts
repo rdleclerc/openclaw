@@ -98,6 +98,7 @@ import {
 } from "../schema/typebox.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringArrayParam, readStringParam } from "./common.js";
+import { resolveGatewayToolCallerMessageActionCapability } from "./gateway-caller-context.js";
 import { gatewayCallOptionSchemaProperties } from "./gateway-schema.js";
 import {
   readGatewayCallOptions,
@@ -1607,17 +1608,23 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       const action = readStringParam(params, "action", {
         required: true,
       }) as ChannelMessageActionName;
+      const activeTurnCapability = resolveGatewayToolCallerMessageActionCapability(
+        options?.messageActionTurnCapability,
+      );
       const trustedTurnContext =
-        resolvedAgentId && options?.agentSessionKey
+        activeTurnCapability.ok && resolvedAgentId && options?.agentSessionKey
           ? resolveMessageActionTurnCapability({
-              token: options.messageActionTurnCapability,
+              token: activeTurnCapability.token,
               agentId: resolvedAgentId,
               runId: options.runId,
               sessionKey: options.agentSessionKey,
               sessionId: options.sessionId,
             })
           : undefined;
-      if (normalizeOptionalString(options?.messageActionTurnCapability) && !trustedTurnContext) {
+      if (
+        (!activeTurnCapability.ok || normalizeOptionalString(activeTurnCapability.token)) &&
+        !trustedTurnContext
+      ) {
         throw new Error("message action turn capability is no longer active");
       }
       if (options?.sourceReplyOnly) {
@@ -1862,7 +1869,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
                 resolveMessageActionAgentRuntimeIdentityToken({
                   opts: gatewayOpts,
                   target: gatewayResolved.target,
-                  turnCapability: options?.messageActionTurnCapability,
+                  turnCapability: activeTurnCapability.ok ? activeTurnCapability.token : undefined,
                   runId: options?.runId,
                   sessionId: options?.sessionId,
                   sourceReplyFinal: context?.sourceReplyFinal,

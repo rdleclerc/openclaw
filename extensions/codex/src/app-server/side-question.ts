@@ -17,6 +17,7 @@ import {
   type NativeHookRelayEvent,
   type NativeHookRelayRegistrationHandle,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { runWithAgentHarnessGatewayToolRequestContext } from "openclaw/plugin-sdk/agent-harness-tool-runtime";
 import { loadExecApprovals } from "openclaw/plugin-sdk/exec-approvals-runtime";
 import { resolveCodexAppServerForModelProvider } from "./app-server-policy.js";
 import { handleCodexAppServerApprovalRequest } from "./approval-bridge.js";
@@ -281,9 +282,10 @@ export async function runCodexAppServerSideQuestion(
       }
     : params;
   const sideRunParams = buildSideRunAttemptParams(effectiveParams, { cwd, authProfileId, runId });
+  const sideSandboxSessionKey = resolveCodexSideSandboxSessionKey(effectiveParams, sessionAgentId);
   const nativeExecutionBlock = resolveCodexNativeExecutionBlock({
     config: sideRunParams.config,
-    sessionKey: sideRunParams.sandboxSessionKey?.trim() || sideRunParams.sessionKey,
+    sessionKey: sideSandboxSessionKey,
     sessionId: sideRunParams.sessionId,
     surface: "/btw side-question mode",
   });
@@ -421,6 +423,7 @@ export async function runCodexAppServerSideQuestion(
       nativeProviderWebSearchSupport,
       runId,
       signal: runAbortController.signal,
+      sandboxSessionKey: sideSandboxSessionKey,
     });
     // Auth refresh is client-owned; keep one shared handler per physical client.
     ensureCodexAppServerClientRuntime(client, {
@@ -496,13 +499,23 @@ export async function runCodexAppServerSideQuestion(
           sessionKey: params.sessionKey,
         };
         emitDynamicToolStartedDiagnostic(diagnosticContext);
-        const toolCall = handleDynamicToolCallWithTimeout({
-          call,
-          toolBridge,
-          signal: runAbortController.signal,
-          timeoutMs,
-          observeToolTerminal: sideRunParams.observeToolTerminal,
-        });
+        const toolCall = runWithAgentHarnessGatewayToolRequestContext(
+          sideSandboxSessionKey
+            ? {
+                agentId: sessionAgentId,
+                sessionKey: sideSandboxSessionKey,
+                messageActionTurnCapability: sideRunParams.messageActionTurnCapability,
+              }
+            : undefined,
+          () =>
+            handleDynamicToolCallWithTimeout({
+              call,
+              toolBridge,
+              signal: runAbortController.signal,
+              timeoutMs,
+              observeToolTerminal: sideRunParams.observeToolTerminal,
+            }),
+        );
         activeDynamicToolCalls.add(toolCall);
         try {
           const response = await toolCall;
@@ -928,6 +941,7 @@ async function createCodexSideToolBridge(input: {
   nativeProviderWebSearchSupport: CodexNativeWebSearchSupport;
   runId: string;
   signal: AbortSignal;
+  sandboxSessionKey: string;
 }): Promise<{ toolBridge: CodexDynamicToolBridge; webSearchPlan: CodexWebSearchPlan }> {
   const runtimeModel =
     input.params.runtimeModel ??
@@ -937,21 +951,16 @@ async function createCodexSideToolBridge(input: {
   if (supportsModelTools(runtimeModel)) {
     const createOpenClawCodingTools = (await import("openclaw/plugin-sdk/agent-harness"))
       .createOpenClawCodingTools;
-    const sandboxSessionKey =
-      input.params.sandboxSessionKey?.trim() ||
-      input.params.sessionKey?.trim() ||
-      input.params.sessionId ||
-      input.sessionAgentId;
     const sandbox = await resolveSandboxContext({
       config: input.params.cfg,
-      sessionKey: sandboxSessionKey,
+      sessionKey: input.sandboxSessionKey,
       workspaceDir: input.cwd,
     });
     const allTools = createOpenClawCodingTools({
       agentId: input.sessionAgentId,
-      sessionKey: sandboxSessionKey,
+      sessionKey: input.sandboxSessionKey,
       runSessionKey:
-        input.params.sessionKey && input.params.sessionKey !== sandboxSessionKey
+        input.params.sessionKey && input.params.sessionKey !== input.sandboxSessionKey
           ? input.params.sessionKey
           : undefined,
       sessionId: input.params.sessionId,
@@ -1071,6 +1080,18 @@ async function createCodexSideToolBridge(input: {
     }),
     webSearchPlan,
   };
+}
+
+function resolveCodexSideSandboxSessionKey(
+  params: AgentHarnessSideQuestionParams,
+  sessionAgentId: string,
+): string {
+  return (
+    params.sandboxSessionKey?.trim() ||
+    params.sessionKey?.trim() ||
+    params.sessionId ||
+    sessionAgentId
+  );
 }
 
 function emptySideUserInputResponse(): JsonObject {

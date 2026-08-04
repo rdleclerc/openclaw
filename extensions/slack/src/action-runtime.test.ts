@@ -435,6 +435,7 @@ describe("handleSlackAction", () => {
         channelId: "C1",
       },
       slackConfig(),
+      { conversationReadOrigin: "direct-operator" },
     );
     expect(requireMockArg(downloadSlackFile, "downloadSlackFile", 0, 0)).toBe("F123");
     expect(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1).maxBytes).toBe(
@@ -462,11 +463,17 @@ describe("handleSlackAction", () => {
     });
 
     const result = await handleSlackAction({ action: "downloadFile", fileId: "F123" }, cfg, {
+      conversationReadOrigin: "delegated",
+      currentChannelProvider: "slack",
+      requesterAccountId: "default",
       currentChannelId: "C1",
+      currentThreadTs: "111.222",
     });
 
     expectRecordFields(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1), {
       channelId: "C1",
+      threadId: "111.222",
+      requireScopeEvidence: true,
     });
     expect(requireDetails(result).ok).toBe(false);
   });
@@ -482,6 +489,7 @@ describe("handleSlackAction", () => {
         replyTo: "123.456",
       },
       slackConfig(),
+      { conversationReadOrigin: "direct-operator" },
     );
 
     expect(requireMockArg(downloadSlackFile, "downloadSlackFile", 0, 0)).toBe("F123");
@@ -506,6 +514,7 @@ describe("handleSlackAction", () => {
         channelId: "C1",
       },
       slackConfig(),
+      { conversationReadOrigin: "direct-operator" },
     );
 
     expect(result.content).toHaveLength(1);
@@ -532,6 +541,7 @@ describe("handleSlackAction", () => {
     await handleSlackAction(
       { action: "downloadFile", fileId: "F123", channelId: "C1" },
       slackConfig(),
+      { conversationReadOrigin: "direct-operator" },
     );
     expect(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1).token).toBe("tok");
   });
@@ -548,6 +558,7 @@ describe("handleSlackAction", () => {
           },
         },
       }),
+      { conversationReadOrigin: "direct-operator" },
     );
     expect(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1).token).toBe("xoxp-user");
   });
@@ -1545,7 +1556,7 @@ describe("handleSlackAction", () => {
 
     await expect(
       handleSlackAction({ action: "downloadFile", fileId: "F123", channelId: "C1" }, cfg),
-    ).rejects.toThrow("Slack read target channel is not allowed.");
+    ).rejects.toThrow("requires the exact current conversation and account");
     expect(downloadSlackFile).not.toHaveBeenCalled();
 
     await expect(handleSlackAction({ action: "listPins", channelId: "C1" }, cfg)).rejects.toThrow(
@@ -1554,7 +1565,7 @@ describe("handleSlackAction", () => {
     expect(listSlackPins).not.toHaveBeenCalled();
   });
 
-  it("rejects Slack file downloads for non-allowlisted target channels", async () => {
+  it("rejects delegated Slack file downloads outside the current conversation", async () => {
     const cfg = slackConfig({
       groupPolicy: "allowlist",
       channels: {
@@ -1564,7 +1575,7 @@ describe("handleSlackAction", () => {
 
     await expect(
       handleSlackAction({ action: "downloadFile", fileId: "F123", channelId: "C_OTHER" }, cfg),
-    ).rejects.toThrow("Slack read target channel is not allowed.");
+    ).rejects.toThrow("requires the exact current conversation and account");
     expect(downloadSlackFile).not.toHaveBeenCalled();
   });
 

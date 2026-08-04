@@ -1,5 +1,9 @@
 // Focused public test helpers for plugin runtime, registry, and setup fixtures.
 
+export {
+  mintMessageActionTurnCapability as mintMessageActionTurnCapabilityForTest,
+  revokeMessageActionTurnCapability as revokeMessageActionTurnCapabilityForTest,
+} from "../gateway/message-action-turn-capability.js";
 export { setDefaultChannelPluginRegistryForTests } from "../commands/channel-test-registry.js";
 export {
   createEmptyPluginRegistry,

@@ -185,11 +185,51 @@ describe("handleBtwCommand", () => {
       requesterSenderId: "sender-1",
       toolContext: {
         currentChannelProvider: "whatsapp",
+        currentThreadTs: "thread-1",
       },
     });
     expect(result).toEqual({
       shouldContinue: false,
       reply: { text: "nothing important", btw: { question: "what changed?" } },
+    });
+  });
+
+  it("binds the current Slack thread to side-question authority", async () => {
+    const params = buildParams("/btw inspect the attachment");
+    params.ctx.Provider = "slack";
+    params.ctx.AccountId = "default";
+    params.ctx.NativeChannelId = "C1";
+    params.ctx.MessageThreadId = "111.222";
+    params.ctx.RuntimePolicySessionKey = "agent:main:runtime-policy";
+    params.command.channel = "slack";
+    params.agentDir = "/tmp/agent";
+    params.sessionEntry = { sessionId: "session-1", updatedAt: Date.now() };
+    let turnContext: ReturnType<typeof resolveMessageActionTurnCapability> | undefined;
+    runBtwSideQuestionMock.mockImplementation(async (input: Record<string, unknown>) => {
+      const opts = input.opts as { runId?: string } | undefined;
+      turnContext = resolveMessageActionTurnCapability({
+        token:
+          typeof input.messageActionTurnCapability === "string"
+            ? input.messageActionTurnCapability
+            : undefined,
+        agentId: "main",
+        runId: opts?.runId,
+        sessionKey: "agent:main:runtime-policy",
+        sessionId: "session-1",
+      });
+      return { text: "attachment inspected" };
+    });
+
+    await handleBtwCommand(params, true);
+
+    expect(mockFirstObjectArg(runBtwSideQuestionMock).messageThreadId).toBe("111.222");
+    expect(turnContext).toMatchObject({
+      toolContext: {
+        currentChannelProvider: "slack",
+        currentChannelId: "C1",
+        currentThreadTs: "111.222",
+        sameChannelThreadRequired: true,
+      },
     });
   });
 

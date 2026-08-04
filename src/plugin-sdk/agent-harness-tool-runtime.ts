@@ -8,6 +8,7 @@ import {
   createAgentHarnessToolSurfaceRuntime as createCoreAgentHarnessToolSurfaceRuntime,
   type AgentHarnessToolSurfaceRuntime as CoreAgentHarnessToolSurfaceRuntime,
 } from "../agents/harness/tool-surface-bridge.js";
+import { runWithGatewayToolCallerRequestContext } from "../agents/tools/gateway-caller-context.js";
 
 type OpenClawCodingToolsOptions = NonNullable<
   Parameters<typeof import("./agent-harness.js").createOpenClawCodingTools>[0]
@@ -27,6 +28,20 @@ export type AgentHarnessToolSurfaceRuntimeParams = Omit<
 > & {
   executeTool: NonNullable<OpenClawCodingToolsOptions["toolSearchCatalogExecutor"]>;
 };
+
+/** Process-local request authority for a native harness dynamic tool execution. */
+export type AgentHarnessGatewayToolRequestContext = {
+  agentId: string;
+  sessionKey: string;
+  messageActionTurnCapability?: string;
+};
+
+export async function runWithAgentHarnessGatewayToolRequestContext<T>(
+  context: AgentHarnessGatewayToolRequestContext | undefined,
+  run: () => Promise<T> | T,
+): Promise<T> {
+  return await runWithGatewayToolCallerRequestContext(context, run);
+}
 
 export function createAgentHarnessToolSurfaceRuntime(
   params: AgentHarnessToolSurfaceRuntimeParams,
