@@ -490,6 +490,17 @@ describe("message tool gateway timeout", () => {
     expect(getToolProperties(tool).timeoutMs).toMatchObject({ type: "integer", minimum: 1 });
   });
 
+  it("advertises idempotencyKey as an optional string", () => {
+    const tool = createMessageTool();
+    expect(getToolProperties(tool).idempotencyKey).toMatchObject({
+      type: "string",
+      description: "Recent retries of the identical logical send reuse the prior result.",
+    });
+    expect((tool.parameters as { required?: string[] }).required ?? []).not.toContain(
+      "idempotencyKey",
+    );
+  });
+
   it("advertises shared poll duration as a positive integer", () => {
     const tool = createMessageTool();
     expect(getToolProperties(tool).pollDurationHours).toMatchObject({

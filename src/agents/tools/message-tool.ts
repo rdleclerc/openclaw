@@ -907,7 +907,14 @@ function buildModerationSchema() {
 }
 
 function buildGatewaySchema() {
-  return gatewayCallOptionSchemaProperties();
+  return {
+    ...gatewayCallOptionSchemaProperties(),
+    idempotencyKey: Type.Optional(
+      Type.String({
+        description: "Recent retries of the identical logical send reuse the prior result.",
+      }),
+    ),
+  };
 }
 
 function buildPresenceSchema() {
