@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeOpenClawAgentDatabasesForTest } from "../../../state/openclaw-agent-db.js";
 import { withEnvAsync } from "../../../test-utils/env.js";
+import type { AuthProfileStore } from "../../auth-profiles.js";
 import { AUTH_STORE_VERSION } from "../../auth-profiles/constants.js";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
@@ -67,6 +68,52 @@ describe("embedded run auth profile loading", () => {
         type: "oauth",
         provider: "openai",
       });
+    });
+  });
+
+  it("keeps non-OpenAI routes on the current gateway snapshot", async () => {
+    stateDir = await mkdtemp(join(tmpdir(), "openclaw-embedded-auth-store-"));
+    const agentDir = join(stateDir, "agents", "main", "agent");
+
+    await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
+      saveAuthProfileStore(
+        {
+          version: AUTH_STORE_VERSION,
+          profiles: {
+            "anthropic:default": {
+              type: "oauth",
+              provider: "anthropic",
+              access: "test-access",
+              refresh: "test-refresh",
+              expires: Date.now() + 60 * 60 * 1000,
+            },
+          },
+          order: { anthropic: ["anthropic:default"] },
+        },
+        agentDir,
+        { filterExternalAuthProfiles: false },
+      );
+      replaceRuntimeAuthProfileStoreSnapshots([
+        { agentDir, store: { version: AUTH_STORE_VERSION, profiles: {} } },
+      ]);
+
+      const authPlanTestingApi = (globalThis as Record<PropertyKey, unknown>)[
+        Symbol.for("openclaw.embeddedRunAuthPlanTestApi")
+      ] as {
+        loadEmbeddedRunAuthProfileStore(params: {
+          agentDir: string;
+          config: object;
+          externalCliProviderIds: Iterable<string>;
+          usesOpenAIAuthRouting: boolean;
+        }): AuthProfileStore;
+      };
+      const loadedStore = authPlanTestingApi.loadEmbeddedRunAuthProfileStore({
+        agentDir,
+        config: {},
+        externalCliProviderIds: ["anthropic"],
+        usesOpenAIAuthRouting: false,
+      });
+      expect(loadedStore.profiles["anthropic:default"]).toBeUndefined();
     });
   });
 });
