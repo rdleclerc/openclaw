@@ -15,9 +15,13 @@ const SCOPED_READ_TOKEN_PREFIX = "read:";
 export type AgentRuntimeMessageActionContext = {
   expiresAtMs: number;
   allowedActions?: readonly MessageActionAllowedAction[];
+  /** Private current-turn correlation facts; never exposed to model tool arguments. */
+  runId?: string;
+  sessionKey?: string;
   sessionId?: string;
   requesterAccountId?: string;
   requesterSenderId?: string;
+  messageSentReceiptPluginId?: string;
   toolContext?: ChannelThreadingToolContext;
 };
 
@@ -161,6 +165,7 @@ export function mintMessageActionTurnCapability(params: {
   requesterAccountId?: string;
   requesterSenderId?: string;
   allowedActions?: readonly MessageActionAllowedAction[];
+  messageSentReceiptPluginId?: string;
   toolContext?: ChannelThreadingToolContext;
   ttlMs?: number;
   nowMs?: number;
@@ -188,6 +193,7 @@ export function mintMessageActionTurnCapability(params: {
     requesterAccountId: normalizeOptionalString(params.requesterAccountId),
     requesterSenderId: normalizeOptionalString(params.requesterSenderId),
     allowedActions: copyAllowedActions(params.allowedActions),
+    messageSentReceiptPluginId: normalizeOptionalString(params.messageSentReceiptPluginId),
     toolContext: copyToolContext(params.toolContext),
   });
   return token;
@@ -233,10 +239,13 @@ export function resolveMessageActionTurnCapabilityDiagnostic(params: {
     ok: true,
     context: {
       expiresAtMs: capability.expiresAtMs,
+      runId: capability.runId,
+      sessionKey: capability.sessionKey,
       sessionId: capability.sessionId,
       requesterAccountId: capability.requesterAccountId,
       requesterSenderId: capability.requesterSenderId,
       allowedActions: copyAllowedActions(capability.allowedActions),
+      messageSentReceiptPluginId: capability.messageSentReceiptPluginId,
       toolContext: copyToolContext(capability.toolContext),
     },
   };

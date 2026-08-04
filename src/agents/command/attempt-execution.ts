@@ -680,6 +680,7 @@ export function runAgentAttempt(params: {
           sessionId: params.sessionId,
           requesterAccountId: params.runContext.accountId,
           requesterSenderId: params.runContext.senderId ?? undefined,
+          messageSentReceiptPluginId: params.opts.inputProvenance?.messageSentReceiptPluginId,
           toolContext: {
             currentChannelId: params.runContext.currentChannelId,
             currentChannelProvider: params.messageChannel,

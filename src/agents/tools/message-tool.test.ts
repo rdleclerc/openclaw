@@ -3724,6 +3724,7 @@ describe("message tool sandbox passthrough", () => {
       sessionId: "session-1",
       requesterAccountId: "trusted-account",
       requesterSenderId: "trusted-sender",
+      messageSentReceiptPluginId: "gaia-workflow-preflight",
       toolContext: {
         currentChannelProvider: "discord",
         currentChannelId: "trusted-current",
@@ -3925,6 +3926,10 @@ describe("message tool sandbox passthrough", () => {
       sessionId: "session-1",
       requesterAccountId: "trusted-account",
       requesterSenderId: "trusted-sender",
+      runId: "run-1",
+      sessionKey: "agent:main:runtime-policy",
+      sessionId: "session-1",
+      messageSentReceiptPluginId: "gaia-workflow-preflight",
       toolContext: {
         currentChannelProvider: "discord",
         currentChannelId: "trusted-current",
