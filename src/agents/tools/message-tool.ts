@@ -46,7 +46,11 @@ import {
   getBootEchoContextForSession,
   stripBootEchoFromOutboundText,
 } from "../../gateway/boot-echo-guard.js";
-import { resolveMessageActionTurnCapabilityDiagnostic } from "../../gateway/message-action-turn-capability.js";
+import {
+  isScopedReadMessageActionTurnCapability,
+  isScopedMessageActionAuthorized,
+  resolveMessageActionTurnCapabilityDiagnostic,
+} from "../../gateway/message-action-turn-capability.js";
 import { createAbortError } from "../../infra/abort-signal.js";
 import { sha256Base64UrlPrefix } from "../../infra/crypto-digest.js";
 import {
@@ -1489,6 +1493,12 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         ? turnCapabilityResolution.context
         : undefined;
       if (
+        !trustedTurnContext &&
+        isScopedReadMessageActionTurnCapability(options?.messageActionTurnCapability)
+      ) {
+        throw new Error("message action capability is unavailable");
+      }
+      if (
         turnCapabilityResolution &&
         !turnCapabilityResolution.ok &&
         (options?.messageActionTurnCapability || options?.requesterSenderId)
@@ -1498,6 +1508,19 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         log.warn("message tool trusted turn context unavailable", {
           reason: turnCapabilityResolution.reason,
         });
+      }
+      if (
+        !isScopedMessageActionAuthorized(trustedTurnContext, {
+          action,
+          provider: params.channel,
+          accountId: readStringParam(params, "accountId"),
+          target: params.target,
+          threadId: params.threadId,
+          to: params.to,
+          channelId: params.channelId,
+        })
+      ) {
+        throw new Error("message action capability permits only the exact Slack read route");
       }
       if (
         suppressedVisiblePayloadReason &&
@@ -1594,6 +1617,16 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       }
 
       const gatewayResolved = resolveGatewayOptions(gatewayOpts);
+      const scopedReadCapability = isScopedReadMessageActionTurnCapability(
+        options?.messageActionTurnCapability,
+      );
+      if (
+        scopedReadCapability &&
+        (options?.conversationReadOrigin === "direct-operator" ||
+          gatewayResolved.target !== "local")
+      ) {
+        throw new Error("message action capability requires the trusted local gateway");
+      }
       // Direct tool invocations already execute inside the authenticated
       // Gateway request. Keep their authority operation-local by dispatching
       // channel actions in-process instead of laundering it through a new
@@ -1608,14 +1641,19 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
               clientName: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
               clientDisplayName: "agent",
               mode: GATEWAY_CLIENT_MODES.BACKEND,
-              resolveAgentRuntimeIdentityToken: () =>
-                resolveMessageActionAgentRuntimeIdentityToken({
+              resolveAgentRuntimeIdentityToken: async () => {
+                const identityToken = await resolveMessageActionAgentRuntimeIdentityToken({
                   opts: gatewayOpts,
                   target: gatewayResolved.target,
                   turnCapability: options?.messageActionTurnCapability,
                   runId: options?.runId,
                   sessionId: options?.sessionId,
-                }),
+                });
+                if (scopedReadCapability && !identityToken) {
+                  throw new Error("message action capability identity is unavailable");
+                }
+                return identityToken;
+              },
             };
       const hasCurrentMessageId =
         typeof options?.currentMessageId === "number" ||

@@ -59,6 +59,7 @@ import {
 } from "../../sessions/session-key-utils.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveGatewayConversationReadOrigin } from "../conversation-read-origin.js";
+import { isScopedMessageActionAuthorized } from "../message-action-turn-capability.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
 import { resolveGatewayPluginConfig } from "../runtime-plugin-config.js";
 import { loadSessionEntry } from "../session-utils.js";
@@ -546,6 +547,30 @@ export const sendHandlers: GatewayRequestHandlers = {
     const trustedContext = resolveTrustedMessageActionToolContext({ client, request });
     if (!trustedContext.ok) {
       respond(false, undefined, trustedContext.error);
+      return;
+    }
+    const scopedActionAuthorized = isScopedMessageActionAuthorized(
+      client?.internal?.agentRuntimeIdentity?.messageActionContext,
+      {
+        action: request.action,
+        provider: request.channel,
+        accountId: request.accountId,
+        target: request.params.target,
+        threadId: request.params.threadId,
+        to: request.params.to,
+        channelId: request.params.channelId,
+        allowEquivalentTo: true,
+      },
+    );
+    if (!scopedActionAuthorized) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "message.action permits only the exact Slack read route",
+        ),
+      );
       return;
     }
     const conversationReadOrigin = resolveGatewayConversationReadOrigin({

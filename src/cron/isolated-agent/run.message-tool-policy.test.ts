@@ -1,5 +1,15 @@
 // Message tool policy tests cover message tool availability during cron runs.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
+import { resolveMessageActionAgentRuntimeIdentityToken } from "../../agents/tools/gateway.js";
+import { createMessageTool } from "../../agents/tools/message-tool.js";
+import { verifyAgentRuntimeIdentityToken } from "../../gateway/agent-runtime-identity-token.js";
+import { isScopedMessageActionAuthorized } from "../../gateway/message-action-turn-capability.js";
+import { sendHandlers } from "../../gateway/server-methods/send.js";
+import { normalizeMessageActionInput } from "../../infra/outbound/message-action-normalization.js";
 import { createSourceDeliveryPlan } from "../../infra/outbound/source-delivery-plan.js";
 import type { SkillSnapshot } from "../../skills/types.js";
 import { applyJobPatch } from "../service/jobs.js";
@@ -190,6 +200,64 @@ function expectDeliveryFields(
 
 describe("runCronIsolatedAgentTurn message tool policy", () => {
   let previousFastTestEnv: string | undefined;
+
+  // oxfmt-ignore
+  it.each([["embedded", false, true, undefined], ["CLI", true, true, undefined], ["embedded cross-route", false, false, undefined], ["CLI cross-route", true, false, undefined], ["embedded missing provider", false, true, "provider"], ["CLI missing account", true, true, "accountId"], ["embedded missing target", false, true, "target"], ["CLI missing thread", true, true, "thread"]])("allows only an exact signed message-tool read through %s cron", async (_name, cli, ownerMatches, missingField) => {
+    const route = { provider: "slack", accountId: "acct", target: "C0ROOM", thread: "1784000000.000001" };
+    const cases = [
+      ["read", route, true],
+      ["read", { ...route, provider: "other" }, false],
+      ["read", { ...route, provider: "last" }, false],
+      ["read", { ...route, accountId: "other" }, false],
+      ["read", { ...route, target: "other" }, false],
+      ["read", { ...route, thread: "other" }, false],
+      ["read", { ...route, thread: undefined }, false],
+      ["send", route, false],
+    ];
+    const resolvedRoute = { ...route, [missingField ?? "unused"]: undefined };
+    mockRunCronFallbackPassthrough(); isCliProviderMock.mockReturnValue(cli); loadSessionEntryMock.mockImplementation((_storePath, sessionKey) => sessionKey.includes(":slack:") ? { lastChannel: route.provider, lastAccountId: route.accountId, lastTo: ownerMatches ? route.target : "other", lastThreadId: route.thread } : undefined);
+    resolveCronDeliveryPlanMock.mockReturnValue(makeAnnounceDeliveryPlan({ channel: resolvedRoute.provider, to: resolvedRoute.target, threadId: resolvedRoute.thread }));
+    resolveDeliveryTargetMock.mockResolvedValue({ ok: true, channel: resolvedRoute.provider, to: resolvedRoute.target, accountId: resolvedRoute.accountId, threadId: resolvedRoute.thread });
+    const outcomes: boolean[] = [],
+      exercise = async (input: Record<"agentId" | "runId" | "sessionKey" | "sessionId", string> & { messageActionTurnCapability?: string }) => {
+        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-cron-slack-read-")), previousStateDir = process.env.OPENCLAW_STATE_DIR;
+        process.env.OPENCLAW_STATE_DIR = stateDir;
+        try {
+          const identityToken = await withGatewayToolCallerIdentity({ agentId: input.agentId, sessionKey: input.sessionKey }, async () => await resolveMessageActionAgentRuntimeIdentityToken({ opts: {}, target: "local", turnCapability: input.messageActionTurnCapability, runId: input.runId, sessionId: input.sessionId }));
+          const identity = await verifyAgentRuntimeIdentityToken(identityToken);
+          let receiverRejectedBeforeContext = false, receiverRejectionMessage = "";
+          const receiver = sendHandlers["message.action"];
+          if (!receiver || !identity) { throw new Error("expected signed message.action receiver context"); }
+          await receiver({ params: { channel: route.provider, action: "read", params: { target: "other", to: "other", threadId: route.thread },
+            accountId: route.accountId, sessionKey: input.sessionKey, sessionId: input.sessionId, agentId: input.agentId, idempotencyKey: `scope-${_name}` } as never,
+            respond: (ok, _payload, error) => { receiverRejectedBeforeContext = !ok; receiverRejectionMessage = String((error as { message?: unknown } | undefined)?.message ?? ""); }, context: new Proxy({} as never, { get: () => { throw new Error("receiver touched context before scope authorization"); } }),
+            client: { internal: { agentRuntimeIdentity: identity } } as never, req: { type: "req", id: "scope", method: "message.action" }, isWebchatConnect: () => false });
+          expect(receiverRejectedBeforeContext).toBe(true);
+          expect(receiverRejectionMessage).toBe("message.action permits only the exact Slack read route");
+          for (const [action, candidate] of cases) {
+            const tool = createMessageTool({ agentId: input.agentId, runId: input.runId, agentSessionKey: input.sessionKey,
+              sessionId: input.sessionId, agentAccountId: route.accountId, messageActionTurnCapability: input.messageActionTurnCapability,
+              config: {}, conversationReadOrigin: "delegated", runMessageAction: async () => ({ kind: "action", action, channel: route.provider,
+                handledBy: "plugin", payload: {}, toolResult: { content: [] }, dryRun: false }) as never } as never);
+            let localAllowed = true;
+            try { await tool.execute(action, { action, channel: candidate.provider, accountId: candidate.accountId,
+              target: candidate.target, threadId: candidate.thread, text: "not sent" } as never); } catch { localAllowed = false; }
+            const normalized = localAllowed ? normalizeMessageActionInput({ action: action as never,
+              args: { channel: candidate.provider, target: candidate.target, threadId: candidate.thread } }) : undefined;
+            outcomes.push(Boolean(normalized) && isScopedMessageActionAuthorized(identity?.messageActionContext, { action,
+              provider: candidate.provider, accountId: candidate.accountId, target: normalized?.target,
+              threadId: normalized?.threadId, to: normalized?.to, channelId: normalized?.channelId, allowEquivalentTo: true }));
+          }
+        } finally {
+          if (previousStateDir === undefined) { delete process.env.OPENCLAW_STATE_DIR; } else { process.env.OPENCLAW_STATE_DIR = previousStateDir; }
+          fs.rmSync(stateDir, { recursive: true, force: true });
+        }
+        return { payloads: [], meta: { agentMeta: {} } };
+      };
+    (cli ? runCliAgentMock : runEmbeddedAgentMock).mockImplementationOnce(exercise as never);
+    const params = makeParams(); params.job.owner = { agentId: "default", sessionKey: "agent:default:slack:channel:C0ROOM:thread:1784000000.000001" };
+    await runCronIsolatedAgentTurn(params); expect(outcomes).toEqual(ownerMatches && !missingField ? cases.map((item) => item[2]) : cases.map(() => false));
+  });
 
   async function expectMessageToolDisabledForPlan(plan: {
     requested: boolean;

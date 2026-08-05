@@ -15,7 +15,12 @@ import type { CliSessionBinding } from "../../config/sessions.js";
 import { formatSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import type { AgentDefaultsConfig } from "../../config/types.agent-defaults.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  mintMessageActionTurnCapability,
+  revokeMessageActionTurnCapability,
+} from "../../gateway/message-action-turn-capability.js";
 import type { SourceDeliveryPlan } from "../../infra/outbound/source-delivery-plan.js";
+import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import {
   createUserTurnTranscriptRecorder,
   type UserTurnTranscriptRecorder,
@@ -26,6 +31,7 @@ import {
   getGeneratedMediaTaskIdsForSessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
 } from "../../tasks/task-status-access.js";
+import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import type { CronAgentExecutionPhaseUpdate, CronJob } from "../types.js";
 import {
   resolveCronChannelOutputPolicy,
@@ -55,6 +61,7 @@ import type {
   PersistCronSessionEntry,
 } from "./run-session-state.js";
 import { syncCronSessionLiveSelection } from "./run-session-state.js";
+import { loadCronSessionEntryLatest } from "./session.js";
 import { resolveFallbackCronSourceDeliveryPlan } from "./source-delivery-fallback.js";
 import { isLikelyInterimCronMessage } from "./subagent-followup-hints.js";
 
@@ -404,6 +411,29 @@ function createCronPromptExecutor(params: {
         await params.setRunContinuationCliExecutionProvider?.(
           cliExecution ? executionProvider : undefined,
         );
+        const currentChannelId = await resolveCurrentChannelTarget({
+          channel: messageChannel,
+          to: params.resolvedDelivery.to,
+          threadId: params.resolvedDelivery.threadId,
+        });
+        const accountId = normalizeOptionalString(params.resolvedDelivery.accountId);
+        const target = normalizeOptionalString(params.resolvedDelivery.to);
+        const threadId = normalizeOptionalString(params.resolvedDelivery.threadId);
+        // oxfmt-ignore
+        const ownerRoute = params.job.owner?.sessionKey ? loadCronSessionEntryLatest(params.cronSession.storePath, params.job.owner.sessionKey) : undefined;
+        const ownerSessionRoute = parseSessionDeliveryRoute(params.job.owner?.sessionKey);
+        // oxfmt-ignore
+        const isSlackOwnedRun = [messageChannel, ownerRoute?.lastChannel, ownerSessionRoute?.channel].some((value) => normalizeMessageChannel(value) === "slack");
+        // oxfmt-ignore
+        const ownerRouteMatches = normalizeMessageChannel(messageChannel) === "slack" && Boolean(accountId && target && threadId) && normalizeMessageChannel(ownerRoute?.lastChannel) === "slack" && normalizeOptionalString(ownerRoute?.lastAccountId) === accountId && normalizeOptionalString(ownerRoute?.lastTo) === target && normalizeOptionalString(ownerRoute?.lastThreadId) === threadId;
+        // oxfmt-ignore
+        const mintCronSlackReadCapability = () => isSlackOwnedRun ? mintMessageActionTurnCapability({ agentId: params.agentId,
+            runId: params.cronSession.sessionEntry.sessionId, sessionKey: params.runSessionKey,
+            sessionId: params.cronSession.sessionEntry.sessionId, requesterAccountId: accountId,
+            allowedActions: ownerRouteMatches ? ["read"] : [],
+            toolContext: { currentChannelId, currentChannelProvider: messageChannel,
+              currentMessagingTarget: target, currentThreadTs: threadId, sameChannelThreadRequired: true },
+            ttlMs: params.timeoutMs + 60_000 }) : undefined;
         const bootstrapPromptWarningSignature =
           bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
         // CLI providers can resume provider-native sessions; embedded providers
@@ -420,6 +450,7 @@ function createCronPromptExecutor(params: {
           // claims stay unique via per-claim ids and the worker gate handles this
           // via credential rotation (see worker-environments/service.ts fences).
           const runId = params.cronSession.sessionEntry.sessionId;
+          const messageActionTurnCapability = mintCronSlackReadCapability();
           const result = await withLocalSessionPlacementTurnAdmission(
             {
               sessionId: params.cronSession.sessionEntry.sessionId,
@@ -453,6 +484,7 @@ function createCronPromptExecutor(params: {
                 cliSessionBinding: guardedCliSessionBinding,
                 skillsSnapshot: params.skillsSnapshot,
                 messageChannel,
+                messageActionTurnCapability,
                 sourceReplyDeliveryMode,
                 requireExplicitMessageTarget: sourceDelivery.messageTool.requireExplicitTarget,
                 cliSessionBindingFacts: {
@@ -478,7 +510,7 @@ function createCronPromptExecutor(params: {
                   userTurnTranscriptRecorder.hasPersisted() ||
                   userTurnTranscriptRecorder.isBlocked(),
               }),
-          );
+          ).finally(() => revokeMessageActionTurnCapability(messageActionTurnCapability));
           bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
             result.meta?.systemPromptReport,
           );
@@ -492,13 +524,9 @@ function createCronPromptExecutor(params: {
           provider: providerOverride,
           model: modelOverride,
         });
-        const currentChannelId = await resolveCurrentChannelTarget({
-          channel: messageChannel,
-          to: params.resolvedDelivery.to,
-          threadId: params.resolvedDelivery.threadId,
-        });
         // Embedded runs receive both the explicit route and the current-channel
         // id so message-tool policy can target the same chat as fallback delivery.
+        const messageActionTurnCapability = mintCronSlackReadCapability();
         const result = await runEmbeddedAgent({
           sessionId: params.cronSession.sessionEntry.sessionId,
           sessionKey: params.runSessionKey,
@@ -513,6 +541,7 @@ function createCronPromptExecutor(params: {
           messageTo: params.resolvedDelivery.to,
           messageThreadId: params.resolvedDelivery.threadId,
           currentChannelId,
+          messageActionTurnCapability,
           sessionFile,
           agentDir: params.agentDir,
           workspaceDir: params.workspaceDir,
@@ -579,7 +608,7 @@ function createCronPromptExecutor(params: {
           userTurnTranscriptRecorder,
           suppressNextUserMessagePersistence:
             userTurnTranscriptRecorder.hasPersisted() || userTurnTranscriptRecorder.isBlocked(),
-        });
+        }).finally(() => revokeMessageActionTurnCapability(messageActionTurnCapability));
         bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
           result.meta?.systemPromptReport,
         );

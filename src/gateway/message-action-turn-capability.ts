@@ -10,14 +10,67 @@ import {
 const DEFAULT_TTL_MS = 15 * 60_000;
 const MAX_TTL_MS = 24 * 60 * 60_000;
 const MAX_ACTIVE_CAPABILITIES = 4096;
+const SCOPED_READ_TOKEN_PREFIX = "read:";
 
 export type AgentRuntimeMessageActionContext = {
   expiresAtMs: number;
+  allowedActions?: readonly MessageActionAllowedAction[];
   sessionId?: string;
   requesterAccountId?: string;
   requesterSenderId?: string;
   toolContext?: ChannelThreadingToolContext;
 };
+
+export type MessageActionAllowedAction = "read";
+
+type ScopedMessageActionRequest = {
+  action: string;
+  provider?: unknown;
+  accountId?: unknown;
+  target?: unknown;
+  threadId?: unknown;
+  to?: unknown;
+  channelId?: unknown;
+  allowEquivalentTo?: boolean;
+};
+
+function normalizeScopedRouteValue(value: unknown): string | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? String(value)
+    : normalizeOptionalString(value);
+}
+
+export function isScopedMessageActionAuthorized(
+  context: AgentRuntimeMessageActionContext | undefined,
+  request: ScopedMessageActionRequest,
+): boolean {
+  if (context?.allowedActions === undefined) {
+    return true;
+  }
+  const requested = [
+    normalizeMessageChannel(request.provider),
+    normalizeOptionalString(request.accountId),
+    normalizeScopedRouteValue(request.target),
+    normalizeScopedRouteValue(request.threadId),
+  ];
+  const expected = [
+    "slack",
+    normalizeOptionalString(context.requesterAccountId),
+    normalizeScopedRouteValue(context.toolContext?.currentMessagingTarget),
+    normalizeScopedRouteValue(context.toolContext?.currentThreadTs),
+  ];
+  const normalizedTo = normalizeScopedRouteValue(request.to);
+  return (
+    context.allowedActions.length === 1 &&
+    context.allowedActions[0] === "read" &&
+    request.action === "read" &&
+    normalizeMessageChannel(context.toolContext?.currentChannelProvider) === "slack" &&
+    context.toolContext?.sameChannelThreadRequired === true &&
+    request.channelId == null &&
+    (!normalizedTo || (request.allowEquivalentTo === true && normalizedTo === requested[2])) &&
+    requested.every((value, index) => Boolean(value) && value === expected[index])
+  );
+}
 
 export type MessageActionTurnCapabilityRejectionReason =
   | "token_missing"
@@ -75,6 +128,9 @@ function copyToolContext(
   };
 }
 
+// oxfmt-ignore
+function copyAllowedActions(actions: readonly MessageActionAllowedAction[] | undefined): readonly MessageActionAllowedAction[] | undefined { return actions === undefined ? undefined : actions.length === 1 && actions[0] === "read" ? ["read"] : []; }
+
 function evictOldestCapability(): void {
   const oldest = capabilitiesByToken.keys().next().value;
   if (typeof oldest === "string") {
@@ -104,6 +160,7 @@ export function mintMessageActionTurnCapability(params: {
   sessionId?: string;
   requesterAccountId?: string;
   requesterSenderId?: string;
+  allowedActions?: readonly MessageActionAllowedAction[];
   toolContext?: ChannelThreadingToolContext;
   ttlMs?: number;
   nowMs?: number;
@@ -121,7 +178,7 @@ export function mintMessageActionTurnCapability(params: {
     // growing process memory without creating a second persistent state path.
     evictOldestCapability();
   }
-  const token = randomBytes(32).toString("base64url");
+  const token = `${params.allowedActions === undefined ? "" : SCOPED_READ_TOKEN_PREFIX}${randomBytes(32).toString("base64url")}`;
   capabilitiesByToken.set(token, {
     agentId,
     runId,
@@ -130,10 +187,14 @@ export function mintMessageActionTurnCapability(params: {
     sessionId: normalizeOptionalString(params.sessionId),
     requesterAccountId: normalizeOptionalString(params.requesterAccountId),
     requesterSenderId: normalizeOptionalString(params.requesterSenderId),
+    allowedActions: copyAllowedActions(params.allowedActions),
     toolContext: copyToolContext(params.toolContext),
   });
   return token;
 }
+
+// oxfmt-ignore
+export function isScopedReadMessageActionTurnCapability(token: string | undefined): boolean { return token?.trim().startsWith(SCOPED_READ_TOKEN_PREFIX) === true; }
 
 export function resolveMessageActionTurnCapabilityDiagnostic(params: {
   token?: string;
@@ -175,6 +236,7 @@ export function resolveMessageActionTurnCapabilityDiagnostic(params: {
       sessionId: capability.sessionId,
       requesterAccountId: capability.requesterAccountId,
       requesterSenderId: capability.requesterSenderId,
+      allowedActions: copyAllowedActions(capability.allowedActions),
       toolContext: copyToolContext(capability.toolContext),
     },
   };
