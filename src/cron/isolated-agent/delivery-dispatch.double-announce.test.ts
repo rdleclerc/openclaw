@@ -21,6 +21,7 @@ const {
   deliverOutboundPayloadsMock,
   ensureOutboundSessionEntryMock,
   loadCronSessionEntryLatestMock,
+  readSessionMessagesAsyncMock,
   maybeApplyTtsToPayloadMock,
   retireSessionMcpRuntimeMock,
   resolveOutboundSessionRouteMock,
@@ -34,6 +35,7 @@ const {
   deliverOutboundPayloadsMock: vi.fn().mockResolvedValue([{ ok: true }]),
   ensureOutboundSessionEntryMock: vi.fn().mockResolvedValue(undefined),
   loadCronSessionEntryLatestMock: vi.fn(),
+  readSessionMessagesAsyncMock: vi.fn().mockResolvedValue([]),
   maybeApplyTtsToPayloadMock: vi.fn(async (params: { payload: unknown }) => params.payload),
   retireSessionMcpRuntimeMock: vi.fn().mockResolvedValue(true),
   resolveOutboundSessionRouteMock: vi.fn().mockResolvedValue(null),
@@ -112,6 +114,8 @@ vi.mock("./session.js", () => ({
   loadCronSessionEntryLatest: loadCronSessionEntryLatestMock,
 }));
 
+// oxfmt-ignore
+vi.mock("../../gateway/session-transcript-readers.js", () => ({ readSessionMessagesAsync: readSessionMessagesAsyncMock }));
 vi.mock("../../cli/outbound-send-deps.js", () => ({
   createOutboundSendDeps: vi.fn().mockReturnValue({}),
 }));
@@ -1207,6 +1211,8 @@ describe("dispatchCronDelivery — double-announce guard", () => {
 
     expect(state.result).toBeUndefined();
     expect(state.delivered).toBe(true);
+    expect(outboundDeliveryCall(0)).not.toHaveProperty("replyPayloadSendingHook");
+    expect(outboundDeliveryCall(0)).not.toHaveProperty("onPlatformSendDispatch");
     expect(buildOutboundSessionContext).toHaveBeenCalledWith({
       cfg: params.cfgWithAgentDefaults,
       agentId: "main",
@@ -2262,7 +2268,16 @@ describe("dispatchCronDelivery — double-announce guard", () => {
   );
 
   it("delivers explicit targets with direct text through the outbound adapter", async () => {
+    // oxfmt-ignore
+    readSessionMessagesAsyncMock.mockResolvedValue([{ role: "user", provenance: { kind: "external_user", messageSentReceiptPluginId: "gaia-workflow-preflight" } }]);
     const params = makeBaseParams({ synthesizedText: "hello from cron" });
+    params.job.owner = { agentId: "main", sessionKey: "agent:main:slack:channel:C0CRON" };
+    params.resolvedDelivery = makeResolvedDelivery({
+      channel: "slack",
+      to: "C0CRON",
+      accountId: "acct",
+      threadId: "1784000000.000001",
+    });
     const state = await dispatchCronDelivery(params);
 
     expect(state.result).toBeUndefined();
@@ -2270,14 +2285,33 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     expect(state.deliveryAttempted).toBe(true);
     expect(deliverOutboundPayloads).toHaveBeenCalledTimes(1);
     expectDeliveryCall(0, {
-      channel: "telegram",
-      to: "123456",
-      accountId: undefined,
-      threadId: undefined,
+      channel: "slack",
+      to: "C0CRON",
+      accountId: "acct",
+      threadId: "1784000000.000001",
       bestEffort: false,
       skipQueue: true,
       payloads: [{ text: "hello from cron" }],
+      replyPayloadSendingHook: expect.objectContaining({
+        runId: "test-session-id",
+        messageSentReceiptPluginId: "gaia-workflow-preflight",
+        context: expect.objectContaining({ runId: "test-session-id" }),
+      }),
     });
+  });
+
+  // oxfmt-ignore
+  it.each([
+    ["missing owner session", undefined, []],
+    ["missing receipt id", { sessionId: "owner-session" }, []],
+    ["ambiguous receipt ids", { sessionId: "owner-session" }, ["receipt-a", "receipt-b"]],
+  ])("preserves Slack delivery without Gaia receipt authority for %s", async (_name, entry, ids) => {
+    loadCronSessionEntryLatestMock.mockReturnValue(entry);
+    readSessionMessagesAsyncMock.mockResolvedValue(ids.map((messageSentReceiptPluginId) => ({ role: "user", provenance: { kind: "external_user", messageSentReceiptPluginId } })));
+    const params = makeBaseParams({ synthesizedText: "hello from cron" }); params.job.owner = { agentId: "main", sessionKey: "agent:main:slack:channel:C0CRON" };
+    params.resolvedDelivery = makeResolvedDelivery({ channel: "slack", to: "C0CRON", accountId: "acct", threadId: "1784000000.000001" });
+    const state = await dispatchCronDelivery(params); expect(state.result).toBeUndefined(); expect(state.delivered).toBe(true);
+    expect(deliverOutboundPayloads).toHaveBeenCalledTimes(1); expect(outboundDeliveryCall(0)).not.toHaveProperty("replyPayloadSendingHook"); expect(outboundDeliveryCall(0)).not.toHaveProperty("onPlatformSendDispatch");
   });
 
   it("keeps unresolved message-tool delivery out of delivered status", async () => {

@@ -65,6 +65,10 @@ function decodeMessageActionContext(
     return undefined;
   }
   const rawToolContext = value.toolContext;
+  // oxfmt-ignore
+  const rawAllowedActions = value.allowedActions, allowedActions = rawAllowedActions === undefined ? undefined : Array.isArray(rawAllowedActions) && (rawAllowedActions.length === 0 || rawAllowedActions.length === 1 && rawAllowedActions[0] === "read") ? rawAllowedActions as readonly ("read")[] : null;
+  // oxfmt-ignore
+  if (rawAllowedActions !== undefined && !allowedActions) { return undefined; }
   if (rawToolContext !== undefined && !isRecord(rawToolContext)) {
     return undefined;
   }
@@ -121,6 +125,7 @@ function decodeMessageActionContext(
     : undefined;
   return {
     expiresAtMs: value.expiresAtMs,
+    ...(allowedActions ? { allowedActions } : {}),
     sessionId: normalizeOptionalString(value.sessionId),
     requesterAccountId: normalizeOptionalString(value.requesterAccountId),
     requesterSenderId: normalizeOptionalString(value.requesterSenderId),

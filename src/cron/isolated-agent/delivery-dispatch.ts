@@ -21,6 +21,7 @@ import { resolveMirroredTranscriptText } from "../../config/sessions/transcript-
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { isSuppressedControlReplyText } from "../../gateway/control-reply-text.js";
+import { readSessionMessagesAsync } from "../../gateway/session-transcript-readers.js";
 import { sleepWithAbort } from "../../infra/backoff.js";
 import { isProvenDeliveryNotSentError } from "../../infra/delivery-recovery.shared.js";
 import { formatErrorMessage } from "../../infra/errors.js";
@@ -45,6 +46,7 @@ import {
   parseThreadSessionSuffix,
   resolveAgentIdFromSessionKey,
 } from "../../routing/session-key.js";
+import { normalizeInputProvenance } from "../../sessions/input-provenance.js";
 import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { shouldAttemptTtsPayload } from "../../tts/tts-config.js";
@@ -208,6 +210,17 @@ const subagentFollowupRuntimeLoader = createLazyImportLoader(
 const ttsRuntimeLoader = createLazyImportLoader(() => import("../../tts/tts.runtime.js"));
 
 const COMPLETED_DIRECT_CRON_DELIVERIES = new Map<string, CompletedDirectCronDelivery>();
+
+// oxfmt-ignore
+async function resolveCronReceiptPluginId(params: Pick<DispatchCronDeliveryParams, "cfg" | "job" | "agentId">) {
+  const sessionKey = params.job.owner?.sessionKey?.trim(); if (!sessionKey) { return undefined; }
+  const agentId = params.job.owner?.agentId?.trim() || params.agentId;
+  const storePath = resolveStorePath(params.cfg.session?.store, { agentId });
+  const sessionId = loadCronSessionEntryLatest(storePath, sessionKey)?.sessionId; if (!sessionId) { return undefined; }
+  const messages = await readSessionMessagesAsync({ agentId, sessionId, sessionKey, storePath }, { mode: "full", reason: "cron delivery receipt owner" });
+  const ids = new Set(messages.flatMap((message) => { const provenance = normalizeInputProvenance((message as { provenance?: unknown })?.provenance); const id = provenance?.kind === "external_user" ? provenance.messageSentReceiptPluginId?.trim() : undefined; return id ? [id] : []; }));
+  return ids.size === 1 ? ids.values().next().value : undefined;
+}
 
 async function loadDeliveryOutboundRuntime(): Promise<
   typeof import("./delivery-outbound.runtime.js")
@@ -1213,8 +1226,11 @@ export async function dispatchCronDelivery(
             );
           }
         : undefined;
+      const receiptPluginId =
+        delivery.channel === "slack" ? await resolveCronReceiptPluginId(params) : undefined;
       const runDelivery = async () => {
         attemptedPayloadsForMirror.length = 0;
+        // oxfmt-ignore
         const send = await sendDurableMessageBatch({
           cfg: params.cfgWithAgentDefaults,
           channel: delivery.channel,
@@ -1223,12 +1239,25 @@ export async function dispatchCronDelivery(
           threadId: delivery.threadId,
           payloads: payloadsForDelivery,
           session: deliverySession,
+          ...(receiptPluginId ? { replyPayloadSendingHook: {
+            kind: "final",
+            channel: delivery.channel,
+            runId: params.sessionId,
+            messageSentReceiptPluginId: receiptPluginId,
+            context: {
+              channelId: delivery.channel,
+              ...(delivery.accountId ? { accountId: delivery.accountId } : {}),
+              conversationId: delivery.to,
+              runId: params.sessionId,
+            },
+          } } : {}),
           identity,
           bestEffort: params.deliveryBestEffort,
           durability: params.deliveryBestEffort ? "best_effort" : "required",
           deps: createOutboundSendDeps(params.deps),
           signal: params.abortSignal,
           onError,
+          ...(receiptPluginId ? { onPlatformSendDispatch: async () => { payloadMayHaveReachedRecipientBeforeFailure = true; } } : {}),
           onPayload: (payload) => {
             attemptedPayloadsForMirror.push(payload);
           },

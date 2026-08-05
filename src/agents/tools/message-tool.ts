@@ -46,7 +46,11 @@ import {
   getBootEchoContextForSession,
   stripBootEchoFromOutboundText,
 } from "../../gateway/boot-echo-guard.js";
-import { resolveMessageActionTurnCapabilityDiagnostic } from "../../gateway/message-action-turn-capability.js";
+import {
+  isScopedReadMessageActionTurnCapability,
+  resolveMessageActionTurnCapabilityDiagnostic,
+  type AgentRuntimeMessageActionContext,
+} from "../../gateway/message-action-turn-capability.js";
 import { createAbortError } from "../../infra/abort-signal.js";
 import { sha256Base64UrlPrefix } from "../../infra/crypto-digest.js";
 import {
@@ -82,7 +86,10 @@ import {
 } from "../schema/typebox.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringArrayParam, readStringParam } from "./common.js";
-import { resolveGatewayToolCallerMessageActionCapability } from "./gateway-caller-context.js";
+import {
+  getGatewayToolCallerIdentity,
+  resolveGatewayToolCallerMessageActionCapability,
+} from "./gateway-caller-context.js";
 import { gatewayCallOptionSchemaProperties } from "./gateway-schema.js";
 import {
   readGatewayCallOptions,
@@ -106,6 +113,28 @@ const AllMessageActions = CHANNEL_MESSAGE_ACTION_NAMES;
 const log = createSubsystemLogger("agents/tools/message");
 function actionNeedsExplicitTarget(action: ChannelMessageActionName): boolean {
   return action === "broadcast" || shouldApplyCrossContextMarker(action);
+}
+
+// oxfmt-ignore
+function enforceScopedMessageActionRead({ action, params, context }: { action: ChannelMessageActionName; params: Record<string, unknown>; context?: AgentRuntimeMessageActionContext }): void {
+  if (context?.allowedActions === undefined) { return; }
+  const toolContext = context.toolContext;
+  const requested = [normalizeMessageChannel(params.channel), normalizeOptionalString(readStringParam(params, "accountId")),
+    normalizeOptionalStringifiedId(params.target), normalizeOptionalStringifiedId(params.threadId)];
+  const expected = ["slack", normalizeOptionalString(context.requesterAccountId),
+    normalizeOptionalString(toolContext?.currentMessagingTarget), normalizeOptionalString(toolContext?.currentThreadTs)];
+  if (
+    context.allowedActions.length !== 1 ||
+    context.allowedActions[0] !== "read" ||
+    action !== "read" ||
+    normalizeMessageChannel(toolContext?.currentChannelProvider) !== "slack" ||
+    toolContext?.sameChannelThreadRequired !== true ||
+    params.to != null ||
+    params.channelId != null ||
+    requested.some((value, index) => !value || value !== expected[index])
+  ) {
+    throw new Error("message action capability permits only the exact Slack read route");
+  }
 }
 
 function normalizeMessageToolIdempotencyKeyPart(value: unknown): string | undefined {
@@ -1500,6 +1529,21 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       const trustedTurnContext = turnCapabilityResolution?.ok
         ? turnCapabilityResolution.context
         : undefined;
+      const rejectedScopedCapability =
+        !activeTurnCapability.ok &&
+        [
+          options?.messageActionTurnCapability,
+          getGatewayToolCallerIdentity()?.messageActionTurnCapability,
+        ].some(isScopedReadMessageActionTurnCapability);
+      if (
+        !trustedTurnContext &&
+        (rejectedScopedCapability ||
+          isScopedReadMessageActionTurnCapability(
+            activeTurnCapability.ok ? activeTurnCapability.token : undefined,
+          ))
+      ) {
+        throw new Error("message action capability is unavailable");
+      }
       if (
         turnCapabilityResolution &&
         !turnCapabilityResolution.ok &&
@@ -1511,6 +1555,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           reason: turnCapabilityResolution.reason,
         });
       }
+      enforceScopedMessageActionRead({ action, params, context: trustedTurnContext });
       if (
         suppressedVisiblePayloadReason &&
         action === "send" &&
