@@ -86,7 +86,10 @@ import {
 } from "../schema/typebox.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringArrayParam, readStringParam } from "./common.js";
-import { resolveGatewayToolCallerMessageActionCapability } from "./gateway-caller-context.js";
+import {
+  getGatewayToolCallerIdentity,
+  resolveGatewayToolCallerMessageActionCapability,
+} from "./gateway-caller-context.js";
 import { gatewayCallOptionSchemaProperties } from "./gateway-schema.js";
 import {
   readGatewayCallOptions,
@@ -1504,9 +1507,18 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       const trustedTurnContext = turnCapabilityResolution?.ok
         ? turnCapabilityResolution.context
         : undefined;
+      const rejectedScopedCapability =
+        !activeTurnCapability.ok &&
+        [
+          options?.messageActionTurnCapability,
+          getGatewayToolCallerIdentity()?.messageActionTurnCapability,
+        ].some(isScopedReadMessageActionTurnCapability);
       if (
         !trustedTurnContext &&
-        isScopedReadMessageActionTurnCapability(options?.messageActionTurnCapability)
+        (rejectedScopedCapability ||
+          isScopedReadMessageActionTurnCapability(
+            activeTurnCapability.ok ? activeTurnCapability.token : undefined,
+          ))
       ) {
         throw new Error("message action capability is unavailable");
       }

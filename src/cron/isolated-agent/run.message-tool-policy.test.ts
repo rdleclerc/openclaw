@@ -3,7 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
+import {
+  runWithGatewayToolCallerRequestContext,
+  withGatewayToolCallerIdentity,
+} from "../../agents/tools/gateway-caller-context.js";
 import { resolveMessageActionAgentRuntimeIdentityToken } from "../../agents/tools/gateway.js";
 import { createMessageTool } from "../../agents/tools/message-tool.js";
 import { verifyAgentRuntimeIdentityToken } from "../../gateway/agent-runtime-identity-token.js";
@@ -248,6 +251,19 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
               provider: candidate.provider, accountId: candidate.accountId, target: normalized?.target,
               threadId: normalized?.threadId, to: normalized?.to, channelId: normalized?.channelId, allowEquivalentTo: true }));
           }
+          const conflictingTool = createMessageTool({ agentId: input.agentId, runId: input.runId,
+            agentSessionKey: input.sessionKey, sessionId: input.sessionId, agentAccountId: route.accountId,
+            messageActionTurnCapability: "legacy-token", config: {}, conversationReadOrigin: "delegated",
+            runMessageAction: async () => ({ kind: "action", action: "send", channel: route.provider,
+              handledBy: "plugin", payload: {}, toolResult: { content: [] }, dryRun: false }) as never } as never);
+          try {
+            await runWithGatewayToolCallerRequestContext({ agentId: input.agentId, sessionKey: input.sessionKey,
+              messageActionTurnCapability: input.messageActionTurnCapability }, () =>
+              conflictingTool.execute("conflict", { action: "send", channel: route.provider,
+                accountId: route.accountId, target: route.target, threadId: route.thread,
+                text: "not sent" } as never));
+            outcomes.push(true);
+          } catch { outcomes.push(false); }
         } finally {
           if (previousStateDir === undefined) { delete process.env.OPENCLAW_STATE_DIR; } else { process.env.OPENCLAW_STATE_DIR = previousStateDir; }
           fs.rmSync(stateDir, { recursive: true, force: true });
@@ -256,7 +272,7 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
       };
     (cli ? runCliAgentMock : runEmbeddedAgentMock).mockImplementationOnce(exercise as never);
     const params = makeParams(); params.job.owner = { agentId: "default", sessionKey: "agent:default:slack:channel:C0ROOM:thread:1784000000.000001" };
-    await runCronIsolatedAgentTurn(params); expect(outcomes).toEqual(ownerMatches && !missingField ? cases.map((item) => item[2]) : cases.map(() => false));
+    await runCronIsolatedAgentTurn(params); expect(outcomes).toEqual(ownerMatches && !missingField ? [...cases.map((item) => item[2]), false] : [...cases.map(() => false), false]);
   });
 
   async function expectMessageToolDisabledForPlan(plan: {

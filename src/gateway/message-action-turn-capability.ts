@@ -75,7 +75,6 @@ export function isScopedMessageActionAuthorized(
     requested.every((value, index) => Boolean(value) && value === expected[index])
   );
 }
-
 export type MessageActionTurnCapabilityRejectionReason =
   | "token_missing"
   | "token_conflict"
