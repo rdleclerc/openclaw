@@ -19,8 +19,8 @@ import {
   mintMessageActionTurnCapability,
   revokeMessageActionTurnCapability,
 } from "../../gateway/message-action-turn-capability.js";
+import { sourceDeliveryTargetsMatch } from "../../infra/outbound/source-delivery-plan.js";
 import type { SourceDeliveryPlan } from "../../infra/outbound/source-delivery-plan.js";
-import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import {
   createUserTurnTranscriptRecorder,
   type UserTurnTranscriptRecorder,
@@ -31,7 +31,7 @@ import {
   getGeneratedMediaTaskIdsForSessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
 } from "../../tasks/task-status-access.js";
-import { normalizeMessageChannel } from "../../utils/message-channel.js";
+import { resolveCronStoredDeliveryContext } from "../delivery-context.js";
 import type { CronAgentExecutionPhaseUpdate, CronJob } from "../types.js";
 import {
   resolveCronChannelOutputPolicy,
@@ -61,7 +61,6 @@ import type {
   PersistCronSessionEntry,
 } from "./run-session-state.js";
 import { syncCronSessionLiveSelection } from "./run-session-state.js";
-import { loadCronSessionEntryLatest } from "./session.js";
 import { resolveFallbackCronSourceDeliveryPlan } from "./source-delivery-fallback.js";
 import { isLikelyInterimCronMessage } from "./subagent-followup-hints.js";
 
@@ -290,6 +289,26 @@ function createCronPromptExecutor(params: {
     resolveFallbackCronSourceDeliveryPlan(params.job, params.resolvedDelivery);
   const sourceReplyDeliveryMode = sourceDelivery.sourceReplyDeliveryMode;
   const messageChannel = sourceDelivery.target.channel ?? params.resolvedDelivery.channel;
+  const storedDelivery = resolveCronStoredDeliveryContext({
+    cfg: params.cfg,
+    sessionKey: params.job.sessionKey,
+  });
+  const resolvedAccountId = params.resolvedDelivery.accountId?.trim();
+  const storedProvider = storedDelivery?.channel?.trim().toLowerCase();
+  const resolvedProvider = params.resolvedDelivery.channel?.trim().toLowerCase();
+  const messageActionRouteTrusted =
+    params.resolvedDeliveryOk &&
+    storedProvider === "slack" &&
+    resolvedProvider === storedProvider &&
+    Boolean(resolvedAccountId && storedDelivery?.accountId?.trim() === resolvedAccountId) &&
+    sourceDeliveryTargetsMatch(
+      {
+        provider: storedDelivery?.channel,
+        to: storedDelivery?.to,
+        threadId: storedDelivery?.threadId?.toString(),
+      },
+      params.resolvedDelivery,
+    );
   // Cron prompts may intentionally have nothing to report; both runners must agree on silence.
   const allowEmptyAssistantReplyAsSilent = true;
   const deliveryTargetRuntimeContext = buildCronDeliveryTargetRuntimeContext({
@@ -309,6 +328,15 @@ function createCronPromptExecutor(params: {
     hasNewGeneratedMediaTaskForSessionKey(params.runSessionKey, attemptMediaTaskIds);
 
   const runPrompt = async (promptText: string) => {
+    if (
+      sourceDelivery.messageTool.enabled &&
+      !messageActionRouteTrusted &&
+      [storedProvider, resolvedProvider, messageChannel?.trim().toLowerCase()].includes("slack")
+    ) {
+      throw new Error(
+        "Cron Slack message route is missing or does not match stored delivery context.",
+      );
+    }
     const userTurnTranscriptRecorder =
       pendingUserTurn?.promptText === promptText
         ? pendingUserTurn.recorder
@@ -330,6 +358,29 @@ function createCronPromptExecutor(params: {
     const modelPrompt = deliveryTargetRuntimeContext
       ? `${promptText}\n\n${deliveryTargetRuntimeContext}`.trim()
       : promptText;
+    const currentChannelId = await resolveCurrentChannelTarget({
+      channel: messageChannel,
+      to: params.resolvedDelivery.to,
+      threadId: params.resolvedDelivery.threadId,
+    });
+    const currentThreadTs = params.resolvedDelivery.threadId?.toString();
+    const messageActionTurnCapability = messageActionRouteTrusted
+      ? mintMessageActionTurnCapability({
+          agentId: params.agentId,
+          runId: params.cronSession.sessionEntry.sessionId,
+          sessionKey: params.runSessionKey,
+          sessionId: params.cronSession.sessionEntry.sessionId,
+          requesterAccountId: resolvedAccountId,
+          ttlMs: params.timeoutMs + 60_000,
+          toolContext: {
+            currentChannelProvider: messageChannel,
+            currentChannelId,
+            currentMessagingTarget: params.resolvedDelivery.to,
+            currentThreadTs,
+            sameChannelThreadRequired: true,
+          },
+        })
+      : undefined;
     const fallbackResult = await runWithModelFallback({
       cfg: params.cfgWithAgentDefaults,
       provider: params.liveSelection.provider,
@@ -411,29 +462,6 @@ function createCronPromptExecutor(params: {
         await params.setRunContinuationCliExecutionProvider?.(
           cliExecution ? executionProvider : undefined,
         );
-        const currentChannelId = await resolveCurrentChannelTarget({
-          channel: messageChannel,
-          to: params.resolvedDelivery.to,
-          threadId: params.resolvedDelivery.threadId,
-        });
-        const accountId = normalizeOptionalString(params.resolvedDelivery.accountId);
-        const target = normalizeOptionalString(params.resolvedDelivery.to);
-        const threadId = normalizeOptionalString(params.resolvedDelivery.threadId);
-        // oxfmt-ignore
-        const ownerRoute = params.job.owner?.sessionKey ? loadCronSessionEntryLatest(params.cronSession.storePath, params.job.owner.sessionKey) : undefined;
-        const ownerSessionRoute = parseSessionDeliveryRoute(params.job.owner?.sessionKey);
-        // oxfmt-ignore
-        const isSlackOwnedRun = [messageChannel, ownerRoute?.lastChannel, ownerSessionRoute?.channel].some((value) => normalizeMessageChannel(value) === "slack");
-        // oxfmt-ignore
-        const ownerRouteMatches = normalizeMessageChannel(messageChannel) === "slack" && Boolean(accountId && target && threadId) && normalizeMessageChannel(ownerRoute?.lastChannel) === "slack" && normalizeOptionalString(ownerRoute?.lastAccountId) === accountId && normalizeOptionalString(ownerRoute?.lastTo) === target && normalizeOptionalString(ownerRoute?.lastThreadId) === threadId;
-        // oxfmt-ignore
-        const mintCronSlackReadCapability = () => isSlackOwnedRun ? mintMessageActionTurnCapability({ agentId: params.agentId,
-            runId: params.cronSession.sessionEntry.sessionId, sessionKey: params.runSessionKey,
-            sessionId: params.cronSession.sessionEntry.sessionId, requesterAccountId: accountId,
-            allowedActions: ownerRouteMatches ? ["read"] : [],
-            toolContext: { currentChannelId, currentChannelProvider: messageChannel,
-              currentMessagingTarget: target, currentThreadTs: threadId, sameChannelThreadRequired: true },
-            ttlMs: params.timeoutMs + 60_000 }) : undefined;
         const bootstrapPromptWarningSignature =
           bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
         // CLI providers can resume provider-native sessions; embedded providers
@@ -450,7 +478,6 @@ function createCronPromptExecutor(params: {
           // claims stay unique via per-claim ids and the worker gate handles this
           // via credential rotation (see worker-environments/service.ts fences).
           const runId = params.cronSession.sessionEntry.sessionId;
-          const messageActionTurnCapability = mintCronSlackReadCapability();
           const result = await withLocalSessionPlacementTurnAdmission(
             {
               sessionId: params.cronSession.sessionEntry.sessionId,
@@ -484,6 +511,9 @@ function createCronPromptExecutor(params: {
                 cliSessionBinding: guardedCliSessionBinding,
                 skillsSnapshot: params.skillsSnapshot,
                 messageChannel,
+                agentAccountId: params.resolvedDelivery.accountId,
+                currentChannelId,
+                currentThreadTs,
                 messageActionTurnCapability,
                 sourceReplyDeliveryMode,
                 requireExplicitMessageTarget: sourceDelivery.messageTool.requireExplicitTarget,
@@ -510,7 +540,7 @@ function createCronPromptExecutor(params: {
                   userTurnTranscriptRecorder.hasPersisted() ||
                   userTurnTranscriptRecorder.isBlocked(),
               }),
-          ).finally(() => revokeMessageActionTurnCapability(messageActionTurnCapability));
+          );
           bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
             result.meta?.systemPromptReport,
           );
@@ -526,7 +556,6 @@ function createCronPromptExecutor(params: {
         });
         // Embedded runs receive both the explicit route and the current-channel
         // id so message-tool policy can target the same chat as fallback delivery.
-        const messageActionTurnCapability = mintCronSlackReadCapability();
         const result = await runEmbeddedAgent({
           sessionId: params.cronSession.sessionEntry.sessionId,
           sessionKey: params.runSessionKey,
@@ -541,6 +570,7 @@ function createCronPromptExecutor(params: {
           messageTo: params.resolvedDelivery.to,
           messageThreadId: params.resolvedDelivery.threadId,
           currentChannelId,
+          currentThreadTs,
           messageActionTurnCapability,
           sessionFile,
           agentDir: params.agentDir,
@@ -608,13 +638,13 @@ function createCronPromptExecutor(params: {
           userTurnTranscriptRecorder,
           suppressNextUserMessagePersistence:
             userTurnTranscriptRecorder.hasPersisted() || userTurnTranscriptRecorder.isBlocked(),
-        }).finally(() => revokeMessageActionTurnCapability(messageActionTurnCapability));
+        });
         bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
           result.meta?.systemPromptReport,
         );
         return result;
       },
-    });
+    }).finally(() => revokeMessageActionTurnCapability(messageActionTurnCapability));
     runResult = fallbackResult.result;
     fallbackProvider = fallbackResult.provider;
     fallbackModel = fallbackResult.model;

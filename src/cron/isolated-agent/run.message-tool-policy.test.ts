@@ -1,18 +1,5 @@
 // Message tool policy tests cover message tool availability during cron runs.
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  runWithGatewayToolCallerRequestContext,
-  withGatewayToolCallerIdentity,
-} from "../../agents/tools/gateway-caller-context.js";
-import { resolveMessageActionAgentRuntimeIdentityToken } from "../../agents/tools/gateway.js";
-import { createMessageTool } from "../../agents/tools/message-tool.js";
-import { verifyAgentRuntimeIdentityToken } from "../../gateway/agent-runtime-identity-token.js";
-import { isScopedMessageActionAuthorized } from "../../gateway/message-action-turn-capability.js";
-import { sendHandlers } from "../../gateway/server-methods/send.js";
-import { normalizeMessageActionInput } from "../../infra/outbound/message-action-normalization.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSourceDeliveryPlan } from "../../infra/outbound/source-delivery-plan.js";
 import type { SkillSnapshot } from "../../skills/types.js";
 import { applyJobPatch } from "../service/jobs.js";
@@ -41,8 +28,19 @@ import {
   runEmbeddedAgentMock,
 } from "./run.test-harness.js";
 
+const resolveCronStoredDeliveryContext = vi.hoisted(() => vi.fn());
+vi.mock("../delivery-context.js", () => ({ resolveCronStoredDeliveryContext }));
+const mintMessageActionTurnCapabilityMock = vi.hoisted(() =>
+  vi.fn(() => "cron-message-action-token"),
+);
+vi.mock("../../gateway/message-action-turn-capability.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../gateway/message-action-turn-capability.js")>()),
+  mintMessageActionTurnCapability: mintMessageActionTurnCapabilityMock,
+  revokeMessageActionTurnCapability: vi.fn(),
+}));
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
 const { executeCronRun } = await import("./run-executor.js");
+const { createMessageTool } = await import("../../agents/tools/message-tool.js");
 
 function makeMessageToolPolicyJob(
   delivery: Record<string, unknown> = { mode: "none" },
@@ -203,77 +201,6 @@ function expectDeliveryFields(
 
 describe("runCronIsolatedAgentTurn message tool policy", () => {
   let previousFastTestEnv: string | undefined;
-
-  // oxfmt-ignore
-  it.each([["embedded", false, true, undefined], ["CLI", true, true, undefined], ["embedded cross-route", false, false, undefined], ["CLI cross-route", true, false, undefined], ["embedded missing provider", false, true, "provider"], ["CLI missing account", true, true, "accountId"], ["embedded missing target", false, true, "target"], ["CLI missing thread", true, true, "thread"]])("allows only an exact signed message-tool read through %s cron", async (_name, cli, ownerMatches, missingField) => {
-    const route = { provider: "slack", accountId: "acct", target: "C0ROOM", thread: "1784000000.000001" };
-    const cases = [
-      ["read", route, true],
-      ["read", { ...route, provider: "other" }, false],
-      ["read", { ...route, provider: "last" }, false],
-      ["read", { ...route, accountId: "other" }, false],
-      ["read", { ...route, target: "other" }, false],
-      ["read", { ...route, thread: "other" }, false],
-      ["read", { ...route, thread: undefined }, false],
-      ["send", route, false],
-    ];
-    const resolvedRoute = { ...route, [missingField ?? "unused"]: undefined };
-    mockRunCronFallbackPassthrough(); isCliProviderMock.mockReturnValue(cli); loadSessionEntryMock.mockImplementation((_storePath, sessionKey) => sessionKey.includes(":slack:") ? { lastChannel: route.provider, lastAccountId: route.accountId, lastTo: ownerMatches ? route.target : "other", lastThreadId: route.thread } : undefined);
-    resolveCronDeliveryPlanMock.mockReturnValue(makeAnnounceDeliveryPlan({ channel: resolvedRoute.provider, to: resolvedRoute.target, threadId: resolvedRoute.thread }));
-    resolveDeliveryTargetMock.mockResolvedValue({ ok: true, channel: resolvedRoute.provider, to: resolvedRoute.target, accountId: resolvedRoute.accountId, threadId: resolvedRoute.thread });
-    const outcomes: boolean[] = [],
-      exercise = async (input: Record<"agentId" | "runId" | "sessionKey" | "sessionId", string> & { messageActionTurnCapability?: string }) => {
-        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-cron-slack-read-")), previousStateDir = process.env.OPENCLAW_STATE_DIR;
-        process.env.OPENCLAW_STATE_DIR = stateDir;
-        try {
-          const identityToken = await withGatewayToolCallerIdentity({ agentId: input.agentId, sessionKey: input.sessionKey }, async () => await resolveMessageActionAgentRuntimeIdentityToken({ opts: {}, target: "local", turnCapability: input.messageActionTurnCapability, runId: input.runId, sessionId: input.sessionId }));
-          const identity = await verifyAgentRuntimeIdentityToken(identityToken);
-          let receiverRejectedBeforeContext = false, receiverRejectionMessage = "";
-          const receiver = sendHandlers["message.action"];
-          if (!receiver || !identity) { throw new Error("expected signed message.action receiver context"); }
-          await receiver({ params: { channel: route.provider, action: "read", params: { target: "other", to: "other", threadId: route.thread },
-            accountId: route.accountId, sessionKey: input.sessionKey, sessionId: input.sessionId, agentId: input.agentId, idempotencyKey: `scope-${_name}` } as never,
-            respond: (ok, _payload, error) => { receiverRejectedBeforeContext = !ok; receiverRejectionMessage = String((error as { message?: unknown } | undefined)?.message ?? ""); }, context: new Proxy({} as never, { get: () => { throw new Error("receiver touched context before scope authorization"); } }),
-            client: { internal: { agentRuntimeIdentity: identity } } as never, req: { type: "req", id: "scope", method: "message.action" }, isWebchatConnect: () => false });
-          expect(receiverRejectedBeforeContext).toBe(true);
-          expect(receiverRejectionMessage).toBe("message.action permits only the exact Slack read route");
-          for (const [action, candidate] of cases) {
-            const tool = createMessageTool({ agentId: input.agentId, runId: input.runId, agentSessionKey: input.sessionKey,
-              sessionId: input.sessionId, agentAccountId: route.accountId, messageActionTurnCapability: input.messageActionTurnCapability,
-              config: {}, conversationReadOrigin: "delegated", runMessageAction: async () => ({ kind: "action", action, channel: route.provider,
-                handledBy: "plugin", payload: {}, toolResult: { content: [] }, dryRun: false }) as never } as never);
-            let localAllowed = true;
-            try { await tool.execute(action, { action, channel: candidate.provider, accountId: candidate.accountId,
-              target: candidate.target, threadId: candidate.thread, text: "not sent" } as never); } catch { localAllowed = false; }
-            const normalized = localAllowed ? normalizeMessageActionInput({ action: action as never,
-              args: { channel: candidate.provider, target: candidate.target, threadId: candidate.thread } }) : undefined;
-            outcomes.push(Boolean(normalized) && isScopedMessageActionAuthorized(identity?.messageActionContext, { action,
-              provider: candidate.provider, accountId: candidate.accountId, target: normalized?.target,
-              threadId: normalized?.threadId, to: normalized?.to, channelId: normalized?.channelId, allowEquivalentTo: true }));
-          }
-          const conflictingTool = createMessageTool({ agentId: input.agentId, runId: input.runId,
-            agentSessionKey: input.sessionKey, sessionId: input.sessionId, agentAccountId: route.accountId,
-            messageActionTurnCapability: "legacy-token", config: {}, conversationReadOrigin: "delegated",
-            runMessageAction: async () => ({ kind: "action", action: "send", channel: route.provider,
-              handledBy: "plugin", payload: {}, toolResult: { content: [] }, dryRun: false }) as never } as never);
-          try {
-            await runWithGatewayToolCallerRequestContext({ agentId: input.agentId, sessionKey: input.sessionKey,
-              messageActionTurnCapability: input.messageActionTurnCapability }, () =>
-              conflictingTool.execute("conflict", { action: "send", channel: route.provider,
-                accountId: route.accountId, target: route.target, threadId: route.thread,
-                text: "not sent" } as never));
-            outcomes.push(true);
-          } catch { outcomes.push(false); }
-        } finally {
-          if (previousStateDir === undefined) { delete process.env.OPENCLAW_STATE_DIR; } else { process.env.OPENCLAW_STATE_DIR = previousStateDir; }
-          fs.rmSync(stateDir, { recursive: true, force: true });
-        }
-        return { payloads: [], meta: { agentMeta: {} } };
-      };
-    (cli ? runCliAgentMock : runEmbeddedAgentMock).mockImplementationOnce(exercise as never);
-    const params = makeParams(); params.job.owner = { agentId: "default", sessionKey: "agent:default:slack:channel:C0ROOM:thread:1784000000.000001" };
-    await runCronIsolatedAgentTurn(params); expect(outcomes).toEqual(ownerMatches && !missingField ? [...cases.map((item) => item[2]), false] : [...cases.map(() => false), false]);
-  });
 
   async function expectMessageToolDisabledForPlan(plan: {
     requested: boolean;
@@ -773,6 +700,91 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
     });
   });
 
+  const baseRoute = makeResolvedAnnounceTarget({
+    channel: "slack",
+    accountId: "bot-a",
+    threadId: 42,
+  });
+  it.each([
+    ["same route", {}, true],
+    ["account mismatch", { accountId: "bot-b" }, false],
+  ])(
+    "grants and bounds message-action authority only for %s",
+    async (_label, changes, expected) => {
+      mockRunCronFallbackPassthrough();
+      isCliProviderMock.mockReturnValue(true);
+      mintMessageActionTurnCapabilityMock.mockClear();
+      runCliAgentMock.mockResolvedValue(makeMessageToolRunResult([]));
+      resolveCronStoredDeliveryContext.mockReturnValue(baseRoute);
+      const run = createMessageToolExecutor({
+        resolvedDelivery: { ...baseRoute, ...changes },
+      }).runPrompt("send a message");
+      if (!expected) {
+        await expect(run).rejects.toThrow("Cron Slack message route");
+        return;
+      }
+      await run;
+      const toolContext = mintMessageActionTurnCapabilityMock.mock.calls[0]?.[0]?.toolContext;
+      expect(toolContext).toMatchObject({
+        currentChannelProvider: "slack",
+        currentMessagingTarget: "123",
+        currentThreadTs: "42",
+        sameChannelThreadRequired: true,
+      });
+      const exact = {
+        action: "send",
+        channel: "slack",
+        accountId: "bot-a",
+        target: "123",
+        threadId: "42",
+        message: "done",
+      };
+      const transport = vi
+        .fn()
+        .mockResolvedValue({ toolResult: { content: [], details: { ok: true } } });
+      const { mintMessageActionTurnCapability: mintReal } = await vi.importActual<
+        typeof import("../../gateway/message-action-turn-capability.js")
+      >("../../gateway/message-action-turn-capability.js");
+      const sessionKey = "agent:default:cron:message-tool-policy:run:test-session-id";
+      const restricted = (tokenRunId: string) =>
+        createMessageTool({
+          agentId: "default",
+          agentSessionKey: sessionKey,
+          runId: "test-session-id",
+          agentAccountId: "bot-a",
+          currentChannelProvider: "slack",
+          currentThreadTs: "42",
+          messageActionTurnCapability: mintReal({
+            agentId: "default",
+            runId: tokenRunId,
+            sessionKey,
+            toolContext,
+          }),
+          runMessageAction: transport,
+        });
+      await expect(restricted("other-run").execute?.("call", exact)).rejects.toThrow(
+        "authority is unavailable",
+      );
+      expect(transport).not.toHaveBeenCalled();
+      const call = (args: Record<string, unknown>) =>
+        restricted("test-session-id").execute?.("call", args);
+      for (const action of ["send", "read"]) {
+        await expect(call({ ...exact, action })).resolves.toMatchObject({
+          details: { effectiveAccountId: "bot-a" },
+        });
+      }
+      for (const args of [
+        { ...exact, channel: "otherchat" },
+        { ...exact, accountId: "bot-b" },
+        { ...exact, target: "456" },
+        { ...exact, threadId: "43" },
+        { ...exact, action: "react" },
+      ]) {
+        await expect(call(args)).rejects.toThrow("outside the bound Slack channel thread");
+      }
+    },
+  );
+
   it("lets channels build currentChannelId from split delivery fields", async () => {
     mockRunCronFallbackPassthrough();
     const executor = createMessageToolExecutor({
@@ -793,6 +805,7 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
       messageTo: "room",
       messageThreadId: 42,
       currentChannelId: "room#42",
+      currentThreadTs: "42",
     });
   });
 

@@ -595,7 +595,7 @@ export function createCodexDynamicToolBridge(params: {
               }
             : result;
         notifyAgentToolResult(options?.onAgentToolResult, toolName, observerResult, resultIsError);
-        void runAgentHarnessAfterToolCallHook({
+        const afterToolCall = runAgentHarnessAfterToolCallHook({
           toolName,
           toolCallId: call.callId,
           runId: toolResultHookContext.runId,
@@ -608,6 +608,9 @@ export function createCodexDynamicToolBridge(params: {
           result,
           startedAt,
         });
+        if (toolResultHookContext.sessionKey?.includes(":cron:")) {
+          await afterToolCall;
+        }
         finalizeToolTerminalPresentation({
           toolCallId: call.callId,
           runId: toolResultHookContext.runId,

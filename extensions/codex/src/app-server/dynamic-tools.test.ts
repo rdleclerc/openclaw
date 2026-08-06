@@ -3049,8 +3049,9 @@ describe("createCodexDynamicToolBridge", () => {
     expect(legacyContexts[0]).not.toHaveProperty("config");
   });
 
-  it("fires after_tool_call for successful codex tool executions", async () => {
-    const afterToolCall = vi.fn();
+  it("waits for after_tool_call only for successful cron tool executions", async () => {
+    const gate = Promise.withResolvers<void>();
+    const afterToolCall = vi.fn(() => gate.promise);
     initializeGlobalHookRunner(
       createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
     );
@@ -3065,13 +3066,13 @@ describe("createCodexDynamicToolBridge", () => {
         agentId: "agent-1",
         accountId: "slack-account-1",
         sessionId: "session-1",
-        sessionKey: "agent:agent-1:session-1",
+        sessionKey: "agent:agent-1:cron:job-1:run:run-1",
         runId: "run-1",
         channelId: "voice-room",
       },
     );
 
-    await bridge.handleToolCall({
+    const handled = bridge.handleToolCall({
       threadId: "thread-1",
       turnId: "turn-1",
       callId: "call-1",
@@ -3080,9 +3081,12 @@ describe("createCodexDynamicToolBridge", () => {
       arguments: { command: "pwd" },
     });
 
-    await vi.waitFor(() => {
-      expect(afterToolCall).toHaveBeenCalledTimes(1);
-    });
+    let settled = false;
+    void handled.then(() => (settled = true));
+    await vi.waitFor(() => expect(afterToolCall).toHaveBeenCalledTimes(1));
+    expect(settled).toBe(false);
+    gate.resolve();
+    await handled;
     const event = requireRecord(callArg(afterToolCall, 0, 0, "after_tool_call event"), "event");
     expect(event.toolName).toBe("exec");
     expect(event.toolCallId).toBe("call-1");
@@ -3095,12 +3099,19 @@ describe("createCodexDynamicToolBridge", () => {
       agentId: "agent-1",
       accountId: "slack-account-1",
       sessionId: "session-1",
-      sessionKey: "agent:agent-1:session-1",
+      sessionKey: "agent:agent-1:cron:job-1:run:run-1",
       runId: "run-1",
       channelId: "voice-room",
       toolName: "exec",
       toolCallId: "call-1",
     });
+    afterToolCall.mockImplementationOnce(() => new Promise<void>(() => {}));
+    await handleMessageToolCall(
+      createBridgeWithToolResult("message", textToolResult("done"), {
+        sessionKey: "agent:agent-1:session-1",
+      }),
+      {},
+    );
   });
 
   it("runs before_tool_call for unwrapped dynamic tools before execution", async () => {
