@@ -1629,6 +1629,8 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       }
 
       const gatewayOpts = readGatewayCallOptions(params);
+      params.accountId =
+        readStringParam(params, "accountId") ?? trustedTurnContext?.requesterAccountId;
       const rawConfig = options?.config ?? loadConfigForTool();
       const scope = resolveMessageSecretScope({
         channel: params.channel,

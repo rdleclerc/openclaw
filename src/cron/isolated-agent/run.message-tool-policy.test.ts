@@ -713,7 +713,6 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
     async (_label, changes, expected) => {
       mockRunCronFallbackPassthrough();
       isCliProviderMock.mockReturnValue(true);
-      mintMessageActionTurnCapabilityMock.mockClear();
       runCliAgentMock.mockResolvedValue(makeMessageToolRunResult([]));
       resolveCronStoredDeliveryContext.mockReturnValue(baseRoute);
       const run = createMessageToolExecutor({
@@ -725,39 +724,36 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
       }
       await run;
       const toolContext = mintMessageActionTurnCapabilityMock.mock.calls[0]?.[0]?.toolContext;
-      expect(toolContext).toMatchObject({
-        currentChannelProvider: "slack",
-        currentMessagingTarget: "123",
-        currentThreadTs: "42",
-        sameChannelThreadRequired: true,
-      });
       const exact = {
         action: "send",
         channel: "slack",
-        accountId: "bot-a",
         target: "123",
         threadId: "42",
         message: "done",
       };
-      const transport = vi
-        .fn()
-        .mockResolvedValue({ toolResult: { content: [], details: { ok: true } } });
+      const transport = vi.fn(async (request: { defaultAccountId?: string; params: object }) => {
+        expect(request.defaultAccountId).toBe("bot-a");
+        expect(request.params).toMatchObject({ accountId: "bot-a" });
+        return { toolResult: { content: [], details: { ok: true } } };
+      });
+      const scopedSecrets = vi.fn(() => ({ targetIds: new Set<string>() }));
       const { mintMessageActionTurnCapability: mintReal } = await vi.importActual<
         typeof import("../../gateway/message-action-turn-capability.js")
       >("../../gateway/message-action-turn-capability.js");
       const sessionKey = "agent:default:cron:message-tool-policy:run:test-session-id";
       const restricted = (tokenRunId: string) =>
         createMessageTool({
-          agentId: "default",
           agentSessionKey: sessionKey,
           runId: "test-session-id",
-          agentAccountId: "bot-a",
+          agentAccountId: "bot-b",
           currentChannelProvider: "slack",
           currentThreadTs: "42",
+          getScopedChannelsCommandSecretTargets: scopedSecrets,
           messageActionTurnCapability: mintReal({
             agentId: "default",
             runId: tokenRunId,
             sessionKey,
+            requesterAccountId: "bot-a",
             toolContext,
           }),
           runMessageAction: transport,
@@ -773,6 +769,7 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
           details: { effectiveAccountId: "bot-a" },
         });
       }
+      expect(scopedSecrets).toHaveBeenCalledWith(expect.objectContaining({ accountId: "bot-a" }));
       for (const args of [
         { ...exact, channel: "otherchat" },
         { ...exact, accountId: "bot-b" },
