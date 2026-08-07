@@ -163,6 +163,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     promptCacheKey: params.promptCacheKey,
     sandboxSessionKey: params.sandboxSessionKey,
     trigger: params.trigger,
+    externalContentSource: params.externalContentSource,
     memoryFlushWritePath: params.memoryFlushWritePath,
     messageChannel: params.messageChannel,
     messageProvider: params.messageProvider,

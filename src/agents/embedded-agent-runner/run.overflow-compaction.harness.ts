@@ -86,6 +86,7 @@ export const mockedGlobalHookRunner = {
       _ctx: PluginHookAgentContext,
     ): Promise<PluginHookBeforeAgentReplyResult | undefined> => undefined,
   ),
+  runAgentEnd: vi.fn(async (_eventValue: unknown, _ctx: PluginHookAgentContext) => undefined),
   runBeforeAgentStart: vi.fn(
     async (
       _eventValue: { prompt: string; messages?: unknown[] },
@@ -411,6 +412,8 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedGlobalHookRunner.hasHooks.mockReturnValue(false);
   mockedGlobalHookRunner.runBeforeAgentReply.mockReset();
   mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue(undefined);
+  mockedGlobalHookRunner.runAgentEnd.mockReset();
+  mockedGlobalHookRunner.runAgentEnd.mockResolvedValue(undefined);
   mockedGlobalHookRunner.runBeforeAgentStart.mockReset();
   mockedGlobalHookRunner.runBeforeAgentStart.mockResolvedValue(undefined);
   mockedGlobalHookRunner.runBeforeAgentFinalize.mockReset();

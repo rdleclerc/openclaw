@@ -40,6 +40,7 @@ export function buildEmbeddedAgentEndContext(params: {
     senderE164: run.senderE164,
     senderIsOwner: run.senderIsOwner,
     trigger: run.trigger,
+    ...(run.externalContentSource ? { externalContentSource: run.externalContentSource } : {}),
     ...(run.config ? { config: run.config } : {}),
     ...buildAgentHookContextChannelFields(run),
     ...buildAgentHookContextIdentityFields({

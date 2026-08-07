@@ -335,7 +335,7 @@ describe("runCronIsolatedAgentTurn isolated session identity", () => {
     expect(runRequest.cleanupCliLiveSessionOnRunEnd).toBe(true);
   });
 
-  it("runs externally sourced CLI hook turns", async () => {
+  it("carries externally sourced CLI hook turns into the CLI cron run", async () => {
     isCliProviderMock.mockReturnValue(true);
     mockRunCronFallbackPassthrough();
     runCliAgentMock.mockResolvedValue({
@@ -345,7 +345,7 @@ describe("runCronIsolatedAgentTurn isolated session identity", () => {
 
     const result = await runCronIsolatedAgentTurn(
       makeIsolatedAgentParamsFixture({
-        sessionKey: "hook:webhook:cli-monitor",
+        sessionKey: "hook:gmail:msg-webhook-cli",
         job: makeIsolatedAgentJobFixture({
           payload: {
             kind: "agentTurn",
@@ -358,5 +358,34 @@ describe("runCronIsolatedAgentTurn isolated session identity", () => {
 
     expect(result.status).toBe("ok");
     expect(runCliAgentMock).toHaveBeenCalledOnce();
+    expect(requireFirstMockArg(runCliAgentMock, "runCliAgentMock")).toEqual(
+      expect.objectContaining({ trigger: "cron", externalContentSource: "webhook" }),
+    );
   });
+
+  it.each(["gmail", "webhook"] as const)(
+    "carries cron payload externalContentSource=%s into the native embedded run",
+    async (externalContentSource) => {
+      mockRunCronFallbackPassthrough();
+
+      const result = await runCronIsolatedAgentTurn(
+        makeIsolatedAgentParamsFixture({
+          sessionKey: `cron:${externalContentSource}-monitor`,
+          job: makeIsolatedAgentJobFixture({
+            payload: {
+              kind: "agentTurn",
+              message: "test",
+              externalContentSource,
+            },
+          }),
+        }),
+      );
+
+      expect(result.status).toBe("ok");
+      expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
+      expect(requireFirstMockArg(runEmbeddedAgentMock, "runEmbeddedAgentMock")).toEqual(
+        expect.objectContaining({ trigger: "cron", externalContentSource }),
+      );
+    },
+  );
 });

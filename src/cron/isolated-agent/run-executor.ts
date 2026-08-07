@@ -21,6 +21,7 @@ import {
 } from "../../gateway/message-action-turn-capability.js";
 import { sourceDeliveryTargetsMatch } from "../../infra/outbound/source-delivery-plan.js";
 import type { SourceDeliveryPlan } from "../../infra/outbound/source-delivery-plan.js";
+import type { HookExternalContentSource } from "../../security/external-content.js";
 import {
   createUserTurnTranscriptRecorder,
   type UserTurnTranscriptRecorder,
@@ -203,6 +204,7 @@ function createCronPromptExecutor(params: {
   cfg: OpenClawConfig;
   cfgWithAgentDefaults: OpenClawConfig;
   job: CronJob;
+  externalContentSource?: HookExternalContentSource;
   agentId: string;
   agentDir: string;
   agentSessionKey: string;
@@ -493,6 +495,7 @@ function createCronPromptExecutor(params: {
                 agentId: params.agentId,
                 trigger: "cron",
                 jobId: params.job.id,
+                externalContentSource: params.externalContentSource,
                 cleanupCliLiveSessionOnRunEnd: params.usesDetachedRunSession === true,
                 sessionFile,
                 workspaceDir: params.workspaceDir,
@@ -563,6 +566,7 @@ function createCronPromptExecutor(params: {
           agentId: params.agentId,
           trigger: "cron",
           jobId: params.job.id,
+          externalContentSource: params.externalContentSource,
           cleanupBundleMcpOnRunEnd: params.usesDetachedRunSession === true,
           allowGatewaySubagentBinding: true,
           messageChannel,
@@ -674,6 +678,7 @@ export async function executeCronRun(params: {
   cfg: OpenClawConfig;
   cfgWithAgentDefaults: OpenClawConfig;
   job: CronJob;
+  externalContentSource?: HookExternalContentSource;
   agentId: string;
   agentDir: string;
   agentSessionKey: string;
@@ -742,6 +747,7 @@ export async function executeCronRun(params: {
     cfg: params.cfg,
     cfgWithAgentDefaults: params.cfgWithAgentDefaults,
     job: params.job,
+    externalContentSource: params.externalContentSource,
     agentId: params.agentId,
     agentDir: params.agentDir,
     agentSessionKey: params.agentSessionKey,

@@ -1255,6 +1255,9 @@ export async function prepareCliRunContext(
             modelProviderId: params.provider,
             modelId,
             trigger: params.trigger,
+            ...(params.externalContentSource
+              ? { externalContentSource: params.externalContentSource }
+              : {}),
             ...buildAgentHookContextChannelFields(params),
           },
           hookRunner,

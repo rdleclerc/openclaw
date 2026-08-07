@@ -22,6 +22,7 @@ type BeforeAgentReplyResult =
 const {
   hasHooksMock,
   runBeforeAgentReplyMock,
+  runAgentEndMock,
   executePreparedCliRunMock,
   prepareCliRunContextMock,
   closeClaudeLiveSessionForContextMock,
@@ -31,6 +32,7 @@ const {
   runBeforeAgentReplyMock: vi.fn<(event: unknown, ctx: unknown) => Promise<BeforeAgentReplyResult>>(
     async () => undefined,
   ),
+  runAgentEndMock: vi.fn(async () => undefined),
   executePreparedCliRunMock: vi.fn<
     (_context: unknown, _cliSessionIdToUse?: string) => Promise<CliOutput>
   >(async () => ({ text: "" })),
@@ -43,6 +45,7 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: vi.fn(() => ({
     hasHooks: hasHooksMock,
     runBeforeAgentReply: runBeforeAgentReplyMock,
+    runAgentEnd: runAgentEndMock,
   })),
 }));
 
@@ -103,6 +106,8 @@ beforeEach(() => {
   hasHooksMock.mockReturnValue(false);
   runBeforeAgentReplyMock.mockReset();
   runBeforeAgentReplyMock.mockResolvedValue(undefined);
+  runAgentEndMock.mockReset();
+  runAgentEndMock.mockResolvedValue(undefined);
   executePreparedCliRunMock.mockReset();
   executePreparedCliRunMock.mockResolvedValue({ text: "" });
   prepareCliRunContextMock.mockReset();
@@ -139,7 +144,9 @@ describe("runCliAgent cron before_agent_reply seam", () => {
 
   it("lets before_agent_reply claim cron runs before the CLI subprocess is invoked", async () => {
     const logInfoSpy = vi.spyOn(cliBackendLog, "info").mockImplementation(() => undefined);
-    hasHooksMock.mockImplementation((hookName) => hookName === "before_agent_reply");
+    hasHooksMock.mockImplementation((hookName) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
     runBeforeAgentReplyMock.mockResolvedValue({
       handled: true,
       reply: { text: "dreaming claimed via cli runner" },
@@ -152,6 +159,7 @@ describe("runCliAgent cron before_agent_reply seam", () => {
         trigger: "cron",
         jobId: "cron-job-123",
         chatId: "native-chat-123",
+        externalContentSource: "gmail",
         onExecutionPhase,
       });
 
@@ -170,12 +178,19 @@ describe("runCliAgent cron before_agent_reply seam", () => {
       expect(hookContext?.sessionKey).toBe(baseRunParams.sessionKey);
       expect(hookContext?.workspaceDir).toBe(baseRunParams.workspaceDir);
       expect(hookContext?.trigger).toBe("cron");
+      expect(hookContext?.externalContentSource).toBe("gmail");
       expect(hookContext?.chatId).toBeUndefined();
       expect(hookContext?.channel).toBeUndefined();
       expect(executePreparedCliRunMock).not.toHaveBeenCalled();
       expect(result.payloads?.[0]?.text).toBe("dreaming claimed via cli runner");
       expect(result.meta.agentMeta?.sessionId).toBe("");
       expect(result.meta.agentMeta?.clearCliSessionBinding).toBeUndefined();
+      expect(runAgentEndMock).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true }),
+        expect.objectContaining({ externalContentSource: "gmail" }),
+        expect.anything(),
+      );
+      expect(runAgentEndMock).toHaveBeenCalledTimes(1);
 
       const syntheticTurnLog = logInfoSpy.mock.calls
         .map(([message]) => message)
@@ -189,6 +204,40 @@ describe("runCliAgent cron before_agent_reply seam", () => {
     } finally {
       logInfoSpy.mockRestore();
     }
+  });
+
+  it("does not emit agent_end for a handled cron turn without a typed external source", async () => {
+    hasHooksMock.mockImplementation((hookName) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    runBeforeAgentReplyMock.mockResolvedValue({ handled: true, reply: { text: "handled" } });
+
+    await runCliAgent({ ...baseRunParams, trigger: "cron" });
+
+    expect(runAgentEndMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit webhook provenance on a handled Gmail-looking cron key", async () => {
+    hasHooksMock.mockImplementation((hookName) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    runBeforeAgentReplyMock.mockResolvedValue({ handled: true, reply: { text: "handled" } });
+
+    await runCliAgent({
+      ...baseRunParams,
+      trigger: "cron",
+      sessionKey: "hook:gmail:message-123",
+      externalContentSource: "webhook",
+    });
+
+    expect(runAgentEndMock).toHaveBeenCalledWith(
+      expect.objectContaining({ success: true }),
+      expect.objectContaining({
+        sessionKey: "hook:gmail:message-123",
+        externalContentSource: "webhook",
+      }),
+      expect.anything(),
+    );
   });
 
   it("clears stateless CLI bindings when before_agent_reply claims a cron turn", async () => {

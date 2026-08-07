@@ -36,6 +36,7 @@ vi.mock("../../music-generation-task-status.js", () => musicGenerationTaskStatus
 vi.mock("../../video-generation-task-status.js", () => videoGenerationTaskStatusMocks);
 vi.mock("../../../plugins/host-hook-state.js", () => hostHookStateMocks);
 
+import { prepareEmbeddedAttemptPromptAssembly } from "./attempt-prompt-assembly.js";
 import { resolvePromptSubmissionSkipReason } from "./attempt-prompt-skip.js";
 import {
   forgetPromptBuildDrainCacheForRun,
@@ -44,6 +45,7 @@ import {
   resolvePromptBuildHookResult,
   shouldInjectHeartbeatPrompt,
 } from "./attempt.prompt-helpers.js";
+import type { EmbeddedRunAttemptParams } from "./types.js";
 
 function hasLoneSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -261,6 +263,60 @@ describe("resolvePromptSubmissionSkipReason", () => {
       }),
     ).toBe("empty_prompt_history_images");
   });
+});
+
+describe("prepareEmbeddedAttemptPromptAssembly provenance", () => {
+  it.each(["gmail", "webhook"] as const)(
+    "preserves cron externalContentSource=%s for agent_turn_prepare",
+    async (externalContentSource) => {
+      const runAgentTurnPrepare = vi.fn(async () => undefined);
+      const hookRunner = {
+        hasHooks: vi.fn((hookName: string) => hookName === "agent_turn_prepare"),
+        runAgentTurnPrepare,
+      };
+
+      await prepareEmbeddedAttemptPromptAssembly({
+        attempt: {
+          runId: `cron-source-${externalContentSource}`,
+          sessionId: `session-${externalContentSource}`,
+          sessionKey: `cron:${externalContentSource}`,
+          workspaceDir: "/workspace",
+          provider: "openai",
+          modelId: "gpt-5.4",
+          model: { provider: "openai", id: "gpt-5.4", api: "openai-responses" },
+          trigger: "cron",
+          externalContentSource,
+          prompt: "cron payload",
+          config: {},
+          bootstrapContextRunKind: "commitment-only",
+        } as unknown as EmbeddedRunAttemptParams,
+        activeSession: { messages: [] } as never,
+        sessionManager: { getLeafEntry: () => undefined } as never,
+        hookRunner: hookRunner as never,
+        hookAgentId: "main",
+        diagnosticTrace: { traceId: "trace-1" },
+        isRawModelRun: false,
+        sessionAgentId: "",
+        runtimeModel: "gpt-5.4",
+        systemPromptText: "",
+        setActiveSessionSystemPrompt: vi.fn(),
+        setLeasedSteering: vi.fn(),
+        cache: {
+          observabilityEnabled: false,
+          retention: undefined,
+          streamStrategy: "sse",
+          transport: "sse",
+          toolNames: [],
+          trace: null,
+        },
+      });
+
+      expect(runAgentTurnPrepare).toHaveBeenCalledWith(
+        expect.objectContaining({ prompt: "cron payload" }),
+        expect.objectContaining({ trigger: "cron", externalContentSource }),
+      );
+    },
+  );
 });
 
 describe("resolvePromptBuildHookResult drain cache", () => {

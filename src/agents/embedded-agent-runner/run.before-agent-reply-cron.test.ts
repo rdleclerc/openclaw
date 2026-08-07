@@ -62,8 +62,8 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
   it("lets before_agent_reply claim cron runs before the embedded attempt starts", async () => {
     // Cron hooks can fully handle maintenance prompts before the model is
     // invoked, which avoids unnecessary prompt-cache and setup work.
-    mockedGlobalHookRunner.hasHooks.mockImplementation(
-      (hookName: string) => hookName === "before_agent_reply",
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
     );
     mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
       handled: true,
@@ -76,6 +76,7 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
       trigger: "cron",
       jobId: "cron-job-123",
       prompt: "__openclaw_memory_core_short_term_promotion_dream__",
+      externalContentSource: "gmail",
       onExecutionPhase,
     });
 
@@ -93,11 +94,58 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
     expect(hookContext?.sessionKey).toBe("test-key");
     expect(hookContext?.workspaceDir).toBe("/tmp/workspace");
     expect(hookContext?.trigger).toBe("cron");
+    expect(hookContext?.externalContentSource).toBe("gmail");
     expect(hookContext?.senderId).toBeUndefined();
     expect(hookContext?.chatId).toBeUndefined();
     expect(hookContext?.channel).toBeUndefined();
     expect(mockedRunEmbeddedAttempt).not.toHaveBeenCalled();
+    expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledWith(
+      expect.objectContaining({ success: true }),
+      expect.objectContaining({ externalContentSource: "gmail" }),
+      expect.anything(),
+    );
+    expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
     expect(result.payloads?.[0]?.text).toBe("dreaming claimed");
+  });
+
+  it("does not emit agent_end for a handled cron turn without a typed external source", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
+      handled: true,
+      reply: { text: "handled" },
+    });
+
+    await runEmbeddedAgent({ ...overflowBaseRunParams, trigger: "cron" });
+
+    expect(mockedGlobalHookRunner.runAgentEnd).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit webhook provenance on a handled Gmail-looking cron key", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
+      handled: true,
+      reply: { text: "handled" },
+    });
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      trigger: "cron",
+      sessionKey: "hook:gmail:message-123",
+      externalContentSource: "webhook",
+    });
+
+    expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledWith(
+      expect.objectContaining({ success: true }),
+      expect.objectContaining({
+        sessionKey: "hook:gmail:message-123",
+        externalContentSource: "webhook",
+      }),
+      expect.anything(),
+    );
   });
 
   it("returns a silent payload when a cron hook claims without a reply body", async () => {

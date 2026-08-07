@@ -38,6 +38,7 @@ import { createDiagnosticMessageLifecycle } from "../../logging/message-lifecycl
 import { isCommandLaneTaskTimeoutError } from "../../process/command-queue.js";
 import { CommandLane } from "../../process/lanes.js";
 import { isCronSessionKey } from "../../routing/session-key.js";
+import type { HookExternalContentSource } from "../../security/external-content.js";
 import {
   AGENT_HARNESS_SESSION_ID_LOCKED_MESSAGE,
   AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE,
@@ -549,6 +550,7 @@ type PreparedCronRunContext = {
   runContinuationSession?: CronRunContinuationSession;
   withRunSession: WithRunSession;
   agentPayload: Extract<CronJob["payload"], { kind: "agentTurn" }> | null;
+  externalContentSource?: HookExternalContentSource;
   deliveryPlan: CronDeliveryPlan;
   resolvedDelivery: ResolvedCronDeliveryTarget;
   deliveryRequested: boolean;
@@ -1106,6 +1108,7 @@ async function prepareCronRunContext(params: {
         runContinuationSession,
         withRunSession,
         agentPayload,
+        externalContentSource: hookExternalContentSource,
         deliveryPlan,
         resolvedDelivery,
         deliveryRequested,
@@ -1747,6 +1750,7 @@ export async function runCronIsolatedAgentTurn(params: {
       persistRunContinuationSession: prepared.context.runContinuationSession?.sync,
       setRunContinuationCliExecutionProvider:
         prepared.context.runContinuationSession?.setCliExecutionProvider,
+      externalContentSource: prepared.context.externalContentSource,
       abortSignal,
       onExecutionStarted: notifyExecutionStarted,
       onExecutionPhase: notifyExecutionPhase,

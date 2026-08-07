@@ -19,6 +19,7 @@ import type { ImageContent } from "../../llm/types.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
 import type { CliBackendExecutionMode } from "../../plugins/cli-backend.types.js";
 import type { PluginHookChannelContext } from "../../plugins/hook-types.js";
+import type { HookExternalContentSource } from "../../security/external-content.js";
 import type { InputProvenance } from "../../sessions/input-provenance.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { SkillSnapshot } from "../../skills/types.js";
@@ -47,6 +48,8 @@ export type RunCliAgentParams = {
   sessionEntry?: SessionEntry;
   agentId?: string;
   trigger?: EmbeddedRunTrigger;
+  /** Immutable external content provenance for hook-originated runs. */
+  externalContentSource?: HookExternalContentSource;
   sessionFile: string;
   workspaceDir: string;
   /** Trusted model/auth owner directory. Defaults to the session agent directory. */

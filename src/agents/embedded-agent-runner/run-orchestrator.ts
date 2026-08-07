@@ -9,11 +9,15 @@ import {
   getAgentEventLifecycleGeneration,
   withAgentRunLifecycleGeneration,
 } from "../../infra/agent-events.js";
-import { buildAgentHookContextChannelFields } from "../../plugins/hook-agent-context.js";
+import {
+  buildAgentHookContextChannelFields,
+  buildAgentHookContextIdentityFields,
+} from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../agent-scope.js";
+import { awaitAgentEndSideEffects } from "../harness/agent-end-side-effects.js";
 import {
   applyAgentRunSessionTargetIdentity,
   resolveAgentRunSessionTarget,
@@ -236,6 +240,9 @@ async function runEmbeddedAgentInternal(
         modelProviderId: provider,
         modelId,
         trigger: params.trigger,
+        ...(params.externalContentSource
+          ? { externalContentSource: params.externalContentSource }
+          : {}),
         ...buildAgentHookContextChannelFields(params),
       };
       if (params.trigger === "cron" && hookRunner?.hasHooks("before_agent_reply")) {
@@ -245,6 +252,30 @@ async function runEmbeddedAgentInternal(
           hookCtx,
         );
         if (hookResult?.handled) {
+          const finalText = hookResult.reply?.text ?? SILENT_REPLY_TOKEN;
+          if (params.externalContentSource) {
+            await awaitAgentEndSideEffects({
+              event: {
+                messages: [
+                  { role: "user", content: params.prompt },
+                  { role: "assistant", content: finalText },
+                ],
+                success: true,
+                durationMs: Date.now() - started,
+              },
+              ctx: {
+                ...hookCtx,
+                ...(params.config ? { config: params.config } : {}),
+                ...buildAgentHookContextIdentityFields({
+                  trigger: params.trigger,
+                  senderId: params.senderId,
+                  chatId: params.chatId,
+                  channelContext: params.channelContext,
+                }),
+              },
+              hookRunner,
+            });
+          }
           return {
             payloads: buildHandledReplyPayloads(hookResult.reply),
             meta: {
@@ -254,8 +285,8 @@ async function runEmbeddedAgentInternal(
                 provider,
                 model: modelId,
               },
-              finalAssistantVisibleText: hookResult.reply?.text ?? SILENT_REPLY_TOKEN,
-              finalAssistantRawText: hookResult.reply?.text ?? SILENT_REPLY_TOKEN,
+              finalAssistantVisibleText: finalText,
+              finalAssistantRawText: finalText,
             },
           };
         }

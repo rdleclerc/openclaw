@@ -9,6 +9,7 @@ import type {
   PluginHookChannelContext,
   PluginHookContextWindowSource,
 } from "../../plugins/hook-types.js";
+import type { HookExternalContentSource } from "../../security/external-content.js";
 
 /**
  * Input facts used to build the agent portion of plugin hook events.
@@ -31,6 +32,8 @@ export type AgentHarnessHookContext = {
   modelId?: string;
   messageProvider?: string;
   trigger?: string;
+  /** Immutable external content provenance for hook-originated runs. */
+  externalContentSource?: HookExternalContentSource;
   channelId?: string;
   contextTokenBudget?: number;
   contextWindowSource?: PluginHookContextWindowSource;
@@ -60,6 +63,9 @@ export function buildAgentHookContext(params: AgentHarnessHookContext): PluginHo
     ...(params.messageProvider ? { messageProvider: params.messageProvider } : {}),
     ...(params.channel ? { channel: params.channel } : {}),
     ...(params.trigger ? { trigger: params.trigger } : {}),
+    ...(params.externalContentSource
+      ? { externalContentSource: params.externalContentSource }
+      : {}),
     ...(params.channelId ? { channelId: params.channelId } : {}),
     ...(params.contextTokenBudget ? { contextTokenBudget: params.contextTokenBudget } : {}),
     ...(params.contextWindowSource ? { contextWindowSource: params.contextWindowSource } : {}),

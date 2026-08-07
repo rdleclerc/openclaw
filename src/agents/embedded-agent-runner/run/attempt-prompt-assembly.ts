@@ -109,6 +109,9 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
     modelProviderId: attempt.model.provider,
     modelId: attempt.model.id,
     trigger: attempt.trigger,
+    ...(attempt.externalContentSource
+      ? { externalContentSource: attempt.externalContentSource }
+      : {}),
     ...buildAgentHookContextChannelFields(attempt),
     ...buildAgentHookContextIdentityFields({
       trigger: attempt.trigger,

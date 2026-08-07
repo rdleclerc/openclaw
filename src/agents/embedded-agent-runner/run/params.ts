@@ -19,6 +19,7 @@ import type { PromptImageOrderEntry } from "../../../media/prompt-image-order.js
 import type { PluginHookChannelContext } from "../../../plugins/hook-types.js";
 import type { RuntimePluginToolGrant } from "../../../plugins/runtime/tool-grant.js";
 import type { CommandQueueEnqueueFn } from "../../../process/command-queue.types.js";
+import type { HookExternalContentSource } from "../../../security/external-content.js";
 import type { InputProvenance } from "../../../sessions/input-provenance.js";
 import type { UserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.types.js";
 import type { SkillSnapshot } from "../../../skills/types.js";
@@ -87,6 +88,8 @@ export type RunEmbeddedAgentParams = {
   trigger?: EmbeddedRunTrigger;
   /** Stable cron job identifier populated for cron-triggered runs. */
   jobId?: string;
+  /** Immutable external content provenance for hook-originated runs. */
+  externalContentSource?: HookExternalContentSource;
   /** Relative workspace path that memory-triggered writes are allowed to append to. */
   memoryFlushWritePath?: string;
   /** Delivery target for topic/thread routing. */

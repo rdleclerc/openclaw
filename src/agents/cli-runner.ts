@@ -12,10 +12,6 @@ import {
 } from "../infra/agent-events.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import {
-  buildAgentHookContextChannelFields,
-  buildAgentHookContextIdentityFields,
-} from "../plugins/hook-agent-context.js";
 import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { isHeartbeatLifecycleRunKind } from "./bootstrap-mode.js";
@@ -30,6 +26,7 @@ import {
   attachCliMessagingDeliveryEvidence,
   getCliMessagingDeliveryEvidence,
 } from "./cli-runner/delivery-evidence.js";
+import { buildCliAgentHookContext } from "./cli-runner/hook-context.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
 import { hashCliReseedPrompt } from "./cli-runner/reseed-envelope.js";
 import {
@@ -488,22 +485,7 @@ async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedA
     const startedAt = Date.now();
     const hookRunner = getGlobalHookRunner();
     if (hookRunner?.hasHooks("before_agent_reply")) {
-      const hookContext = {
-        runId: params.runId,
-        jobId: params.jobId,
-        agentId: params.agentId,
-        sessionKey: params.sessionKey,
-        sessionId: params.sessionId,
-        workspaceDir: params.workspaceDir,
-        trigger: params.trigger,
-        ...buildAgentHookContextChannelFields(params),
-        ...buildAgentHookContextIdentityFields({
-          trigger: params.trigger,
-          senderId: params.senderId,
-          chatId: params.chatId,
-          channelContext: params.channelContext,
-        }),
-      } as const;
+      const hookContext = buildCliAgentHookContext({ run: params, includeConfig: false });
       params.onExecutionPhase?.({
         phase: "before_agent_reply",
         provider: params.provider,
@@ -515,6 +497,24 @@ async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedA
       );
       if (hookResult?.handled) {
         const finalText = hookResult.reply?.text ?? SILENT_REPLY_TOKEN;
+        if (params.externalContentSource) {
+          await awaitAgentEndSideEffects({
+            event: {
+              messages: [
+                buildCliHookUserMessage(params.prompt),
+                buildCliHookAssistantMessage({
+                  text: finalText,
+                  provider: params.provider,
+                  model: params.model ?? "",
+                }),
+              ],
+              success: true,
+              durationMs: Date.now() - startedAt,
+            },
+            ctx: buildCliAgentHookContext({ run: params }),
+            hookRunner,
+          });
+        }
         const syntheticBackend = resolveCliBackendConfig(params.provider, params.config, {
           agentId: params.agentId,
         });
@@ -627,32 +627,10 @@ export async function runPreparedCliAgent(
     historyMessages,
     imagesCount: params.images?.length ?? 0,
   } as const;
-  const hookContext = {
-    runId: params.runId,
-    jobId: params.jobId,
-    agentId: params.agentId,
-    sessionKey: params.sessionKey,
-    sessionId: params.sessionId,
-    workspaceDir: params.workspaceDir,
-    trigger: params.trigger,
-    ...(params.config ? { config: params.config } : {}),
-    ...(context.contextWindowInfo?.tokens
-      ? { contextTokenBudget: context.contextWindowInfo.tokens }
-      : {}),
-    ...(context.contextWindowInfo?.source
-      ? { contextWindowSource: context.contextWindowInfo.source }
-      : {}),
-    ...(context.contextWindowInfo?.referenceTokens
-      ? { contextWindowReferenceTokens: context.contextWindowInfo.referenceTokens }
-      : {}),
-    ...buildAgentHookContextChannelFields(params),
-    ...buildAgentHookContextIdentityFields({
-      trigger: params.trigger,
-      senderId: params.senderId,
-      chatId: params.chatId,
-      channelContext: params.channelContext,
-    }),
-  } as const;
+  const hookContext = buildCliAgentHookContext({
+    run: params,
+    contextWindowInfo: context.contextWindowInfo,
+  });
 
   const buildAgentEndMessages = (lastAssistant?: unknown): unknown[] => [
     ...buildAgentHookConversationMessages({

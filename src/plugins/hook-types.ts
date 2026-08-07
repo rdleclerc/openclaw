@@ -10,6 +10,7 @@ import type { ChatType } from "../channels/chat-type.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { TtsAutoMode } from "../config/types.tts.js";
 import type { DiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
+import type { HookExternalContentSource } from "../security/external-content.js";
 import type {
   PluginHookBeforeAgentStartEvent,
   PluginHookBeforeAgentStartResult,
@@ -287,6 +288,8 @@ export type PluginHookAgentContext = {
   /** Sender identity for channel-originated runs when available. */
   senderId?: string;
   trigger?: string;
+  /** Immutable external content provenance for hook-originated runs. */
+  externalContentSource?: HookExternalContentSource;
   channelId?: string;
   /** Resolved effective context-token budget after model/config/agent caps. */
   contextTokenBudget?: number;

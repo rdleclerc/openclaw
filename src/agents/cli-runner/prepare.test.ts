@@ -1839,7 +1839,7 @@ describe("prepareCliRunContext", () => {
     }
   });
 
-  it("applies agent_turn_prepare-only context on the CLI path", async () => {
+  it("preserves typed external content source for agent_turn_prepare on the CLI cron path", async () => {
     const { dir, sessionFile } = createSessionFile();
     try {
       const hookRunner = {
@@ -1857,7 +1857,9 @@ describe("prepareCliRunContext", () => {
         sessionId: "session-test",
         sessionKey: "agent:main:test",
         agentId: "main",
-        trigger: "user",
+        trigger: "cron",
+        jobId: "cron-gmail-source",
+        externalContentSource: "gmail",
         sessionFile,
         workspaceDir: dir,
         prompt: "latest ask",
@@ -1888,6 +1890,7 @@ describe("prepareCliRunContext", () => {
             runId?: string;
             senderId?: string;
             sessionKey?: string;
+            externalContentSource?: string;
           }
         | undefined;
       expect(turnPrepareContext?.runId).toBe("run-test-turn-prepare");
@@ -1895,6 +1898,7 @@ describe("prepareCliRunContext", () => {
       expect(turnPrepareContext?.channel).toBe("telegram");
       expect(turnPrepareContext?.chatId).toBe("chat-1");
       expect(turnPrepareContext?.senderId).toBe("user-456");
+      expect(turnPrepareContext?.externalContentSource).toBe("gmail");
       expect(hookRunner.runBeforePromptBuild).not.toHaveBeenCalled();
       expect(hookRunner.runBeforeAgentStart).not.toHaveBeenCalled();
     } finally {
