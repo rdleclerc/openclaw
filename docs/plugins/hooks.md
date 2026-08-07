@@ -57,10 +57,11 @@ observation side effects.
 
 `api.on(name, handler, opts?)` accepts:
 
-| Option      | Effect                                                                                                                                                                                            |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `priority`  | Ordering; higher runs first.                                                                                                                                                                      |
-| `timeoutMs` | Per-hook await budget. When it expires, OpenClaw stops awaiting that handler and moves on. It does not cancel the handler or its side effects. Omit to use the runner's default per-hook timeout. |
+| Option                             | Effect                                                                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `priority`                         | Ordering; higher runs first.                                                                                                                                                                      |
+| `timeoutMs`                        | Per-hook await budget. When it expires, OpenClaw stops awaiting that handler and moves on. It does not cancel the handler or its side effects. Omit to use the runner's default per-hook timeout. |
+| `requiredForExternalContentSource` | Marks an `agent_end` handler as the required terminal owner for the named typed external source.                                                                                                  |
 
 Operators can set hook budgets without patching plugin code:
 
@@ -425,7 +426,7 @@ older plugins. Core does not populate it; new channel-specific sender
 identities should live under `ctx.channelContext.sender` through module
 augmentation.
 
-`agent_end` is an observation hook. Gateway and persistent harness paths run
+`agent_end` is normally an observation hook. Gateway and persistent harness paths run
 it fire-and-forget after the turn, while short-lived one-shot CLI paths wait
 for the hook promise before process cleanup so trusted plugins can flush
 terminal observability or capture state. The hook runner applies a 30 second
@@ -433,6 +434,11 @@ timeout so a wedged plugin or embedding endpoint cannot leave the hook promise
 pending forever. A timeout is logged and OpenClaw continues; it does not
 cancel plugin-owned network work unless the plugin also uses its own abort
 signal.
+
+For typed Gmail content, a handler registered with
+`requiredForExternalContentSource: "gmail"` is required. The runner waits for
+that handler and fails closed if it is missing, fails, or times out. Optional
+observation handlers remain fail-open.
 
 Use `model_call_started` and `model_call_ended` for provider-call telemetry
 that should not receive raw prompts, history, responses, headers, request

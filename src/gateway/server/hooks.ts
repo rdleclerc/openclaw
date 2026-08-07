@@ -145,6 +145,7 @@ export function createGatewayHooksRequestHandler(params: {
         timeoutSeconds: value.timeoutSeconds,
         allowUnsafeExternalContent: value.allowUnsafeExternalContent,
         externalContentSource: value.externalContentSource,
+        externalContentId: value.externalContentId,
       },
       delivery,
       state: { nextRunAtMs: nowMs },

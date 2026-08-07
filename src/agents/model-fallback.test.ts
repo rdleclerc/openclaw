@@ -26,6 +26,7 @@ import { FailoverError } from "./failover-error.js";
 import { resetFallbackSkipCacheForTest } from "./fallback-skip-cache.test-support.js";
 import { MissingAgentHarnessError } from "./harness/errors.js";
 import { clearAgentHarnesses, registerAgentHarness } from "./harness/registry.js";
+import { AgentEndTerminalFinalizationError } from "./harness/terminal-finalization-error.js";
 import type { AgentHarness } from "./harness/types.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch-error.js";
 import {
@@ -4339,6 +4340,28 @@ describe("runWithImageModelFallback", () => {
 });
 
 describe("runWithModelFallback preserved prompt errors", () => {
+  it("does not retry a timeout-like terminal finalization error", async () => {
+    const cfg = makeCfg({
+      agents: {
+        defaults: {
+          model: {
+            primary: "openai/gpt-5.5",
+            fallbacks: ["anthropic/claude-sonnet-4-6"],
+          },
+        },
+      },
+    });
+    const terminalError = new AgentEndTerminalFinalizationError(
+      "required agent_end handler timed out after 30000ms",
+    );
+    const run = vi.fn().mockRejectedValue(terminalError);
+
+    await expect(
+      runWithModelFallback({ cfg, provider: "openai", model: "gpt-5.5", run }),
+    ).rejects.toBe(terminalError);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     {
       label: "timeout",

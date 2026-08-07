@@ -58,6 +58,7 @@ import {
 import { MissingAgentHarnessError, isMissingAgentHarnessError } from "./harness/errors.js";
 import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import { getRegisteredAgentHarness } from "./harness/registry.js";
+import { isAgentEndTerminalFinalizationError } from "./harness/terminal-finalization-error.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch-error.js";
 import {
   isModelFallbackDecisionLogEnabled,
@@ -412,6 +413,9 @@ async function runFallbackCandidate<T>(params: {
     };
   } catch (err) {
     if (isCommandLaneTaskTimeoutError(err)) {
+      throw err;
+    }
+    if (isAgentEndTerminalFinalizationError(err)) {
       throw err;
     }
     const fallbackError = resolveModelFallbackError(err, {
@@ -1841,6 +1845,9 @@ async function runWithModelFallbackInternal<T>(
         throw err;
       }
       if (isTranscriptNotContinuableError(err)) {
+        throw err;
+      }
+      if (isAgentEndTerminalFinalizationError(err)) {
         throw err;
       }
       if (transientProbeProviderForAttempt) {

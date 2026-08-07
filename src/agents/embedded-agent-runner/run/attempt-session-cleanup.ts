@@ -3,6 +3,7 @@
  */
 import { formatErrorMessage, toErrorObject } from "../../../infra/errors.js";
 import type { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
+import { isAgentEndTerminalFinalizationError } from "../../harness/terminal-finalization-error.js";
 import type { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import type { AgentSession } from "../../sessions/index.js";
 import { clearToolSearchCatalog, type ToolSearchCatalogRef } from "../../tool-search.js";
@@ -71,7 +72,8 @@ function shouldPreservePromptErrorAfterCleanupError(params: {
 }): boolean {
   return (
     Boolean(params.promptError) &&
-    params.cleanupError instanceof EmbeddedAttemptSessionTakeoverError
+    (isAgentEndTerminalFinalizationError(params.promptError) ||
+      params.cleanupError instanceof EmbeddedAttemptSessionTakeoverError)
   );
 }
 
@@ -188,6 +190,9 @@ export async function cleanupEmbeddedAttemptSessionPhase(
         `runId=${attempt.runId} sessionId=${attempt.sessionId} ` +
         `promptError=${formatErrorMessage(finalState.promptError)} cleanupError=${formatErrorMessage(cleanupFailure)}`,
     );
+    if (isAgentEndTerminalFinalizationError(finalState.promptError)) {
+      await Promise.reject(finalState.promptError);
+    }
     await Promise.reject(
       new EmbeddedAttemptPromptErrorWithCleanupTakeoverError({
         promptError: finalState.promptError,

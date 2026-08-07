@@ -61,6 +61,114 @@ describe("hook correlation fields", () => {
     );
   });
 
+  it("awaits the required Gmail terminal handler without waiting observational handlers", async () => {
+    let releaseObserver: (() => void) | undefined;
+    const requiredHandler = vi.fn(() => undefined);
+    const observer = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseObserver = resolve;
+        }),
+    );
+    addTestHook({
+      registry,
+      pluginId: "gmail-terminal",
+      hookName: "agent_end",
+      handler: requiredHandler as PluginHookRegistration["handler"],
+      requiredForExternalContentSource: "gmail",
+    });
+    addTestHook({
+      registry,
+      pluginId: "observer",
+      hookName: "agent_end",
+      handler: observer as PluginHookRegistration["handler"],
+    });
+
+    const runner = createHookRunner(registry);
+    const run = runner.runAgentEnd(
+      { messages: [], success: true },
+      { ...TEST_PLUGIN_AGENT_CTX, externalContentSource: "gmail", messageId: "gmail-1" },
+      { requiredForExternalContentSource: "gmail", awaitOnlyRequired: true },
+    );
+
+    await vi.waitFor(() => {
+      expect(requiredHandler).toHaveBeenCalledTimes(1);
+      expect(observer).toHaveBeenCalledTimes(1);
+    });
+    await expect(run).resolves.toBeUndefined();
+    releaseObserver?.();
+  });
+
+  it("fails closed when a typed Gmail terminal handler is missing", async () => {
+    const runner = createHookRunner(registry);
+
+    await expect(
+      runner.runAgentEnd(
+        { messages: [], success: true },
+        { ...TEST_PLUGIN_AGENT_CTX, externalContentSource: "gmail", messageId: "gmail-1" },
+        { requiredForExternalContentSource: "gmail", awaitOnlyRequired: true },
+      ),
+    ).rejects.toThrow("required agent_end handler missing for external content source: gmail");
+  });
+
+  it("surfaces a typed Gmail terminal handler failure", async () => {
+    const handler = vi.fn().mockRejectedValue(new Error("Gmail finalizer failed"));
+    addTestHook({
+      registry,
+      pluginId: "gmail-terminal",
+      hookName: "agent_end",
+      handler: handler as PluginHookRegistration["handler"],
+      requiredForExternalContentSource: "gmail",
+    });
+    const runner = createHookRunner(registry);
+
+    await expect(
+      runner.runAgentEnd(
+        { messages: [], success: true },
+        { ...TEST_PLUGIN_AGENT_CTX, externalContentSource: "gmail", messageId: "gmail-1" },
+        { requiredForExternalContentSource: "gmail", awaitOnlyRequired: true },
+      ),
+    ).rejects.toThrow("Gmail finalizer failed");
+  });
+
+  it("keeps Gmail identity stable across agent_end handlers", async () => {
+    const observer = vi.fn(
+      (_event: unknown, ctx: { messageId?: string; externalContentSource?: string }) => {
+        expect(() => {
+          ctx.messageId = "mutated";
+          ctx.externalContentSource = "webhook";
+        }).toThrow();
+      },
+    );
+    const requiredHandler = vi.fn();
+    addTestHook({
+      registry,
+      pluginId: "observer",
+      hookName: "agent_end",
+      handler: observer as PluginHookRegistration["handler"],
+      priority: 100,
+    });
+    addTestHook({
+      registry,
+      pluginId: "gmail-terminal",
+      hookName: "agent_end",
+      handler: requiredHandler as PluginHookRegistration["handler"],
+      requiredForExternalContentSource: "gmail",
+    });
+    const runner = createHookRunner(registry);
+
+    await runner.runAgentEnd(
+      { messages: [], success: true },
+      { ...TEST_PLUGIN_AGENT_CTX, externalContentSource: "gmail", messageId: "gmail-1" },
+      { requiredForExternalContentSource: "gmail" },
+    );
+
+    expect(requiredHandler).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ externalContentSource: "gmail", messageId: "gmail-1" }),
+    );
+  });
+
   it("times out never-settling agent_end handlers", async () => {
     vi.useFakeTimers();
     try {

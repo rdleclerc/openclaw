@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
+  awaitAgentEndSideEffects: vi.fn(),
   runAgentEndSideEffects: vi.fn(),
 }));
 
 vi.mock("../../harness/agent-end-side-effects.js", () => ({
+  awaitAgentEndSideEffects: hoisted.awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions: () => ({
+    requiredForExternalContentSource: "gmail",
+  }),
   runAgentEndSideEffects: hoisted.runAgentEndSideEffects,
 }));
 vi.mock("./agent-end-context.js", () => ({
@@ -16,6 +21,7 @@ import { settleEmbeddedAttemptStream } from "./attempt-stream-settle.js";
 
 describe("embedded attempt phase lifecycle state", () => {
   beforeEach(() => {
+    hoisted.awaitAgentEndSideEffects.mockReset();
     hoisted.runAgentEndSideEffects.mockReset();
   });
 
@@ -147,5 +153,56 @@ describe("embedded attempt phase lifecycle state", () => {
         event: expect.objectContaining({ success: false }),
       }),
     );
+  });
+
+  it("stores a Gmail terminal finalization failure for cleanup", async () => {
+    const terminalError = new Error("Gmail finalizer failed");
+    hoisted.awaitAgentEndSideEffects.mockRejectedValue(terminalError);
+    const state = {
+      promptError: null as unknown,
+      yieldAborted: false,
+      sessionIdUsed: "session-1",
+      messagesSnapshot: [],
+      prePromptMessageCount: 0,
+      contextEngineAfterTurnCheckpoint: null,
+      compactionOccurredThisAttempt: false,
+    };
+
+    const result = completeEmbeddedAttemptAfterTurn({
+      attempt: {
+        runId: "run-1",
+        sessionId: "session-1",
+        sessionFile: "/tmp/session.jsonl",
+        externalContentSource: "gmail",
+      } as never,
+      activeSession: {} as never,
+      sessionManager: { appendCustomEntry: vi.fn() } as never,
+      sessionLockController: { waitForSessionEvents: async () => {} } as never,
+      withOwnedSessionWriteLock: async (operation) => await operation(),
+      state,
+      readLifecycleState: () => ({
+        aborted: false,
+        timedOut: false,
+        idleTimedOut: false,
+        timedOutDuringCompaction: false,
+      }),
+      runtime: {
+        effectiveWorkspace: "/tmp/workspace",
+        agentDir: "/tmp/agent",
+        sessionAgentId: "main",
+        resolveActiveContextEnginePluginId: () => undefined,
+        shouldRecordCompletedBootstrapTurn: false,
+        cacheTrace: null,
+        anthropicPayloadLogger: null,
+        hookAgentId: "main",
+        diagnosticTrace: { traceId: "trace-1", spanId: "span-1" } as never,
+        skillWorkshopAvailable: false,
+        hookRunner: {} as never,
+        promptStartedAt: Date.now(),
+      },
+    });
+
+    await expect(result).rejects.toBe(terminalError);
+    expect(state.promptError).toBe(terminalError);
   });
 });

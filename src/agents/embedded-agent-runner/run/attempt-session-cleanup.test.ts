@@ -20,6 +20,7 @@ vi.mock("./attempt.subscription-cleanup.js", () => ({
   cleanupEmbeddedAttemptResources: hoisted.cleanupEmbeddedAttemptResources,
 }));
 
+import { AgentEndTerminalFinalizationError } from "../../harness/terminal-finalization-error.js";
 import { cleanupEmbeddedAttemptSessionPhase } from "./attempt-session-cleanup.js";
 
 const attempt = {
@@ -159,5 +160,31 @@ describe("cleanupEmbeddedAttemptSessionPhase", () => {
       expect.objectContaining({ skipSessionFlush: true }),
     );
     expect(emitDiagnosticRunCompleted).toHaveBeenCalledWith("error", promptError, undefined);
+  });
+
+  it("preserves terminal finalization when resource cleanup also fails", async () => {
+    const terminalError = new AgentEndTerminalFinalizationError("Gmail finalizer failed");
+    hoisted.cleanupEmbeddedAttemptResources.mockRejectedValue(new Error("cleanup failed"));
+    const input = createInput({
+      trajectoryRecorder: null,
+      readState: () => ({
+        aborted: false,
+        externalAbort: false,
+        timedOut: false,
+        idleTimedOut: false,
+        timedOutDuringCompaction: false,
+        timedOutDuringToolExecution: false,
+        timedOutByRunBudget: false,
+        promptError: terminalError,
+        beforeAgentRunBlocked: false,
+      }),
+    });
+
+    await expect(cleanupEmbeddedAttemptSessionPhase(input as never)).rejects.toBe(terminalError);
+    expect(input.emitDiagnosticRunCompleted).toHaveBeenCalledWith(
+      "error",
+      terminalError,
+      undefined,
+    );
   });
 });

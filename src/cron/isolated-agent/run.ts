@@ -551,6 +551,7 @@ type PreparedCronRunContext = {
   withRunSession: WithRunSession;
   agentPayload: Extract<CronJob["payload"], { kind: "agentTurn" }> | null;
   externalContentSource?: HookExternalContentSource;
+  externalContentId?: string | number;
   deliveryPlan: CronDeliveryPlan;
   resolvedDelivery: ResolvedCronDeliveryTarget;
   deliveryRequested: boolean;
@@ -648,6 +649,8 @@ async function prepareCronRunContext(params: {
       : undefined;
   const payloadHookExternalContentSource =
     input.job.payload.kind === "agentTurn" ? input.job.payload.externalContentSource : undefined;
+  const payloadHookExternalContentId =
+    input.job.payload.kind === "agentTurn" ? input.job.payload.externalContentId : undefined;
   const hookExternalContentSource =
     payloadHookExternalContentSource ?? resolveHookExternalContentSource(baseSessionKey);
 
@@ -1109,6 +1112,9 @@ async function prepareCronRunContext(params: {
         withRunSession,
         agentPayload,
         externalContentSource: hookExternalContentSource,
+        ...(payloadHookExternalContentId !== undefined
+          ? { externalContentId: payloadHookExternalContentId }
+          : {}),
         deliveryPlan,
         resolvedDelivery,
         deliveryRequested,
@@ -1751,6 +1757,7 @@ export async function runCronIsolatedAgentTurn(params: {
       setRunContinuationCliExecutionProvider:
         prepared.context.runContinuationSession?.setCliExecutionProvider,
       externalContentSource: prepared.context.externalContentSource,
+      externalContentId: prepared.context.externalContentId,
       abortSignal,
       onExecutionStarted: notifyExecutionStarted,
       onExecutionPhase: notifyExecutionPhase,

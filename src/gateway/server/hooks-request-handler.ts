@@ -71,6 +71,25 @@ function resolveMappedHookExternalContentSource(params: { subPath: string; sessi
   return resolveHookExternalContentSourceFromSession(params.sessionKey) ?? "webhook";
 }
 
+function resolveMappedHookExternalContentId(params: {
+  subPath: string;
+  payload: Record<string, unknown>;
+}): string | number | undefined {
+  if (params.subPath !== "gmail" || !Array.isArray(params.payload.messages)) {
+    return undefined;
+  }
+  const firstMessage = params.payload.messages[0];
+  if (!firstMessage || typeof firstMessage !== "object" || Array.isArray(firstMessage)) {
+    return undefined;
+  }
+  const messageId = (firstMessage as Record<string, unknown>).id;
+  if (typeof messageId === "string") {
+    const normalized = messageId.trim();
+    return normalized || undefined;
+  }
+  return typeof messageId === "number" && Number.isFinite(messageId) ? messageId : undefined;
+}
+
 export function createHooksRequestHandler(
   opts: {
     getHooksConfig: () => HooksConfigResolved | null;
@@ -416,6 +435,14 @@ export function createHooksRequestHandler(
             sendJson(res, 200, { ok: true, runId: cachedRunId });
             return true;
           }
+          const externalContentSource = resolveMappedHookExternalContentSource({
+            subPath,
+            sessionKey: sessionKey.value,
+          });
+          const externalContentId = resolveMappedHookExternalContentId({
+            subPath,
+            payload: payload as Record<string, unknown>,
+          });
           const runId = dispatchAgentHook({
             message: mapped.action.message,
             name: mapped.action.name ?? "Hook",
@@ -431,10 +458,8 @@ export function createHooksRequestHandler(
             thinking: mapped.action.thinking,
             timeoutSeconds: mapped.action.timeoutSeconds,
             allowUnsafeExternalContent: mapped.action.allowUnsafeExternalContent,
-            externalContentSource: resolveMappedHookExternalContentSource({
-              subPath,
-              sessionKey: sessionKey.value,
-            }),
+            externalContentSource,
+            ...(externalContentId !== undefined ? { externalContentId } : {}),
           });
           rememberHookRunId(replayKey, runId, now);
           sendJson(res, 200, { ok: true, runId });

@@ -4,6 +4,7 @@ import { normalizeStringEntries } from "@openclaw/normalization-core/string-norm
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { registerInternalHook, unregisterInternalHook } from "../hooks/internal-hooks.js";
 import type { HookEntry } from "../hooks/types.js";
+import type { HookExternalContentSource } from "../security/external-content.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { AgentToolResultMiddleware } from "./agent-tool-result-middleware-types.js";
 import {
@@ -398,7 +399,11 @@ export function createToolHookRegistrars(state: PluginRegistryState) {
     record: PluginRecord,
     hookName: K,
     handler: PluginHookHandlerMap[K],
-    opts?: { priority?: number; timeoutMs?: number },
+    opts?: {
+      priority?: number;
+      timeoutMs?: number;
+      requiredForExternalContentSource?: HookExternalContentSource;
+    },
     policy?: PluginTypedHookPolicy,
   ) => {
     if (!isPluginHookName(hookName)) {
@@ -481,6 +486,9 @@ export function createToolHookRegistrars(state: PluginRegistryState) {
       handler: effectiveHandler,
       priority: opts?.priority,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(opts?.requiredForExternalContentSource
+        ? { requiredForExternalContentSource: opts.requiredForExternalContentSource }
+        : {}),
       source: record.source,
     } as TypedPluginHookRegistration);
   };

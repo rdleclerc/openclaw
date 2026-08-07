@@ -539,7 +539,8 @@ describe("cron store", () => {
     expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
       kind: "agentTurn",
       message: "Summarize hook payload",
-      externalContentSource: "webhook",
+      externalContentSource: "gmail",
+      externalContentId: "gmail-message-123",
     };
 
     await saveCronStore(store.storePath, payload);
@@ -547,7 +548,26 @@ describe("cron store", () => {
     expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toMatchObject({
       kind: "agentTurn",
       message: "Summarize hook payload",
-      externalContentSource: "webhook",
+      externalContentSource: "gmail",
+      externalContentId: "gmail-message-123",
+    });
+  });
+
+  it("reads the legacy scalar external content source from SQLite", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("legacy-hook-job", true);
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").sessionTarget = "isolated";
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
+      kind: "agentTurn",
+      message: "Summarize legacy hook payload",
+      externalContentSource: "gmail",
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toMatchObject({
+      kind: "agentTurn",
+      externalContentSource: "gmail",
     });
   });
 

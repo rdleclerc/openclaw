@@ -1,5 +1,6 @@
 // Provides shared helpers for plugin hook tests.
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import type { HookExternalContentSource } from "../security/external-content.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import type { PluginRegistry } from "./registry.js";
 import { createPluginRecord } from "./status.test-helpers.js";
@@ -12,6 +13,7 @@ export function createMockPluginRegistry(
     pluginId?: string;
     priority?: number;
     timeoutMs?: number;
+    requiredForExternalContentSource?: HookExternalContentSource;
   }>,
 ): PluginRegistry {
   const pluginIds =
@@ -35,6 +37,9 @@ export function createMockPluginRegistry(
       handler: h.handler,
       priority: h.priority ?? 0,
       ...(h.timeoutMs !== undefined ? { timeoutMs: h.timeoutMs } : {}),
+      ...(h.requiredForExternalContentSource
+        ? { requiredForExternalContentSource: h.requiredForExternalContentSource }
+        : {}),
       source: "test",
     })) as PluginRegistry["typedHooks"],
   };
@@ -46,6 +51,7 @@ export function addTestHook(params: {
   handler: PluginHookRegistration["handler"];
   priority?: number;
   timeoutMs?: number;
+  requiredForExternalContentSource?: HookExternalContentSource;
 }) {
   params.registry.typedHooks.push({
     pluginId: params.pluginId,
@@ -53,6 +59,9 @@ export function addTestHook(params: {
     handler: params.handler,
     priority: params.priority ?? 0,
     ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+    ...(params.requiredForExternalContentSource
+      ? { requiredForExternalContentSource: params.requiredForExternalContentSource }
+      : {}),
     source: "test",
   } as PluginHookRegistration);
 }

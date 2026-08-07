@@ -1325,6 +1325,8 @@ export type PluginHookRegistration<K extends PluginHookName = PluginHookName> = 
   handler: PluginHookHandlerMap[K];
   priority?: number;
   timeoutMs?: number;
+  /** Marks a typed handler as the required terminal owner for this source. */
+  requiredForExternalContentSource?: HookExternalContentSource;
   source: string;
 };
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

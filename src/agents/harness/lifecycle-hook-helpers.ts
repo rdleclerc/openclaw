@@ -16,8 +16,13 @@ import type {
   PluginHookLlmOutputEvent,
 } from "../../plugins/hook-types.js";
 import type { VoidHookRunOptions } from "../../plugins/hooks.js";
+import type { HookExternalContentSource } from "../../security/external-content.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { buildAgentHookContext, type AgentHarnessHookContext } from "./hook-context.js";
+import {
+  AgentEndTerminalFinalizationError,
+  toAgentEndTerminalFinalizationError,
+} from "./terminal-finalization-error.js";
 
 const log = createSubsystemLogger("agents/harness");
 const FINALIZE_RETRY_BUDGET_KEY = Symbol.for("openclaw.pluginFinalizeRetryBudget");
@@ -103,15 +108,34 @@ async function executeAgentHarnessAgentEndHook(params: {
   ctx: AgentHarnessHookContext;
   hookRunner?: AgentHarnessHookRunner;
   unrefTimeout?: boolean;
+  requiredForExternalContentSource?: HookExternalContentSource;
+  awaitOnlyRequired?: boolean;
 }): Promise<void> {
   const hookRunner = params.hookRunner ?? getGlobalHookRunner();
-  if (!hookRunner?.hasHooks("agent_end") || typeof hookRunner.runAgentEnd !== "function") {
+  const requiredForExternalContentSource = params.requiredForExternalContentSource;
+  const isRequired = requiredForExternalContentSource !== undefined;
+  if (!isRequired && !hookRunner?.hasHooks("agent_end")) {
+    return;
+  }
+  if (!hookRunner || typeof hookRunner.runAgentEnd !== "function") {
+    if (isRequired) {
+      throw new AgentEndTerminalFinalizationError(
+        `required agent_end handler missing for external content source: ${requiredForExternalContentSource}`,
+      );
+    }
     return;
   }
   try {
-    const options: VoidHookRunOptions = { unrefTimeout: params.unrefTimeout ?? false };
+    const options: VoidHookRunOptions = {
+      unrefTimeout: params.unrefTimeout ?? false,
+      ...(requiredForExternalContentSource ? { requiredForExternalContentSource } : {}),
+      ...(params.awaitOnlyRequired ? { awaitOnlyRequired: true } : {}),
+    };
     await hookRunner.runAgentEnd(params.event, buildAgentHookContext(params.ctx), options);
   } catch (error) {
+    if (isRequired) {
+      throw toAgentEndTerminalFinalizationError(error);
+    }
     log.warn(`agent_end hook failed: ${String(error)}`);
   }
 }
@@ -121,6 +145,8 @@ export function runAgentHarnessAgentEndHook(params: {
   event: PluginHookAgentEndEvent;
   ctx: AgentHarnessHookContext;
   hookRunner?: AgentHarnessHookRunner;
+  requiredForExternalContentSource?: HookExternalContentSource;
+  awaitOnlyRequired?: boolean;
 }): void {
   void executeAgentHarnessAgentEndHook({ ...params, unrefTimeout: true });
 }
@@ -130,6 +156,8 @@ export async function awaitAgentHarnessAgentEndHook(params: {
   event: PluginHookAgentEndEvent;
   ctx: AgentHarnessHookContext;
   hookRunner?: AgentHarnessHookRunner;
+  requiredForExternalContentSource?: HookExternalContentSource;
+  awaitOnlyRequired?: boolean;
 }): Promise<void> {
   await executeAgentHarnessAgentEndHook({ ...params, unrefTimeout: false });
 }

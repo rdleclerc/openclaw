@@ -5,6 +5,7 @@ import type { BootstrapContextMode } from "../../agents/bootstrap-files.js";
 import { resolveCliRuntimeToolsAllow } from "../../agents/cli-runner/tool-policy.js";
 import type { FastModeAutoProgressState } from "../../agents/fast-mode.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
+import { isAgentEndTerminalFinalizationError } from "../../agents/harness/terminal-finalization-error.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
 import { resolveCliRuntimeExecutionProvider } from "../../agents/model-runtime-aliases.js";
 import { wrapUntrustedPromptDataBlock } from "../../agents/sanitize-for-prompt.js";
@@ -205,6 +206,7 @@ function createCronPromptExecutor(params: {
   cfgWithAgentDefaults: OpenClawConfig;
   job: CronJob;
   externalContentSource?: HookExternalContentSource;
+  externalContentId?: string | number;
   agentId: string;
   agentDir: string;
   agentSessionKey: string;
@@ -420,7 +422,8 @@ function createCronPromptExecutor(params: {
         });
         return classification && currentAttemptCommittedMedia() ? undefined : classification;
       },
-      canFallbackAfterError: () => !currentAttemptCommittedMedia(),
+      canFallbackAfterError: ({ error }) =>
+        !isAgentEndTerminalFinalizationError(error) && !currentAttemptCommittedMedia(),
       mergeExhaustedResult: mergeEmbeddedAgentRunResultForModelFallbackExhaustion,
       run: async (providerOverride, modelOverride, runOptions) => {
         attemptMediaTaskIds = getGeneratedMediaTaskIdsForSessionKey(params.runSessionKey);
@@ -496,6 +499,7 @@ function createCronPromptExecutor(params: {
                 trigger: "cron",
                 jobId: params.job.id,
                 externalContentSource: params.externalContentSource,
+                currentMessageId: params.externalContentId,
                 cleanupCliLiveSessionOnRunEnd: params.usesDetachedRunSession === true,
                 sessionFile,
                 workspaceDir: params.workspaceDir,
@@ -567,6 +571,7 @@ function createCronPromptExecutor(params: {
           trigger: "cron",
           jobId: params.job.id,
           externalContentSource: params.externalContentSource,
+          currentMessageId: params.externalContentId,
           cleanupBundleMcpOnRunEnd: params.usesDetachedRunSession === true,
           allowGatewaySubagentBinding: true,
           messageChannel,
@@ -679,6 +684,7 @@ export async function executeCronRun(params: {
   cfgWithAgentDefaults: OpenClawConfig;
   job: CronJob;
   externalContentSource?: HookExternalContentSource;
+  externalContentId?: string | number;
   agentId: string;
   agentDir: string;
   agentSessionKey: string;
@@ -748,6 +754,7 @@ export async function executeCronRun(params: {
     cfgWithAgentDefaults: params.cfgWithAgentDefaults,
     job: params.job,
     externalContentSource: params.externalContentSource,
+    externalContentId: params.externalContentId,
     agentId: params.agentId,
     agentDir: params.agentDir,
     agentSessionKey: params.agentSessionKey,

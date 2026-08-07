@@ -7,6 +7,7 @@ import {
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
 } from "./lifecycle-hook-helpers.js";
+import { AgentEndTerminalFinalizationError } from "./terminal-finalization-error.js";
 
 const createLegacyHookRunner = () => ({
   hasHooks: vi.fn(() => true),
@@ -93,6 +94,44 @@ describe("agent harness lifecycle hook helpers", () => {
     releaseHook();
     await expect(run).resolves.toBeUndefined();
     expect(resolved).toBe(true);
+  });
+
+  it("surfaces a missing required typed external agent_end handler", async () => {
+    const hookRunner = {
+      hasHooks: vi.fn(() => false),
+      runAgentEnd: undefined,
+    };
+
+    const result = awaitAgentHarnessAgentEndHook({
+      ctx: { runId: "run-1", externalContentSource: "gmail", messageId: "gmail-1" },
+      event: EVENT,
+      hookRunner: hookRunner as never,
+      requiredForExternalContentSource: "gmail",
+      awaitOnlyRequired: true,
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AgentEndTerminalFinalizationError);
+    await expect(result).rejects.toThrow(
+      "required agent_end handler missing for external content source: gmail",
+    );
+  });
+
+  it("surfaces a required typed external agent_end handler failure", async () => {
+    const hookRunner = {
+      hasHooks: vi.fn(() => true),
+      runAgentEnd: vi.fn().mockRejectedValue(new Error("terminal ledger failed")),
+    };
+
+    const result = awaitAgentHarnessAgentEndHook({
+      ctx: { runId: "run-1", externalContentSource: "gmail", messageId: "gmail-1" },
+      event: EVENT,
+      hookRunner: hookRunner as never,
+      requiredForExternalContentSource: "gmail",
+      awaitOnlyRequired: true,
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AgentEndTerminalFinalizationError);
+    await expect(result).rejects.toThrow("terminal ledger failed");
   });
 
   it("can leave agent_end timeouts unref'd for fire-and-forget callers", async () => {

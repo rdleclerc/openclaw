@@ -46,6 +46,7 @@ import { buildEmbeddedRunPayloads } from "./embedded-agent-runner/run/payloads.j
 import { FailoverError, isFailoverError, resolveFailoverStatus } from "./failover-error.js";
 import {
   awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions,
   runAgentEndSideEffects,
 } from "./harness/agent-end-side-effects.js";
 import {
@@ -60,6 +61,7 @@ import {
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
 } from "./harness/lifecycle-hook-helpers.js";
+import { isAgentEndTerminalFinalizationError } from "./harness/terminal-finalization-error.js";
 import type { AgentMessage } from "./runtime/index.js";
 import { SessionManager } from "./sessions/session-manager.js";
 import { buildAssistantMessage, buildUsageWithNoCost } from "./stream-message-shared.js";
@@ -289,7 +291,9 @@ function buildCliContextEngineAssistantMessage(params: {
 type CliAgentEndHookParams = Parameters<typeof runAgentEndSideEffects>[0];
 
 function shouldAwaitCliAgentEndHook(params: RunCliAgentParams): boolean {
-  return !params.messageChannel && !params.messageProvider;
+  return (
+    params.externalContentSource === "gmail" || (!params.messageChannel && !params.messageProvider)
+  );
 }
 
 async function runCliAgentEndHook(
@@ -297,7 +301,10 @@ async function runCliAgentEndHook(
   hookParams: CliAgentEndHookParams,
 ): Promise<void> {
   if (shouldAwaitCliAgentEndHook(params)) {
-    await awaitAgentEndSideEffects(hookParams);
+    await awaitAgentEndSideEffects({
+      ...hookParams,
+      ...buildGmailAgentEndSideEffectOptions(params.externalContentSource),
+    });
     return;
   }
   runAgentEndSideEffects(hookParams);
@@ -498,7 +505,7 @@ async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedA
       if (hookResult?.handled) {
         const finalText = hookResult.reply?.text ?? SILENT_REPLY_TOKEN;
         if (params.externalContentSource) {
-          await awaitAgentEndSideEffects({
+          const handledAgentEndParams = {
             event: {
               messages: [
                 buildCliHookUserMessage(params.prompt),
@@ -513,6 +520,10 @@ async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedA
             },
             ctx: buildCliAgentHookContext({ run: params }),
             hookRunner,
+          };
+          await awaitAgentEndSideEffects({
+            ...handledAgentEndParams,
+            ...buildGmailAgentEndSideEffectOptions(params.externalContentSource),
           });
         }
         const syntheticBackend = resolveCliBackendConfig(params.provider, params.config, {
@@ -869,6 +880,9 @@ export async function runPreparedCliAgent(
   };
 
   const toCliRunFailure = (error: unknown): never => {
+    if (isAgentEndTerminalFinalizationError(error)) {
+      throw error;
+    }
     if (isFailoverError(error)) {
       throw error;
     }
@@ -1318,6 +1332,9 @@ export async function runPreparedCliAgent(
         reusableCliSessionId,
       );
     } catch (err) {
+      if (isAgentEndTerminalFinalizationError(err)) {
+        throw err;
+      }
       const deliveredFailure = await finishDeliveredFailure(err);
       if (deliveredFailure) {
         return deliveredFailure;
@@ -1352,6 +1369,9 @@ export async function runPreparedCliAgent(
             );
             return await finishCliAttempt(await executeCliAttempt(undefined, retryTimeoutMs));
           } catch (retryErr) {
+            if (isAgentEndTerminalFinalizationError(retryErr)) {
+              throw retryErr;
+            }
             const deliveredRetryFailure = await finishDeliveredFailure(retryErr);
             if (deliveredRetryFailure) {
               return deliveredRetryFailure;
@@ -1394,6 +1414,12 @@ export async function runPreparedCliAgent(
   try {
     await context.preparedBackend.cleanup?.();
   } catch (cleanupError) {
+    if (runFailed && isAgentEndTerminalFinalizationError(runError)) {
+      cliBackendLog.warn(
+        `CLI backend cleanup also failed after terminal finalization: ${formatErrorMessage(cleanupError)}`,
+      );
+      throw runError;
+    }
     if (!deliveredMessagingSideEffect) {
       if (runFailed) {
         cliBackendLog.warn(

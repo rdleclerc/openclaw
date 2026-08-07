@@ -268,6 +268,8 @@ type CronAgentTurnPayloadFields = {
   allowUnsafeExternalContent?: boolean;
   /** Immutable external hook provenance for async dispatch. */
   externalContentSource?: HookExternalContentSource;
+  /** Trusted host-owned identity for the external content carried by this turn. */
+  externalContentId?: string | number;
   /** If true, run with lightweight bootstrap context. */
   lightContext?: boolean;
 };

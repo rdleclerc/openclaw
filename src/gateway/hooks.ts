@@ -239,6 +239,8 @@ export type HookAgentDispatchPayload = Omit<HookAgentPayload, "sessionKey"> & {
   sourcePath: string;
   allowUnsafeExternalContent?: boolean;
   externalContentSource?: HookExternalContentSource;
+  /** Host-owned identity extracted from the authenticated mapped ingress. */
+  externalContentId?: string | number;
 };
 
 const listHookChannelValues = () => ["last", ...listChannelPlugins().map((plugin) => plugin.id)];

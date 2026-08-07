@@ -5,6 +5,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { CliOutput } from "./cli-output.js";
 import { cliBackendLog } from "./cli-runner/log.js";
+import { AgentEndTerminalFinalizationError } from "./harness/terminal-finalization-error.js";
 
 // vi.mock factories are hoisted above imports, so any references inside them
 // must come from vi.hoisted() so they exist at hoist time (otherwise they'd
@@ -160,6 +161,7 @@ describe("runCliAgent cron before_agent_reply seam", () => {
         jobId: "cron-job-123",
         chatId: "native-chat-123",
         externalContentSource: "gmail",
+        currentMessageId: "gmail-message-123",
         onExecutionPhase,
       });
 
@@ -179,6 +181,7 @@ describe("runCliAgent cron before_agent_reply seam", () => {
       expect(hookContext?.workspaceDir).toBe(baseRunParams.workspaceDir);
       expect(hookContext?.trigger).toBe("cron");
       expect(hookContext?.externalContentSource).toBe("gmail");
+      expect(hookContext?.messageId).toBe("gmail-message-123");
       expect(hookContext?.chatId).toBeUndefined();
       expect(hookContext?.channel).toBeUndefined();
       expect(executePreparedCliRunMock).not.toHaveBeenCalled();
@@ -187,7 +190,10 @@ describe("runCliAgent cron before_agent_reply seam", () => {
       expect(result.meta.agentMeta?.clearCliSessionBinding).toBeUndefined();
       expect(runAgentEndMock).toHaveBeenCalledWith(
         expect.objectContaining({ success: true }),
-        expect.objectContaining({ externalContentSource: "gmail" }),
+        expect.objectContaining({
+          externalContentSource: "gmail",
+          messageId: "gmail-message-123",
+        }),
         expect.anything(),
       );
       expect(runAgentEndMock).toHaveBeenCalledTimes(1);
@@ -204,6 +210,54 @@ describe("runCliAgent cron before_agent_reply seam", () => {
     } finally {
       logInfoSpy.mockRestore();
     }
+  });
+
+  it("propagates Gmail finalizer failure without invoking agent_end again", async () => {
+    hasHooksMock.mockImplementation((hookName) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    runBeforeAgentReplyMock.mockResolvedValue({
+      handled: true,
+      reply: { text: "claimed" },
+    });
+    runAgentEndMock.mockRejectedValueOnce(new Error("Gmail finalizer failed"));
+
+    const result = runCliAgent({
+      ...baseRunParams,
+      trigger: "cron",
+      jobId: "cron-job-123",
+      externalContentSource: "gmail",
+      currentMessageId: "gmail-message-123",
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AgentEndTerminalFinalizationError);
+    await expect(result).rejects.toThrow("Gmail finalizer failed");
+    expect(runAgentEndMock).toHaveBeenCalledTimes(1);
+    expect(executePreparedCliRunMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves Gmail finalizer failure when backend cleanup also fails", async () => {
+    const cleanup = vi.fn().mockRejectedValue(new Error("backend cleanup failed"));
+    prepareCliRunContextMock.mockImplementation(async (params) => ({
+      ...(makeStubContext(params as typeof baseRunParams & { trigger?: string }) as object),
+      preparedBackend: { backend: { sessionMode: "none" }, cleanup },
+    }));
+    hasHooksMock.mockImplementation((hookName) => hookName === "agent_end");
+    executePreparedCliRunMock.mockResolvedValue({ text: "completed model work" });
+    runAgentEndMock.mockRejectedValueOnce(new Error("Gmail finalizer failed"));
+
+    const result = runCliAgent({
+      ...baseRunParams,
+      trigger: "cron",
+      jobId: "cron-job-123",
+      externalContentSource: "gmail",
+      currentMessageId: "gmail-message-123",
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AgentEndTerminalFinalizationError);
+    await expect(result).rejects.toThrow("Gmail finalizer failed");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(runAgentEndMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not emit agent_end for a handled cron turn without a typed external source", async () => {

@@ -100,6 +100,7 @@ type HookCronRunCall = {
     createdAtMs?: number;
     payload?: {
       externalContentSource?: string;
+      externalContentId?: string | number;
       allowUnsafeExternalContent?: boolean;
       model?: string;
     };
@@ -322,6 +323,7 @@ describe("gateway server hooks", () => {
       const call = cronRunCall();
       expect(call?.sessionKey).toBe("main");
       expect(call?.job?.payload?.externalContentSource).toBe("gmail");
+      expect(call?.job?.payload?.externalContentId).toBe("msg-1");
       drainSystemEvents(resolveMainKey());
     });
   });
@@ -356,6 +358,7 @@ describe("gateway server hooks", () => {
       const call = cronRunCall();
       expect(call?.sessionKey).toBe("hook:webhook:github");
       expect(call?.job?.payload?.externalContentSource).toBe("webhook");
+      expect(call?.job?.payload?.externalContentId).toBeUndefined();
       expect(call?.job?.payload?.allowUnsafeExternalContent).toBeUndefined();
       drainSystemEvents(resolveMainKey());
     });

@@ -1,6 +1,7 @@
 // Coverage for cron before_agent_reply hook handling before embedded attempts.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+import { AGENT_END_TERMINAL_FINALIZATION_ERROR_CODE } from "../harness/terminal-finalization-error.js";
 import { makeAttemptResult } from "./run.overflow-compaction.fixture.js";
 import {
   loadRunOverflowCompactionHarness,
@@ -77,6 +78,7 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
       jobId: "cron-job-123",
       prompt: "__openclaw_memory_core_short_term_promotion_dream__",
       externalContentSource: "gmail",
+      currentMessageId: "gmail-message-123",
       onExecutionPhase,
     });
 
@@ -95,17 +97,109 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
     expect(hookContext?.workspaceDir).toBe("/tmp/workspace");
     expect(hookContext?.trigger).toBe("cron");
     expect(hookContext?.externalContentSource).toBe("gmail");
+    expect(hookContext?.messageId).toBe("gmail-message-123");
     expect(hookContext?.senderId).toBeUndefined();
     expect(hookContext?.chatId).toBeUndefined();
     expect(hookContext?.channel).toBeUndefined();
     expect(mockedRunEmbeddedAttempt).not.toHaveBeenCalled();
     expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledWith(
       expect.objectContaining({ success: true }),
-      expect.objectContaining({ externalContentSource: "gmail" }),
-      expect.anything(),
+      expect.objectContaining({
+        externalContentSource: "gmail",
+        messageId: "gmail-message-123",
+      }),
+      {
+        unrefTimeout: false,
+        requiredForExternalContentSource: "gmail",
+        awaitOnlyRequired: true,
+      },
     );
     expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
     expect(result.payloads?.[0]?.text).toBe("dreaming claimed");
+  });
+
+  it("fails a handled Gmail cron turn when the trusted message identity is missing", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
+      handled: true,
+      reply: { text: "dreaming claimed" },
+    });
+
+    const result = runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      trigger: "cron",
+      jobId: "cron-job-123",
+      prompt: "The prose mentions gmail-message-from-prompt, but it is not trusted.",
+      externalContentSource: "gmail",
+    });
+
+    await expect(result).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: AGENT_END_TERMINAL_FINALIZATION_ERROR_CODE,
+    });
+    await expect(result).rejects.toThrow(
+      "required agent_end handler missing host-owned message identity",
+    );
+    expect(mockedGlobalHookRunner.runAgentEnd).not.toHaveBeenCalled();
+  });
+
+  it("fails a handled Gmail cron turn when the required handler is missing", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
+      handled: true,
+      reply: { text: "dreaming claimed" },
+    });
+    const runAgentEnd = mockedGlobalHookRunner.runAgentEnd;
+    Reflect.set(mockedGlobalHookRunner, "runAgentEnd", undefined);
+    try {
+      const result = runEmbeddedAgent({
+        ...overflowBaseRunParams,
+        trigger: "cron",
+        jobId: "cron-job-123",
+        externalContentSource: "gmail",
+        currentMessageId: "gmail-message-123",
+      });
+
+      await expect(result).rejects.toMatchObject({
+        name: "AgentEndTerminalFinalizationError",
+        code: AGENT_END_TERMINAL_FINALIZATION_ERROR_CODE,
+      });
+      await expect(result).rejects.toThrow(
+        "required agent_end handler missing for external content source: gmail",
+      );
+    } finally {
+      Reflect.set(mockedGlobalHookRunner, "runAgentEnd", runAgentEnd);
+    }
+  });
+
+  it("surfaces a handled Gmail finalizer failure to the owning cron run", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation((hookName: string) =>
+      ["before_agent_reply", "agent_end"].includes(hookName),
+    );
+    mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue({
+      handled: true,
+      reply: { text: "dreaming claimed" },
+    });
+    mockedGlobalHookRunner.runAgentEnd.mockRejectedValueOnce(new Error("Gmail finalizer failed"));
+
+    const result = runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      trigger: "cron",
+      jobId: "cron-job-123",
+      externalContentSource: "gmail",
+      currentMessageId: "gmail-message-123",
+    });
+
+    await expect(result).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: AGENT_END_TERMINAL_FINALIZATION_ERROR_CODE,
+    });
+    await expect(result).rejects.toThrow("Gmail finalizer failed");
+    expect(mockedGlobalHookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
   });
 
   it("does not emit agent_end for a handled cron turn without a typed external source", async () => {

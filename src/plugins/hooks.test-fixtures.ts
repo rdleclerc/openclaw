@@ -1,4 +1,5 @@
 /** Test-only helpers for exercising plugin hook behavior. */
+import type { HookExternalContentSource } from "../security/external-content.js";
 import { createHookRunner } from "./hooks.js";
 import { addTestHook, createMockPluginRegistry } from "./hooks.test-helpers.js";
 import type { PluginRegistry } from "./registry.js";
@@ -31,16 +32,24 @@ export function addStaticTestHooks<TResult>(
       result: TResult;
       priority?: number;
       handler?: () => TResult | Promise<TResult>;
+      requiredForExternalContentSource?: HookExternalContentSource;
     }>;
   },
 ) {
-  for (const { pluginId, result, priority, handler } of params.hooks) {
+  for (const {
+    pluginId,
+    result,
+    priority,
+    handler,
+    requiredForExternalContentSource,
+  } of params.hooks) {
     addTestHook({
       registry,
       pluginId,
       hookName: params.hookName,
       handler: (handler ?? (() => result)) as PluginHookRegistration["handler"],
       ...(priority !== undefined ? { priority } : {}),
+      ...(requiredForExternalContentSource ? { requiredForExternalContentSource } : {}),
     });
   }
 }

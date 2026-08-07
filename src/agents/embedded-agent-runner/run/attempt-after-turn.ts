@@ -10,7 +10,11 @@ import type { createAnthropicPayloadLogger } from "../../anthropic-payload-log.j
 import { FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE } from "../../bootstrap-files.js";
 import { isHeartbeatLifecycleRunKind } from "../../bootstrap-mode.js";
 import type { createCacheTrace } from "../../cache-trace.js";
-import { runAgentEndSideEffects } from "../../harness/agent-end-side-effects.js";
+import {
+  awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions,
+  runAgentEndSideEffects,
+} from "../../harness/agent-end-side-effects.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { AgentSession, SessionManager } from "../../sessions/index.js";
 import type { NormalizedUsage } from "../../usage.js";
@@ -213,7 +217,7 @@ export async function completeEmbeddedAttemptAfterTurn(
 
   if (!state.beforeAgentFinalizeRevisionReason) {
     const lifecycleForAgentEnd = input.readLifecycleState();
-    runAgentEndSideEffects({
+    const agentEndParams = {
       event: {
         messages: state.messagesSnapshot,
         success: !lifecycleForAgentEnd.aborted && !state.promptError,
@@ -228,7 +232,20 @@ export async function completeEmbeddedAttemptAfterTurn(
         compacted: state.compactionOccurredThisAttempt,
       }),
       hookRunner: runtime.hookRunner,
-    });
+    };
+    if (attempt.externalContentSource === "gmail") {
+      try {
+        await awaitAgentEndSideEffects({
+          ...agentEndParams,
+          ...buildGmailAgentEndSideEffectOptions(attempt.externalContentSource),
+        });
+      } catch (error) {
+        state.promptError = error;
+        throw error;
+      }
+    } else {
+      runAgentEndSideEffects(agentEndParams);
+    }
   }
 
   return { sessionIdUsed, sessionFileUsed };

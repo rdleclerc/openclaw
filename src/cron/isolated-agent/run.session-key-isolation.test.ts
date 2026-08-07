@@ -388,4 +388,31 @@ describe("runCronIsolatedAgentTurn isolated session identity", () => {
       );
     },
   );
+
+  it("carries a typed external content identity into the native embedded run", async () => {
+    mockRunCronFallbackPassthrough();
+
+    const result = await runCronIsolatedAgentTurn(
+      makeIsolatedAgentParamsFixture({
+        sessionKey: "hook:gmail:session-key-id",
+        job: makeIsolatedAgentJobFixture({
+          payload: {
+            kind: "agentTurn",
+            message: "The prompt may contain a different untrusted id.",
+            externalContentSource: "gmail",
+            externalContentId: "gmail-message-123",
+          },
+        }),
+      }),
+    );
+
+    expect(result.status).toBe("ok");
+    expect(requireFirstMockArg(runEmbeddedAgentMock, "runEmbeddedAgentMock")).toEqual(
+      expect.objectContaining({
+        trigger: "cron",
+        externalContentSource: "gmail",
+        currentMessageId: "gmail-message-123",
+      }),
+    );
+  });
 });

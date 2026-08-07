@@ -17,7 +17,10 @@ import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../agent-scope.js";
-import { awaitAgentEndSideEffects } from "../harness/agent-end-side-effects.js";
+import {
+  awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions,
+} from "../harness/agent-end-side-effects.js";
 import {
   applyAgentRunSessionTargetIdentity,
   resolveAgentRunSessionTarget,
@@ -254,7 +257,7 @@ async function runEmbeddedAgentInternal(
         if (hookResult?.handled) {
           const finalText = hookResult.reply?.text ?? SILENT_REPLY_TOKEN;
           if (params.externalContentSource) {
-            await awaitAgentEndSideEffects({
+            const handledAgentEndParams = {
               event: {
                 messages: [
                   { role: "user", content: params.prompt },
@@ -274,6 +277,10 @@ async function runEmbeddedAgentInternal(
                 }),
               },
               hookRunner,
+            };
+            await awaitAgentEndSideEffects({
+              ...handledAgentEndParams,
+              ...buildGmailAgentEndSideEffectOptions(params.externalContentSource),
             });
           }
           return {

@@ -39,9 +39,54 @@ function payloadToolAllowFromRow(
   };
 }
 
-function parseExternalContentSource(raw: string | null): "gmail" | "webhook" | undefined {
+type ParsedExternalContent = {
+  externalContentSource: "gmail" | "webhook";
+  externalContentId?: string | number;
+};
+
+function normalizeExternalContentId(value: unknown): string | number | undefined {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized ? normalized : undefined;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseExternalContent(raw: string | null): ParsedExternalContent | undefined {
   const parsed = raw ? parseJsonValue<unknown>(raw, undefined) : undefined;
-  return parsed === "gmail" || parsed === "webhook" ? parsed : undefined;
+  if (parsed === "gmail" || parsed === "webhook") {
+    return { externalContentSource: parsed };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  const externalContentSource = record.source;
+  if (externalContentSource !== "gmail" && externalContentSource !== "webhook") {
+    return undefined;
+  }
+  const externalContentId = normalizeExternalContentId(record.externalContentId);
+  return {
+    externalContentSource,
+    ...(externalContentId !== undefined ? { externalContentId } : {}),
+  };
+}
+
+function serializeExternalContent(
+  payload: Extract<CronPayload, { kind: "agentTurn" }>,
+): string | null {
+  if (!payload.externalContentSource) {
+    return null;
+  }
+  const externalContentId = normalizeExternalContentId(payload.externalContentId);
+  return serializeJson(
+    externalContentId === undefined
+      ? payload.externalContentSource
+      : {
+          source: payload.externalContentSource,
+          externalContentId,
+        },
+  );
 }
 
 function parseCommandPayloadMessage(
@@ -148,7 +193,7 @@ export function bindPayloadColumns(
     payload_thinking: payload.thinking ?? null,
     payload_timeout_seconds: payload.timeoutSeconds ?? null,
     payload_allow_unsafe_external_content: booleanToInteger(payload.allowUnsafeExternalContent),
-    payload_external_content_source_json: serializeJson(payload.externalContentSource),
+    payload_external_content_source_json: serializeExternalContent(payload),
     payload_light_context: booleanToInteger(payload.lightContext),
     ...bindPayloadToolAllowColumns(payload),
   };
@@ -178,9 +223,7 @@ export function payloadFromRow(row: CronJobRow): CronPayload | null {
       row.payload_allow_unsafe_external_content != null
         ? integerToBoolean(row.payload_allow_unsafe_external_content)
         : undefined;
-    const externalContentSource = parseExternalContentSource(
-      row.payload_external_content_source_json,
-    );
+    const externalContent = parseExternalContent(row.payload_external_content_source_json);
     const lightContext =
       row.payload_light_context != null ? integerToBoolean(row.payload_light_context) : undefined;
     return {
@@ -191,7 +234,14 @@ export function payloadFromRow(row: CronJobRow): CronPayload | null {
       ...(row.payload_thinking ? { thinking: row.payload_thinking } : {}),
       ...(timeoutSeconds != null ? { timeoutSeconds } : {}),
       ...(allowUnsafeExternalContent != null ? { allowUnsafeExternalContent } : {}),
-      ...(externalContentSource ? { externalContentSource } : {}),
+      ...(externalContent
+        ? {
+            externalContentSource: externalContent.externalContentSource,
+            ...(externalContent.externalContentId !== undefined
+              ? { externalContentId: externalContent.externalContentId }
+              : {}),
+          }
+        : {}),
       ...(lightContext != null ? { lightContext } : {}),
       ...payloadToolAllowFromRow(row),
     };

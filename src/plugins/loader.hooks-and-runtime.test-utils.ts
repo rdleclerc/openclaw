@@ -1693,6 +1693,36 @@ describe("loadOpenClawPlugins", () => {
     });
   });
 
+  it("preserves the required external-content source on typed hook registration", () => {
+    useNoBundledPlugins();
+    const plugin = writePlugin({
+      id: "gmail-terminal-hook",
+      filename: "gmail-terminal-hook.cjs",
+      body: `module.exports = { id: "gmail-terminal-hook", register(api) {
+    api.on("agent_end", () => undefined, { requiredForExternalContentSource: "gmail" });
+  } };`,
+    });
+
+    const registry = loadRegistryFromSinglePlugin({
+      plugin,
+      pluginConfig: {
+        allow: ["gmail-terminal-hook"],
+        entries: {
+          "gmail-terminal-hook": {
+            hooks: { allowConversationAccess: true },
+          },
+        },
+      },
+    });
+
+    expect(registry.typedHooks).toContainEqual(
+      expect.objectContaining({
+        hookName: "agent_end",
+        requiredForExternalContentSource: "gmail",
+      }),
+    );
+  });
+
   it("blocks conversation typed hooks for non-bundled plugins unless explicitly allowed", () => {
     useNoBundledPlugins();
     const plugin = writePlugin({

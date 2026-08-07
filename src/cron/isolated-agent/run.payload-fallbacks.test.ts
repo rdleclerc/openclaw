@@ -1,5 +1,6 @@
 // Payload fallback tests cover fallback prompt payloads for isolated cron runs.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { AgentEndTerminalFinalizationError } from "../../agents/harness/terminal-finalization-error.js";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
 import { setupRunCronIsolatedAgentTurnSuite } from "./run.suite-helpers.js";
 import {
@@ -138,6 +139,72 @@ describe("runCronIsolatedAgentTurn — payload.fallbacks", () => {
     expect(fallbackRequest.mergeExhaustedResult).toBe(
       mergeEmbeddedAgentRunResultForModelFallbackExhaustionMock,
     );
+  });
+
+  it("does not retry a terminal Gmail finalization failure on the next model", async () => {
+    const finalizer = vi.fn(() => {
+      throw new AgentEndTerminalFinalizationError("Gmail finalizer failed");
+    });
+    runEmbeddedAgentMock.mockImplementation(async () => {
+      finalizer();
+      return { payloads: [{ text: "unreachable" }], meta: { agentMeta: {} } };
+    });
+
+    let terminalError: unknown;
+    runWithModelFallbackMock.mockImplementation(
+      async (params: {
+        provider: string;
+        model: string;
+        fallbacksOverride?: string[];
+        run: (provider: string, model: string) => Promise<unknown>;
+        canFallbackAfterError?: (input: {
+          provider: string;
+          model: string;
+          error: unknown;
+          attempt: number;
+          total: number;
+        }) => boolean | Promise<boolean>;
+      }) => {
+        try {
+          const result = await params.run(params.provider, params.model);
+          return { result, provider: params.provider, model: params.model, attempts: [] };
+        } catch (error) {
+          terminalError = error;
+          const canFallback = await params.canFallbackAfterError?.({
+            provider: params.provider,
+            model: params.model,
+            error,
+            attempt: 1,
+            total: 2,
+          });
+          if (canFallback) {
+            await params.run("openai", "gpt-5.3");
+          }
+          throw error;
+        }
+      },
+    );
+
+    const result = await runCronIsolatedAgentTurn(
+      makeIsolatedAgentParamsFixture({
+        job: makeIsolatedAgentJobFixture({
+          payload: {
+            kind: "agentTurn",
+            message: "test",
+            externalContentSource: "gmail",
+            externalContentId: "msg-1",
+            fallbacks: ["openai/gpt-5.3"],
+          },
+        }),
+      }),
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.error).toBe("AgentEndTerminalFinalizationError: Gmail finalizer failed");
+    expect(terminalError).toBeInstanceOf(AgentEndTerminalFinalizationError);
+    expect(runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
+    expect(finalizer).toHaveBeenCalledTimes(1);
+    expect(requireModelFallbackRequest().fallbacksOverride).toEqual(["openai/gpt-5.3"]);
   });
 
   it("plans Anthropic fallbacks canonically while executing compatible attempts through Claude CLI", async () => {

@@ -9,6 +9,7 @@ import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number
 import { copyReplyPayloadMetadata, type ReplyPayload } from "../auto-reply/reply-payload.js";
 import { formatHookErrorForLog } from "../hooks/fire-and-forget.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import type { HookExternalContentSource } from "../security/external-content.js";
 import { concatOptionalTextSegments } from "../shared/text/join-segments.js";
 import {
   type GateHookResult,
@@ -106,6 +107,10 @@ type HookFailurePolicy = "fail-open" | "fail-closed";
 export type VoidHookRunOptions = {
   unrefTimeout?: boolean;
   requiredPluginId?: string;
+  /** Require a handler marked for this typed external source. */
+  requiredForExternalContentSource?: HookExternalContentSource;
+  /** Await only required handlers; observational handlers still run in the background. */
+  awaitOnlyRequired?: boolean;
 };
 
 type BeforeAgentFinalizeRetry = NonNullable<PluginHookBeforeAgentFinalizeResult["retry"]>;
@@ -549,8 +554,19 @@ export function createHookRunner(
   ): Promise<void> {
     const hooks = getHooksForName(registry, hookName);
     const requiredPluginId = optionsValue.requiredPluginId?.trim();
+    const requiredExternalContentSource = optionsValue.requiredForExternalContentSource;
+    const requiredExternalContentHooks = requiredExternalContentSource
+      ? hooks.filter(
+          (hook) => hook.requiredForExternalContentSource === requiredExternalContentSource,
+        )
+      : [];
     if (requiredPluginId && !hooks.some((hook) => hook.pluginId === requiredPluginId)) {
       throw new Error(`required ${hookName} handler missing: ${requiredPluginId}`);
+    }
+    if (requiredExternalContentSource && requiredExternalContentHooks.length === 0) {
+      throw new Error(
+        `required ${hookName} handler missing for external content source: ${requiredExternalContentSource}`,
+      );
     }
     if (hooks.length === 0) {
       return;
@@ -558,11 +574,19 @@ export function createHookRunner(
 
     logger?.debug?.(`[hooks] running ${hookName} (${hooks.length} handlers)`);
 
+    const isRequired = (hook: PluginHookRegistration): boolean =>
+      hook.pluginId === requiredPluginId ||
+      (requiredExternalContentSource !== undefined &&
+        hook.requiredForExternalContentSource === requiredExternalContentSource);
     const promises = hooks.map(async (hook) => {
-      const required = hook.pluginId === requiredPluginId;
+      const required = isRequired(hook);
       try {
+        const handlerContext = Object.freeze({ ...(ctx as object) });
         const promise = Promise.resolve(
-          (hook.handler as (event: unknown, ctx: unknown) => Promise<void> | void)(event, ctx),
+          (hook.handler as (event: unknown, ctx: unknown) => Promise<void> | void)(
+            event,
+            handlerContext,
+          ),
         );
         const timeoutMs = getVoidHookTimeoutMs(hookName, hook);
         if (timeoutMs) {
@@ -577,6 +601,17 @@ export function createHookRunner(
         handleHookError({ hookName, pluginId: hook.pluginId, error: err });
       }
     });
+
+    if (
+      optionsValue.awaitOnlyRequired &&
+      (requiredPluginId !== undefined || requiredExternalContentSource !== undefined)
+    ) {
+      const requiredPromises = hooks.flatMap((hook, index) =>
+        isRequired(hook) && promises[index] ? [promises[index]] : [],
+      );
+      await Promise.all(requiredPromises);
+      return;
+    }
 
     await Promise.all(promises);
   }
