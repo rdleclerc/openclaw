@@ -1590,11 +1590,15 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         !isScopedMessageActionAuthorized(trustedTurnContext, {
           action,
           provider: params.channel,
-          accountId: readStringParam(params, "accountId"),
+          accountId:
+            readStringParam(params, "accountId") ??
+            trustedTurnContext?.requesterAccountId ??
+            agentAccountId,
           target: params.target,
           threadId: params.threadId,
           to: params.to,
           channelId: params.channelId,
+          actionParams: params,
         })
       ) {
         throw new Error("message action capability permits only the exact Slack read route");

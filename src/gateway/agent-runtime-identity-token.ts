@@ -66,7 +66,7 @@ function decodeMessageActionContext(
   }
   const rawToolContext = value.toolContext;
   // oxfmt-ignore
-  const rawAllowedActions = value.allowedActions, allowedActions = rawAllowedActions === undefined ? undefined : Array.isArray(rawAllowedActions) && (rawAllowedActions.length === 0 || rawAllowedActions.length === 1 && rawAllowedActions[0] === "read") ? rawAllowedActions as readonly ("read")[] : null;
+  const rawAllowedActions = value.allowedActions, allowedActions = rawAllowedActions === undefined ? undefined : Array.isArray(rawAllowedActions) && (rawAllowedActions.length === 0 || rawAllowedActions.length === 1 && rawAllowedActions[0] === "read" || rawAllowedActions.length === 2 && rawAllowedActions[0] === "read" && rawAllowedActions[1] === "send") ? rawAllowedActions as readonly ("read" | "send")[] : null;
   // oxfmt-ignore
   if (rawAllowedActions !== undefined && !allowedActions) { return undefined; }
   if (rawToolContext !== undefined && !isRecord(rawToolContext)) {

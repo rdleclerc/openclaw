@@ -560,6 +560,7 @@ export const sendHandlers: GatewayRequestHandlers = {
         to: request.params.to,
         channelId: request.params.channelId,
         allowEquivalentTo: true,
+        actionParams: request.params,
       },
     );
     if (!scopedActionAuthorized) {

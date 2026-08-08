@@ -375,6 +375,7 @@ function createCronPromptExecutor(params: {
           sessionKey: params.runSessionKey,
           sessionId: params.cronSession.sessionEntry.sessionId,
           requesterAccountId: resolvedAccountId,
+          allowedActions: ["read", "send"],
           ttlMs: params.timeoutMs + 60_000,
           toolContext: {
             currentChannelProvider: messageChannel,

@@ -723,7 +723,9 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
         return;
       }
       await run;
-      const toolContext = mintMessageActionTurnCapabilityMock.mock.calls[0]?.[0]?.toolContext;
+      const mintedCapability = mintMessageActionTurnCapabilityMock.mock.calls[0]?.[0];
+      expect(mintedCapability?.allowedActions).toEqual(["read", "send"]);
+      const toolContext = mintedCapability?.toolContext;
       const exact = {
         action: "send",
         channel: "slack",
@@ -737,10 +739,130 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
         return { toolResult: { content: [], details: { ok: true } } };
       });
       const scopedSecrets = vi.fn(() => ({ targetIds: new Set<string>() }));
-      const { mintMessageActionTurnCapability: mintReal } = await vi.importActual<
-        typeof import("../../gateway/message-action-turn-capability.js")
-      >("../../gateway/message-action-turn-capability.js");
+      const {
+        isScopedMessageActionAuthorized: authorizeReal,
+        mintMessageActionTurnCapability: mintReal,
+      } = await vi.importActual<typeof import("../../gateway/message-action-turn-capability.js")>(
+        "../../gateway/message-action-turn-capability.js",
+      );
       const sessionKey = "agent:default:cron:message-tool-policy:run:test-session-id";
+      const boundToken = mintReal({
+        agentId: "default",
+        runId: "test-session-id",
+        sessionKey,
+        sessionId: "test-session-id",
+        requesterAccountId: "bot-a",
+        allowedActions: ["read", "send"],
+        toolContext,
+      });
+      const { withGatewayToolCallerIdentity } =
+        await import("../../agents/tools/gateway-caller-context.js");
+      const { resolveMessageActionAgentRuntimeIdentityToken } =
+        await import("../../agents/tools/gateway.js");
+      const { verifyAgentRuntimeIdentityToken } =
+        await import("../../gateway/agent-runtime-identity-token.js");
+      const identityToken = await withGatewayToolCallerIdentity(
+        { agentId: "default", sessionKey },
+        () =>
+          resolveMessageActionAgentRuntimeIdentityToken({
+            opts: {},
+            target: "local",
+            turnCapability: boundToken,
+            runId: "test-session-id",
+            sessionId: "test-session-id",
+          }),
+      );
+      const identity = await verifyAgentRuntimeIdentityToken(identityToken);
+      expect(identity).toBeDefined();
+      for (const [action, candidate, allowed] of [
+        ["read", { channel: "slack", accountId: "bot-a", target: "123", threadId: "42" }, true],
+        ["send", { channel: "slack", accountId: "bot-a", target: "123", threadId: "42" }, true],
+        ["read", { channel: "other", accountId: "bot-a", target: "123", threadId: "42" }, false],
+        ["read", { channel: "slack", accountId: "bot-b", target: "123", threadId: "42" }, false],
+        ["read", { channel: "slack", accountId: "bot-a", target: "456", threadId: "42" }, false],
+        ["read", { channel: "slack", accountId: "bot-a", target: "123", threadId: "43" }, false],
+        ["react", { channel: "slack", accountId: "bot-a", target: "123", threadId: "42" }, false],
+      ] as const) {
+        expect(
+          authorizeReal(identity?.messageActionContext, {
+            action,
+            provider: candidate.channel,
+            accountId: candidate.accountId,
+            target: candidate.target,
+            threadId: candidate.threadId,
+          }),
+        ).toBe(allowed);
+      }
+      expect(
+        authorizeReal(identity?.messageActionContext, {
+          action: "send",
+          provider: "slack",
+          accountId: "bot-a",
+          target: "123",
+          threadId: "42",
+          actionParams: { replyTo: "43" },
+        }),
+      ).toBe(false);
+      const { sendHandlers } = await import("../../gateway/server-methods/send.js");
+      const receiver = sendHandlers["message.action"];
+      let receiverError = "";
+      if (!receiver || !identity) {
+        throw new Error("expected signed message.action receiver");
+      }
+      const invokeReceiver = (
+        action: string,
+        target: string,
+        actionParams: Record<string, unknown> = {},
+      ) =>
+        receiver({
+          params: {
+            channel: "slack",
+            action,
+            params: { target, threadId: "42", ...actionParams },
+            accountId: "bot-a",
+            sessionKey,
+            sessionId: "test-session-id",
+            agentId: "default",
+            idempotencyKey: `bound-route-${action}-${target}`,
+          } as never,
+          respond: (_ok, _payload, error) => {
+            receiverError = String((error as { message?: unknown } | undefined)?.message ?? "");
+          },
+          context: new Proxy({} as never, {
+            get: () => {
+              throw new Error("accepted route reached gateway context");
+            },
+          }),
+          client: { internal: { agentRuntimeIdentity: identity } } as never,
+          req: { type: "req", id: "bound-route", method: "message.action" },
+          isWebchatConnect: () => false,
+        });
+      for (const action of ["read", "send"]) {
+        receiverError = "";
+        await expect(invokeReceiver(action, "123")).rejects.toThrow(
+          "accepted route reached gateway context",
+        );
+        expect(receiverError).toBe("");
+      }
+      await expect(invokeReceiver("send", "123", { replyTo: "42" })).rejects.toThrow(
+        "accepted route reached gateway context",
+      );
+      receiverError = "";
+      await invokeReceiver("read", "456");
+      expect(receiverError).toBe("message.action permits only the exact Slack read route");
+      receiverError = "";
+      await invokeReceiver("send", "123", { replyTo: "43" });
+      expect(receiverError).toBe("message.action permits only the exact Slack read route");
+      for (const actionParams of [
+        { replyBroadcast: true },
+        { replyBroadcast: "true" },
+        { message: "[[ reply_to\\n : 43 ]] escaped" },
+        { caption: "[[ reply_to : 43 ]] escaped" },
+      ]) {
+        receiverError = "";
+        await invokeReceiver("send", "123", actionParams);
+        expect(receiverError).toBe("message.action permits only the exact Slack read route");
+      }
       const restricted = (tokenRunId: string) =>
         createMessageTool({
           agentSessionKey: sessionKey,
@@ -754,12 +876,13 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
             runId: tokenRunId,
             sessionKey,
             requesterAccountId: "bot-a",
+            allowedActions: ["read", "send"],
             toolContext,
           }),
           runMessageAction: transport,
         });
       await expect(restricted("other-run").execute?.("call", exact)).rejects.toThrow(
-        "authority is unavailable",
+        "capability is unavailable",
       );
       expect(transport).not.toHaveBeenCalled();
       const call = (args: Record<string, unknown>) =>
@@ -769,15 +892,25 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
           details: { effectiveAccountId: "bot-a" },
         });
       }
+      await expect(call({ ...exact, replyTo: "42" })).resolves.toMatchObject({
+        details: { effectiveAccountId: "bot-a" },
+      });
       expect(scopedSecrets).toHaveBeenCalledWith(expect.objectContaining({ accountId: "bot-a" }));
       for (const args of [
         { ...exact, channel: "otherchat" },
         { ...exact, accountId: "bot-b" },
         { ...exact, target: "456" },
         { ...exact, threadId: "43" },
+        { ...exact, replyTo: "43" },
+        { ...exact, replyBroadcast: true },
+        { ...exact, replyBroadcast: "true" },
+        { ...exact, message: "[[ reply_to\\n : 43 ]] escaped" },
+        { ...exact, caption: "[[ reply_to : 43 ]] escaped" },
         { ...exact, action: "react" },
       ]) {
-        await expect(call(args)).rejects.toThrow("outside the bound Slack channel thread");
+        await expect(call(args)).rejects.toThrow(
+          "message action capability permits only the exact Slack read route",
+        );
       }
     },
   );

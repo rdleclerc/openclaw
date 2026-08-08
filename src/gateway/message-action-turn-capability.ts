@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
+import { parseBoolean } from "@openclaw/normalization-core/boolean-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ChannelThreadingToolContext } from "../channels/plugins/types.public.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { parseInlineDirectives } from "../utils/directive-tags.js";
 import {
   isDeliverableMessageChannel,
   normalizeMessageChannel,
@@ -25,7 +27,7 @@ export type AgentRuntimeMessageActionContext = {
   toolContext?: ChannelThreadingToolContext;
 };
 
-export type MessageActionAllowedAction = "read";
+export type MessageActionAllowedAction = "read" | "send";
 
 type ScopedMessageActionRequest = {
   action: string;
@@ -36,6 +38,7 @@ type ScopedMessageActionRequest = {
   to?: unknown;
   channelId?: unknown;
   allowEquivalentTo?: boolean;
+  actionParams?: Readonly<Record<string, unknown>>;
 };
 
 function normalizeScopedRouteValue(value: unknown): string | undefined {
@@ -64,14 +67,26 @@ export function isScopedMessageActionAuthorized(
     normalizeScopedRouteValue(context.toolContext?.currentThreadTs),
   ];
   const normalizedTo = normalizeScopedRouteValue(request.to);
+  const normalizedReplyTo = normalizeScopedRouteValue(request.actionParams?.replyTo);
+  const hasInlineReplyDirective = ["message", "SendMessage", "content", "text", "caption"].some(
+    (key) => {
+      const value = request.actionParams?.[key];
+      // oxfmt-ignore
+      return typeof value === "string" && parseInlineDirectives(value.replaceAll("\\n", "\n")).hasReplyTag;
+    },
+  );
+  const actionAllowed =
+    (request.action === "read" || request.action === "send") &&
+    context.allowedActions.includes(request.action);
   return (
-    context.allowedActions.length === 1 &&
-    context.allowedActions[0] === "read" &&
-    request.action === "read" &&
+    actionAllowed &&
     normalizeMessageChannel(context.toolContext?.currentChannelProvider) === "slack" &&
     context.toolContext?.sameChannelThreadRequired === true &&
     request.channelId == null &&
     (!normalizedTo || (request.allowEquivalentTo === true && normalizedTo === requested[2])) &&
+    (!normalizedReplyTo || normalizedReplyTo === expected[3]) &&
+    parseBoolean(request.actionParams?.replyBroadcast) !== true &&
+    !hasInlineReplyDirective &&
     requested.every((value, index) => Boolean(value) && value === expected[index])
   );
 }
@@ -132,7 +147,7 @@ function copyToolContext(
 }
 
 // oxfmt-ignore
-function copyAllowedActions(actions: readonly MessageActionAllowedAction[] | undefined): readonly MessageActionAllowedAction[] | undefined { return actions === undefined ? undefined : actions.length === 1 && actions[0] === "read" ? ["read"] : []; }
+function copyAllowedActions(actions: readonly MessageActionAllowedAction[] | undefined): readonly MessageActionAllowedAction[] | undefined { return actions === undefined ? undefined : actions.length === 0 ? [] : actions.length === 1 && actions[0] === "read" ? ["read"] : actions.length === 2 && actions[0] === "read" && actions[1] === "send" ? ["read", "send"] : []; }
 
 function evictOldestCapability(): void {
   const oldest = capabilitiesByToken.keys().next().value;
