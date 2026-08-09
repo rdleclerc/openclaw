@@ -753,7 +753,7 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
         sessionId: "test-session-id",
         requesterAccountId: "bot-a",
         allowedActions: ["read", "send"],
-        toolContext,
+        toolContext: { ...toolContext, currentMessagingTarget: "channel:123" },
       });
       const { withGatewayToolCallerIdentity } =
         await import("../../agents/tools/gateway-caller-context.js");
@@ -892,6 +892,9 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
           details: { effectiveAccountId: "bot-a" },
         });
       }
+      await expect(
+        call({ action: "read", channel: "slack", channelId: "123", threadId: "42" }),
+      ).resolves.toMatchObject({ details: { effectiveAccountId: "bot-a" } });
       await expect(call({ ...exact, replyTo: "42" })).resolves.toMatchObject({
         details: { effectiveAccountId: "bot-a" },
       });
@@ -900,6 +903,9 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
         { ...exact, channel: "otherchat" },
         { ...exact, accountId: "bot-b" },
         { ...exact, target: "456" },
+        { action: "read", channel: "slack", channelId: "456", threadId: "42" },
+        { action: "read", channel: "slack", channelId: "123", threadId: "43" },
+        { action: "send", channel: "slack", channelId: "123", threadId: "42" },
         { ...exact, threadId: "43" },
         { ...exact, replyTo: "43" },
         { ...exact, replyBroadcast: true },

@@ -47,6 +47,12 @@ function normalizeScopedRouteValue(value: unknown): string | undefined {
     : normalizeOptionalString(value);
 }
 
+function normalizeScopedSlackTarget(value: unknown): string | undefined {
+  return normalizeScopedRouteValue(value)
+    ?.replace(/^(channel|group):/iu, "")
+    .toUpperCase();
+}
+
 export function isScopedMessageActionAuthorized(
   context: AgentRuntimeMessageActionContext | undefined,
   request: ScopedMessageActionRequest,
@@ -54,19 +60,21 @@ export function isScopedMessageActionAuthorized(
   if (context?.allowedActions === undefined) {
     return true;
   }
+  const readViaChannelId =
+    request.action === "read" && request.target == null && request.channelId != null;
   const requested = [
     normalizeMessageChannel(request.provider),
     normalizeOptionalString(request.accountId),
-    normalizeScopedRouteValue(request.target),
+    normalizeScopedSlackTarget(readViaChannelId ? request.channelId : request.target),
     normalizeScopedRouteValue(request.threadId),
   ];
   const expected = [
     "slack",
     normalizeOptionalString(context.requesterAccountId),
-    normalizeScopedRouteValue(context.toolContext?.currentMessagingTarget),
+    normalizeScopedSlackTarget(context.toolContext?.currentMessagingTarget),
     normalizeScopedRouteValue(context.toolContext?.currentThreadTs),
   ];
-  const normalizedTo = normalizeScopedRouteValue(request.to);
+  const normalizedTo = normalizeScopedSlackTarget(request.to);
   const normalizedReplyTo = normalizeScopedRouteValue(request.actionParams?.replyTo);
   const hasInlineReplyDirective = ["message", "SendMessage", "content", "text", "caption"].some(
     (key) => {
@@ -82,7 +90,7 @@ export function isScopedMessageActionAuthorized(
     actionAllowed &&
     normalizeMessageChannel(context.toolContext?.currentChannelProvider) === "slack" &&
     context.toolContext?.sameChannelThreadRequired === true &&
-    request.channelId == null &&
+    (request.channelId == null || readViaChannelId) &&
     (!normalizedTo || (request.allowEquivalentTo === true && normalizedTo === requested[2])) &&
     (!normalizedReplyTo || normalizedReplyTo === expected[3]) &&
     parseBoolean(request.actionParams?.replyBroadcast) !== true &&
