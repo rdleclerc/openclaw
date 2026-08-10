@@ -125,6 +125,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   sessionId?: string;
   /** Agent identity for hook context — resolved from session config in attempt.ts. */
   agentId?: string;
+  /** Host-authenticated transport account for identity-bound hook actions. */
+  accountId?: string;
   /**
    * Exact raw names of OpenClaw tools registered for this run.
    */

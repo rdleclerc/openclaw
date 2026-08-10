@@ -275,6 +275,7 @@ export function prepareEmbeddedAttemptStream(input: {
       hasRepliedRef: attempt.hasRepliedRef,
       sessionId: attempt.sessionId,
       agentId: input.hookAgentId,
+      ...(attempt.agentAccountId ? { accountId: attempt.agentAccountId } : {}),
       builtinToolNames: input.builtinToolNames,
       replaySafeToolNames: input.replaySafeToolNames,
       internalEvents: attempt.internalEvents,

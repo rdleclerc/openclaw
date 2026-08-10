@@ -295,6 +295,7 @@ type ToolHandlerParams = Pick<
   | "hasRepliedRef"
   | "sessionId"
   | "agentId"
+  | "accountId"
   | "replaySafeToolNames"
   | "toolResultFormat"
   | "toolProgressDetail"

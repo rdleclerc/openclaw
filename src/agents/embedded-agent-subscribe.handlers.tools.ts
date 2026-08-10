@@ -1717,6 +1717,7 @@ export async function handleToolExecutionEnd(
       .runAfterToolCall(hookEvent, {
         toolName,
         agentId: ctx.params.agentId,
+        ...(ctx.params.accountId ? { accountId: ctx.params.accountId } : {}),
         sessionKey: ctx.params.sessionKey,
         sessionId: ctx.params.sessionId,
         runId,

@@ -361,7 +361,7 @@ describe("runCopilotAttempt", () => {
       return { sdkTools: [], sourceTools: [] };
     });
 
-    await runCopilotAttempt(makeParams(), {
+    await runCopilotAttempt(makeParams({ agentAccountId: "slack-account-1" }), {
       createToolBridge,
       pool: makeFakePool(sdk),
     });
@@ -408,8 +408,43 @@ describe("runCopilotAttempt", () => {
         toolCallId: "tool-call-1",
         toolName: "read",
       }),
-      expect.objectContaining({ agentId: "agent-1", sessionId: "session-1" }),
+      expect.objectContaining({
+        accountId: "slack-account-1",
+        agentId: "agent-1",
+        sessionId: "session-1",
+      }),
     );
+  });
+
+  it("omits account identity from after-tool hooks when the run has none", async () => {
+    const afterToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const sdk = makeFakeSdk({
+      onCreateSession: (session) => {
+        session.sendAndWait.mockResolvedValueOnce(makeAssistantMessageEvent("done"));
+      },
+    });
+    const createToolBridge = vi.fn(async (input: CopilotToolBridgeInput) => {
+      await input.onToolCompleted?.({
+        args: { path: "README.md" },
+        result: { content: [{ text: "read result", type: "text" }] },
+        startedAt: Date.now(),
+        toolCallId: "tool-call-without-account",
+        toolName: "read",
+      });
+      return { sdkTools: [], sourceTools: [] };
+    });
+
+    await runCopilotAttempt(makeParams(), {
+      createToolBridge,
+      pool: makeFakePool(sdk),
+    });
+    await waitForEventLoopTurn();
+
+    expect(afterToolCall).toHaveBeenCalledTimes(1);
+    expect(afterToolCall.mock.calls[0]?.[1]).not.toHaveProperty("accountId");
   });
 
   it("keeps generic compaction hooks attached through asynchronous SDK completion", async () => {

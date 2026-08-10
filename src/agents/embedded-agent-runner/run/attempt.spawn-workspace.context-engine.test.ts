@@ -3086,6 +3086,23 @@ describe("runEmbeddedAttempt context engine sessionKey forwarding", () => {
     expect(subscriptionParams.messageChannel).toBe("telegram");
   });
 
+  it("forwards the authenticated account to the embedded subscription", async () => {
+    await createContextEngineAttemptRunner({
+      contextEngine: createContextEngineBootstrapAndAssemble(),
+      sessionKey,
+      tempPaths,
+      attemptOverrides: {
+        agentAccountId: "slack-account-1",
+      },
+    });
+
+    const subscriptionParams = requireRecord(
+      hoisted.subscribeEmbeddedAgentSessionMock.mock.calls[0]?.[0],
+      "subscription params",
+    );
+    expect(subscriptionParams.accountId).toBe("slack-account-1");
+  });
+
   it("preserves source delivery reported by bridged tool lifecycle events", async () => {
     const baseSubscribe = hoisted.subscribeEmbeddedAgentSessionMock.getMockImplementation();
     if (!baseSubscribe) {

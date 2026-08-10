@@ -28,6 +28,7 @@ import type {
   ReplyDispatchBeforeDeliverOptions as ReplyRuntimeBeforeDeliverOptions,
   ReplyDispatcher as ReplyRuntimeDispatcher,
 } from "openclaw/plugin-sdk/reply-runtime";
+import type { PluginHookToolContext as PublicPluginHookToolContext } from "openclaw/plugin-sdk/types";
 import * as zalouserSdk from "openclaw/plugin-sdk/zalouser";
 import ts from "typescript";
 import { beforeAll, describe, expect, expectTypeOf, it } from "vitest";
@@ -1334,6 +1335,7 @@ describe("plugin-sdk subpath exports", () => {
   });
 
   it("keeps shared plugin-sdk types aligned", () => {
+    expectTypeOf<PublicPluginHookToolContext["accountId"]>().toEqualTypeOf<string | undefined>();
     expectTypeOf<ContractBaseProbeResult>().toMatchTypeOf<BaseProbeResult>();
     expectTypeOf<ContractBaseTokenResolution>().toMatchTypeOf<BaseTokenResolution>();
     expectTypeOf<ContractChannelAgentTool>().toMatchTypeOf<ChannelAgentTool>();

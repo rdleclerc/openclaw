@@ -659,6 +659,7 @@ export async function runCopilotAttempt(
             toolCallId,
             runId: input.runId,
             agentId: sessionAgentId,
+            ...(input.agentAccountId ? { accountId: input.agentAccountId } : {}),
             sessionId: input.sessionId,
             sessionKey: sandboxSessionKey,
             channelId: hookContext.channelId,

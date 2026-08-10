@@ -29,6 +29,7 @@ function createToolHandlerCtx(params: {
   sessionKey?: string;
   sessionId?: string;
   agentId?: string;
+  accountId?: string;
   onBlockReplyFlush?: unknown;
 }) {
   return {
@@ -36,6 +37,7 @@ function createToolHandlerCtx(params: {
       runId: params.runId,
       session: { messages: [] },
       agentId: params.agentId,
+      accountId: params.accountId,
       sessionKey: params.sessionKey,
       sessionId: params.sessionId,
       onBlockReplyFlush: params.onBlockReplyFlush,
@@ -71,6 +73,7 @@ function getAfterToolCallCall(index = 0) {
       | {
           toolName?: string;
           agentId?: string;
+          accountId?: string;
           sessionKey?: string;
           sessionId?: string;
           runId?: string;
@@ -124,6 +127,7 @@ describe("after_tool_call hook wiring", () => {
     const ctx = createToolHandlerCtx({
       runId: "test-run-1",
       agentId: "main",
+      accountId: "slack-account-1",
       sessionKey: "test-session",
       sessionId: "test-ephemeral-session",
     });
@@ -163,6 +167,7 @@ describe("after_tool_call hook wiring", () => {
       expectedContext: {
         toolName: "read",
         agentId: "main",
+        accountId: "slack-account-1",
         sessionKey: "test-session",
         sessionId: "test-ephemeral-session",
         runId: "test-run-1",
@@ -201,6 +206,7 @@ describe("after_tool_call hook wiring", () => {
     const { event, context } = requireAfterToolCallCall();
     expect(event.error).toBe("command failed");
     expect(context.agentId).toBeUndefined();
+    expect(context).not.toHaveProperty("accountId");
   });
 
   it("does not call runAfterToolCall when no hooks registered", async () => {

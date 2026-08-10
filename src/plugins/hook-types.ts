@@ -647,6 +647,8 @@ export type PluginHookToolInputKind = "javascript" | "typescript";
 
 export type PluginHookToolContext = {
   agentId?: string;
+  /** Host-authenticated transport account for identity-bound hook actions. */
+  accountId?: string;
   sessionKey?: string;
   sessionId?: string;
   runId?: string;
