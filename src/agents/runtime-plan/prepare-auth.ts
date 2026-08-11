@@ -547,8 +547,8 @@ export function prepareAgentRuntimeAuth(
       allowHarnessAuthProfileForwarding: harnessAllowsAuthProfileForwarding,
     });
   };
-  const attempts: PreparedAgentRuntimeAuthAttempt[] = routeAuthDecision.attempts.map(
-    (attempt, index) => {
+  const attempts: PreparedAgentRuntimeAuthAttempt[] = routeAuthDecision.attempts
+    .map((attempt, index): PreparedAgentRuntimeAuthAttempt => {
       const plan = buildRoutedPlan(attempt);
       return attempt.kind === "profile"
         ? { kind: "profile", plan, profileId: attempt.source.profileId }
@@ -560,8 +560,18 @@ export function prepareAgentRuntimeAuth(
               .slice(0, index)
               .some((candidate) => candidate.kind === "profile"),
           };
-    },
-  );
+    })
+    .filter(
+      // Codex cannot supply account identity for a profile-free subscription fallback.
+      // Keep direct-only attempts so harness validation still fails closed.
+      (attempt) =>
+        !(
+          attempt.kind === "direct" &&
+          attempt.requiresPriorProfileAttempt &&
+          harnessOwnsOpenAIAuth &&
+          attempt.plan.modelRoute?.authRequirement === "subscription"
+        ),
+    );
   const plan = attempts[0]?.plan ?? buildRoutedPlan(undefined);
   for (const attempt of attempts) {
     if (

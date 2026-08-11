@@ -1743,6 +1743,33 @@ describe("prepareAgentRuntimeAuthPlan", () => {
     ]);
   });
 
+  it("omits a direct subscription fallback behind Codex profile attempts", () => {
+    const prepared = prepareAgentRuntimeAuth({
+      provider: "openai",
+      modelId: "gpt-5.5",
+      config: {
+        models: { providers: { openai: { auth: "oauth", apiKey: "configured-oauth-token" } } },
+      } as OpenClawConfig,
+      env: {},
+      authProfileStore: authStore({
+        "openai:profile": {
+          type: "oauth",
+          provider: "openai",
+          access: "token",
+          refresh: "refresh",
+          expires: Date.now() + 60_000,
+        },
+      }),
+      harnessId: "codex",
+      harnessRuntime: "codex",
+      harnessAuthBootstrap: "harness",
+    });
+
+    expect(prepared.attempts.map((attempt) => [attempt.kind, attempt.profileId])).toEqual([
+      ["profile", "openai:profile"],
+    ]);
+  });
+
   it("keeps an API profile ahead of configured OAuth direct material", () => {
     const prepared = prepareAgentRuntimeAuth({
       provider: "openai",
