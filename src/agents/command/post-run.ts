@@ -210,6 +210,7 @@ export async function finalizeEmbeddedAgentCommand(params: {
       payloads,
       deliveryContext: params.currentRunDeliveryContext,
       runOwnedSessionId,
+      runId: params.prepared.runId,
     });
     sessionEntry = pendingFinalDeliveryMarker.sessionEntry;
 

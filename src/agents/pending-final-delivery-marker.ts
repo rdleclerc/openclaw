@@ -21,6 +21,7 @@ type PersistPendingFinalDeliveryMarkerParams = {
   payloads: ReplyPayload[];
   deliveryContext?: DeliveryContext;
   runOwnedSessionId: string;
+  runId: string;
 };
 
 type PendingFinalDeliveryMarkerResult = {
@@ -65,6 +66,7 @@ export async function persistPendingFinalDeliveryMarker(
   }
 
   const now = Date.now();
+  let markerWriteAccepted = false;
   const persisted = await persistSessionEntry({
     sessionStore: params.sessionStore,
     sessionKey: params.sessionKey,
@@ -78,10 +80,17 @@ export async function persistPendingFinalDeliveryMarker(
       pendingFinalDeliveryCreatedAt: now,
       updatedAt: now,
     },
-    shouldPersist: (current) =>
-      current?.sessionId === params.runOwnedSessionId && current.abortedLastRun !== true,
+    // The restart barrier can mark the row aborted before this run flushes its final.
+    shouldPersist: (current) => {
+      markerWriteAccepted =
+        current?.sessionId === params.runOwnedSessionId &&
+        (current.abortedLastRun !== true ||
+          (current.status === "running" && current.restartRecoveryDeliveryRunId === params.runId));
+      return markerWriteAccepted;
+    },
   });
   const markerPersisted =
+    markerWriteAccepted &&
     persisted?.pendingFinalDelivery === true &&
     persisted.pendingFinalDeliveryText === recoverableText;
 
