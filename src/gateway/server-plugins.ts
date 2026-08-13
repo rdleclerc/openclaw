@@ -945,6 +945,9 @@ export function loadGatewayPlugins(params: {
     runtimeOptions: {
       allowGatewaySubagentBinding: true,
     },
+    ...(pluginIds.includes("gaia-workflow-preflight") && {
+      criticalPluginIds: ["gaia-workflow-preflight"],
+    }),
     preferSetupRuntimeForChannelPlugins: params.preferSetupRuntimeForChannelPlugins,
     preferBuiltPluginArtifacts: true,
     ...(params.startupTrace !== undefined && {

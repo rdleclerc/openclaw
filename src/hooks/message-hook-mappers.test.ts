@@ -128,6 +128,36 @@ describe("message hook mappers", () => {
     expect(canonical.guildId).toBe("guild-1");
   });
 
+  it.each([
+    { label: "true", value: true },
+    { label: "false", value: false },
+    { label: "absent", value: undefined },
+  ])("preserves SenderIsBot $label across inbound projections", ({ value }) => {
+    const canonical = deriveInboundMessageHookContext(
+      makeInboundCtx(value === undefined ? {} : { SenderIsBot: value }),
+    );
+    const pluginContext = toPluginMessageContext(canonical);
+    const claimContext = toPluginInboundClaimContext(canonical);
+    const claimEvent = toPluginInboundClaimEvent(canonical);
+    const receivedEvent = toPluginMessageReceivedEvent(canonical);
+    const internalReceived = toInternalMessageReceivedContext(canonical);
+    for (const projection of [
+      canonical,
+      pluginContext,
+      claimContext,
+      claimEvent,
+      receivedEvent,
+      claimEvent.metadata,
+      receivedEvent.metadata,
+      internalReceived.metadata,
+    ]) {
+      expect(projection?.senderIsBot).toBe(value);
+      if (value === undefined) {
+        expect(projection && Object.hasOwn(projection, "senderIsBot")).toBe(false);
+      }
+    }
+  });
+
   it("uses the session key as the Control UI conversation id", () => {
     const canonical = deriveInboundMessageHookContext(
       makeInboundCtx({

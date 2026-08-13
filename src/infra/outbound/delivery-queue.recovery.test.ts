@@ -1,20 +1,39 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { Worker } from "node:worker_threads";
 // Covers startup delivery recovery, backoff, permanent failures, unknown-send
 // reconciliation, commit hooks, and retry budget deferral.
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
+import { build } from "esbuild";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { completeDeliveryQueueEntry } from "../delivery-queue-sqlite.js";
 import {
   OutboundDeliveryError,
   PlatformMessageNotDispatchedError,
   type OutboundPayloadDeliveryOutcome,
 } from "./deliver-types.js";
 import { attachOutboundDeliveryCommitHook } from "./delivery-commit-hooks.js";
-import { loadPendingDeliveries } from "./delivery-queue-storage.js";
+import {
+  acquireGaiaSlackSendFence,
+  admitGaiaAcceptance,
+  admitGaiaKeyedOutput,
+  completeDelivery,
+  deriveGaiaAcceptanceId,
+  deriveGaiaKeyedOutputOwnerId,
+  inspectGaiaKeyedOutput,
+  loadPendingDeliveries,
+  moveToFailed,
+  recoverGaiaAcceptance,
+  resumeGaiaKeyedOutput,
+} from "./delivery-queue-storage.js";
 import {
   ackDelivery,
   enqueueDelivery,
+  drainPendingDeliveries,
   markDeliveryPlatformOutcomeUnknown,
   markDeliveryPlatformSendAttemptStarted,
   recoverPendingDeliveries,
@@ -63,6 +82,70 @@ function readOutboundQueueStatus(tmpDir: string, id: string): string | undefined
     .prepare("SELECT status FROM delivery_queue_entries WHERE queue_name = 'outbound' AND id = ?")
     .get(id) as { status?: string } | undefined;
   return row?.status;
+}
+
+const GAIA_ACCEPTANCE_OWNER_RACE_WORKER_SOURCE = `
+  import { DatabaseSync } from "node:sqlite";
+  import { pathToFileURL } from "node:url";
+  import { parentPort, workerData } from "node:worker_threads";
+
+  const state = await import(pathToFileURL(workerData.bundlePath).href);
+  state.openOpenClawStateDatabase({
+    env: { ...process.env, OPENCLAW_STATE_DIR: workerData.stateDir },
+  });
+  const originalExec = DatabaseSync.prototype.exec;
+  DatabaseSync.prototype.exec = function (sql) {
+    const result = originalExec.call(this, sql);
+    if (sql === "BEGIN IMMEDIATE") {
+      parentPort.postMessage({ type: "begun" });
+      Atomics.wait(new Int32Array(workerData.beginBarrier), 0, 0);
+    }
+    return result;
+  };
+  const storage = state;
+  parentPort.postMessage({ type: "ready" });
+  await new Promise((resolve) => parentPort.once("message", resolve));
+  parentPort.postMessage({ type: "attempting" });
+  try {
+    const result = workerData.role === "refresh"
+      ? storage.admitGaiaAcceptance(workerData.accepted, workerData.stateDir)
+      : await storage.admitGaiaKeyedOutput(workerData.params, workerData.stateDir);
+    parentPort.postMessage({ type: "settled", ok: true, result });
+  } catch (error) {
+    parentPort.postMessage({
+      type: "settled",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    state.closeOpenClawStateDatabaseForTest();
+  }
+`;
+
+function waitForGaiaRaceWorkerMessage(
+  worker: Worker,
+  type: string,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (message: Record<string, unknown>) => {
+      if (message?.type !== type) {
+        return;
+      }
+      cleanup();
+      resolve(message);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+    };
+    worker.on("message", onMessage);
+    worker.once("error", onError);
+  });
 }
 
 describe("delivery-queue recovery", () => {
@@ -700,31 +783,30 @@ describe("delivery-queue recovery", () => {
     });
   });
 
-  it("moves started entries without reconciliation to failed instead of blindly replaying", async () => {
+  it("dead-letters an ordinary row after durable not-sent permanent failure", async () => {
     const id = await enqueueDelivery(
-      { channel: "demo-channel-a", to: "+1", payloads: [{ text: "not yet sent" }] },
+      { channel: "demo-channel-a", to: "+1", payloads: [{ text: "permanent" }] },
       tmpDir(),
     );
-    setQueuedEntryState(tmpDir(), id, {
-      retryCount: 0,
-      platformSendStartedAt: Date.now(),
-      recoveryState: "send_attempt_started",
+    const reconcileUnknownSend = vi.fn().mockResolvedValue({ status: "not_sent" });
+    resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+      durableFinal: {
+        capabilities: { reconcileUnknownSend: true },
+        reconcileUnknownSend,
+      },
     });
-
-    const deliver = vi.fn().mockResolvedValue([]);
+    const error = "No conversation reference found for C123";
+    const deliver = vi.fn(async () => {
+      await markDeliveryPlatformSendAttemptStarted(id, tmpDir());
+      throw new Error(error);
+    });
     const log = createRecoveryLog();
     const { result } = await runRecovery({ deliver, log });
 
-    expect(deliver).not.toHaveBeenCalled();
-    expect(result).toEqual({
-      recovered: 0,
-      failed: 1,
-      skippedMaxRetries: 0,
-      deferredBackoff: 0,
-    });
+    expect(result).toMatchObject({ recovered: 0, failed: 1 });
     expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
     expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
-    expectMockMessageContaining(log.warn, "refusing blind replay without adapter reconciliation");
+    expectMockMessageContaining(log.warn, "permanent error");
   });
 
   it("replays started entries only after adapter proves they were not sent", async () => {
@@ -752,20 +834,15 @@ describe("delivery-queue recovery", () => {
       cfg: baseCfg,
       allowBootstrap: true,
     });
-    const deliverInput = mockCallArg(deliver) as {
-      channel?: string;
-      to?: string;
-      skipQueue?: boolean;
-    };
-    expect(deliverInput.channel).toBe("demo-channel-a");
-    expect(deliverInput.to).toBe("+1");
-    expect(deliverInput.skipQueue).toBe(true);
+    expect(deliver).not.toHaveBeenCalled();
     expect(result).toEqual({
-      recovered: 1,
-      failed: 0,
+      recovered: 0,
+      failed: 1,
       skippedMaxRetries: 0,
       deferredBackoff: 0,
     });
+    setQueuedEntryState(tmpDir(), id, { retryCount: 1, lastAttemptAt: Date.now() - 60_000 });
+    expect((await runRecovery({ deliver })).result).toMatchObject({ recovered: 1, failed: 0 });
     expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
   });
 
@@ -794,6 +871,17 @@ describe("delivery-queue recovery", () => {
             replyToId: "root-message",
           },
         },
+        gaiaKeyedOutput: {
+          version: "gaia-slack-output-v1",
+          accepted: {
+            runId: "request-1",
+            sessionKey: "agent:gaia:slack:channel:C123",
+            agentId: "gaia",
+            acceptedAt: 1_700_000_000_000,
+            receiptPluginId: "gaia-workflow-preflight",
+          },
+          fingerprint: "fingerprint-1",
+        },
       },
       tmpDir(),
     );
@@ -807,7 +895,7 @@ describe("delivery-queue recovery", () => {
     messageSentHookMock.runMessageSent.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
-          order.push("message_sent");
+          order.push(`message_sent:${readOutboundQueueStatus(tmpDir(), id)}`);
           releaseReceipt = resolve;
         }),
     );
@@ -907,7 +995,8 @@ describe("delivery-queue recovery", () => {
       }),
       { requiredPluginId: "gaia-workflow-preflight" },
     );
-    expect(order).toEqual(["message_sent", "afterCommit"]);
+    expect(order).toEqual(["message_sent:pending", "afterCommit"]);
+    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("completed");
     expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
     expect(auditEvents).toHaveLength(1);
     expect(auditEvents[0]).toMatchObject({
@@ -1753,6 +1842,1038 @@ describe("delivery-queue recovery", () => {
       deferredBackoff: 0,
     });
     expect(deliver).not.toHaveBeenCalled();
+  });
+
+  describe("Gaia keyed output ownership", () => {
+    const accepted = (runId = "accepted-run-1") => ({
+      runId,
+      sessionKey: "agent:gaia:slack:channel:C123",
+      agentId: "gaia",
+      acceptedAt: 1_700_000_000_000,
+      receiptPluginId: "gaia-workflow-preflight" as const,
+    });
+    const gaiaParams = (text: string, runId = "accepted-run-1") => ({
+      accepted: accepted(runId),
+      channel: "slack" as const,
+      to: "C123",
+      accountId: "acct-1",
+      payloads: [{ text }],
+      queuePolicy: "required" as const,
+    });
+    const persistAcceptance = (runId: string, stateDir = tmpDir()) => {
+      const result = admitGaiaAcceptance(accepted(runId), stateDir);
+      if (result.status !== "accepted") {
+        throw new Error(`expected durable acceptance for ${runId}`);
+      }
+    };
+
+    it("fails closed when durable acceptance is absent", async () => {
+      const params = gaiaParams("absent", "absent-acceptance-run");
+
+      await expect(admitGaiaKeyedOutput(params, tmpDir())).rejects.toThrow(
+        "matching durable acceptance row",
+      );
+      expect(
+        readOutboundQueueStatus(tmpDir(), deriveGaiaKeyedOutputOwnerId(params.accepted.runId)),
+      ).toBeUndefined();
+    });
+
+    it("fails closed when durable acceptance evidence is corrupt", async () => {
+      const stateDir = tmpDir();
+      const envelope = accepted("corrupt-acceptance-run");
+      const acceptanceId = deriveGaiaAcceptanceId(envelope.runId);
+      persistAcceptance(envelope.runId, stateDir);
+      const { db } = openOpenClawStateDatabase({
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      });
+      db.prepare(
+        "UPDATE delivery_queue_entries SET entry_json = ? WHERE queue_name = 'gaia-acceptance' AND id = ?",
+      ).run("{", acceptanceId);
+
+      await expect(
+        admitGaiaKeyedOutput(
+          { ...gaiaParams("corrupt", envelope.runId), accepted: envelope },
+          stateDir,
+        ),
+      ).rejects.toThrow("corrupt durable acceptance evidence");
+      expect(
+        recoverGaiaAcceptance(
+          {
+            runId: envelope.runId,
+            sessionKey: envelope.sessionKey,
+            agentId: envelope.agentId,
+            receiptPluginId: envelope.receiptPluginId,
+          },
+          stateDir,
+        ),
+      ).toEqual({ status: "corrupt" });
+      expect(readOutboundQueueStatus(stateDir, deriveGaiaKeyedOutputOwnerId(envelope.runId))).toBe(
+        undefined,
+      );
+    });
+
+    it("keeps mismatched durable acceptance evidence out of owner admission", async () => {
+      const stateDir = tmpDir();
+      const requested = accepted("mismatched-acceptance-run");
+      const stored = { ...requested, sessionKey: "agent:gaia:slack:channel:OTHER" };
+      expect(admitGaiaAcceptance(stored, stateDir)).toEqual({
+        status: "accepted",
+        accepted: stored,
+      });
+
+      await expect(
+        admitGaiaKeyedOutput(
+          { ...gaiaParams("mismatched", requested.runId), accepted: requested },
+          stateDir,
+        ),
+      ).resolves.toMatchObject({
+        status: "conflict",
+        ownerId: deriveGaiaKeyedOutputOwnerId(requested.runId),
+      });
+      expect(readOutboundQueueStatus(stateDir, deriveGaiaKeyedOutputOwnerId(requested.runId))).toBe(
+        undefined,
+      );
+    });
+
+    it("persists exact acceptance tuples, refreshes before ownership, and retains authority", async () => {
+      const initial = accepted("acceptance-run");
+      const acceptanceId = deriveGaiaAcceptanceId(initial.runId);
+      expect(acceptanceId).not.toBe(deriveGaiaKeyedOutputOwnerId(initial.runId));
+      expect(admitGaiaAcceptance(initial, tmpDir())).toEqual({
+        status: "accepted",
+        accepted: initial,
+      });
+
+      const { db } = openOpenClawStateDatabase({
+        env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() },
+      });
+      const row = db
+        .prepare("SELECT queue_name, status, entry_json FROM delivery_queue_entries WHERE id = ?")
+        .get(acceptanceId) as { queue_name: string; status: string; entry_json: string };
+      expect(row.queue_name).toBe("gaia-acceptance");
+      expect(row.status).toBe("completed");
+      const persisted = JSON.parse(row.entry_json) as {
+        gaiaAcceptance: Record<string, unknown>;
+      };
+      expect(Object.keys(persisted.gaiaAcceptance).toSorted()).toEqual([
+        "acceptedAt",
+        "agentId",
+        "receiptPluginId",
+        "runId",
+        "sessionKey",
+      ]);
+      expect(persisted.gaiaAcceptance).toEqual(initial);
+
+      const refreshed = { ...initial, acceptedAt: initial.acceptedAt + 1 };
+      expect(admitGaiaAcceptance(refreshed, tmpDir())).toEqual({
+        status: "accepted",
+        accepted: refreshed,
+      });
+      expect(
+        recoverGaiaAcceptance(
+          {
+            runId: initial.runId,
+            sessionKey: initial.sessionKey,
+            agentId: initial.agentId,
+            receiptPluginId: initial.receiptPluginId,
+          },
+          tmpDir(),
+        ),
+      ).toEqual({ status: "found", accepted: refreshed });
+      expect(
+        admitGaiaAcceptance(
+          { ...refreshed, sessionKey: "agent:gaia:slack:channel:OTHER" },
+          tmpDir(),
+        ),
+      ).toEqual(expect.objectContaining({ status: "conflict" }));
+      expect(
+        recoverGaiaAcceptance(
+          {
+            runId: initial.runId,
+            sessionKey: "agent:gaia:slack:channel:OTHER",
+            agentId: initial.agentId,
+            receiptPluginId: initial.receiptPluginId,
+          },
+          tmpDir(),
+        ),
+      ).toEqual({ status: "mismatch" });
+      expect(
+        recoverGaiaAcceptance(
+          {
+            runId: "missing-acceptance-run",
+            sessionKey: initial.sessionKey,
+            agentId: initial.agentId,
+            receiptPluginId: initial.receiptPluginId,
+          },
+          tmpDir(),
+        ),
+      ).toEqual({ status: "absent" });
+
+      const owner = await admitGaiaKeyedOutput(
+        { ...gaiaParams("owner", initial.runId), accepted: refreshed },
+        tmpDir(),
+      );
+      expect(
+        admitGaiaAcceptance({ ...refreshed, acceptedAt: refreshed.acceptedAt + 1 }, tmpDir()),
+      ).toEqual(expect.objectContaining({ status: "conflict" }));
+
+      db.prepare(
+        "UPDATE delivery_queue_entries SET enqueued_at = ? WHERE queue_name = 'gaia-acceptance' AND id = ?",
+      ).run(Date.now() - 31 * 24 * 60 * 60 * 1000, acceptanceId);
+      completeDeliveryQueueEntry("gaia-acceptance", acceptanceId, tmpDir());
+      expect(
+        recoverGaiaAcceptance(
+          {
+            runId: initial.runId,
+            sessionKey: initial.sessionKey,
+            agentId: initial.agentId,
+            receiptPluginId: initial.receiptPluginId,
+          },
+          tmpDir(),
+        ),
+      ).toEqual({ status: "found", accepted: refreshed });
+      expect((await loadPendingDeliveries(tmpDir())).map((entry) => entry.id)).toEqual([
+        owner.ownerId,
+      ]);
+    });
+
+    it("serializes acceptance refresh and owner admission in both orderings", async () => {
+      const repoRoot = process.cwd();
+      const storageModulePath = path.resolve(
+        repoRoot,
+        "src/infra/outbound/delivery-queue-storage.ts",
+      );
+      const stateModulePath = path.resolve(repoRoot, "src/state/openclaw-state-db.ts");
+      const workerBundle = await build({
+        bundle: true,
+        format: "esm",
+        platform: "node",
+        target: "node22",
+        write: false,
+        stdin: {
+          contents: [
+            `export * from ${JSON.stringify(storageModulePath)};`,
+            `export { closeOpenClawStateDatabaseForTest, openOpenClawStateDatabase } from ${JSON.stringify(stateModulePath)};`,
+          ].join("\n"),
+          resolveDir: repoRoot,
+          sourcefile: "gaia-acceptance-owner-race-entry.ts",
+        },
+        plugins: [
+          {
+            name: "openclaw-normalization-core-source",
+            setup(esbuild) {
+              esbuild.onResolve(
+                { filter: /^@openclaw\/normalization-core(?:\/.*)?$/ },
+                ({ path: importPath }) => {
+                  const subpath =
+                    importPath === "@openclaw/normalization-core"
+                      ? "index"
+                      : importPath.slice("@openclaw/normalization-core/".length);
+                  return {
+                    path: path.resolve(
+                      repoRoot,
+                      "packages/normalization-core/src",
+                      `${subpath}.ts`,
+                    ),
+                  };
+                },
+              );
+            },
+          },
+        ],
+      });
+      const bundlePath = path.join(tmpDir(), "gaia-acceptance-owner-race-worker.mjs");
+      fs.writeFileSync(bundlePath, Buffer.from(workerBundle.outputFiles[0].contents));
+      const orders = ["refresh-first", "owner-first"] as const;
+
+      for (const order of orders) {
+        const stateDir = path.join(tmpDir(), `gaia-acceptance-owner-${order}`);
+        fs.mkdirSync(stateDir, { recursive: true });
+        const initial = { ...accepted(`race-${order}`), acceptedAt: 1_700_000_000_100 };
+        const refreshed = { ...initial, acceptedAt: initial.acceptedAt + 100 };
+        expect(admitGaiaAcceptance(initial, stateDir)).toEqual({
+          status: "accepted",
+          accepted: initial,
+        });
+
+        const refreshBarrier = new SharedArrayBuffer(4);
+        const ownerBarrier = new SharedArrayBuffer(4);
+        const workerData = {
+          bundlePath,
+          stateDir,
+        };
+        const refreshWorker = new Worker(GAIA_ACCEPTANCE_OWNER_RACE_WORKER_SOURCE, {
+          eval: true,
+          workerData: {
+            ...workerData,
+            role: "refresh",
+            accepted: refreshed,
+            beginBarrier: refreshBarrier,
+          },
+        });
+        const ownerWorker = new Worker(GAIA_ACCEPTANCE_OWNER_RACE_WORKER_SOURCE, {
+          eval: true,
+          workerData: {
+            ...workerData,
+            role: "owner",
+            params: { ...gaiaParams("race-owner", initial.runId), accepted: initial },
+            beginBarrier: ownerBarrier,
+          },
+        });
+
+        const refreshReady = waitForGaiaRaceWorkerMessage(refreshWorker, "ready");
+        const ownerReady = waitForGaiaRaceWorkerMessage(ownerWorker, "ready");
+        const refreshAttempting = waitForGaiaRaceWorkerMessage(refreshWorker, "attempting");
+        const ownerAttempting = waitForGaiaRaceWorkerMessage(ownerWorker, "attempting");
+        const refreshBegun = waitForGaiaRaceWorkerMessage(refreshWorker, "begun");
+        const ownerBegun = waitForGaiaRaceWorkerMessage(ownerWorker, "begun");
+        const refreshSettled = waitForGaiaRaceWorkerMessage(refreshWorker, "settled");
+        const ownerSettled = waitForGaiaRaceWorkerMessage(ownerWorker, "settled");
+        const release = (barrier: SharedArrayBuffer): void => {
+          const view = new Int32Array(barrier);
+          Atomics.store(view, 0, 1);
+          Atomics.notify(view, 0);
+        };
+
+        try {
+          await Promise.all([refreshReady, ownerReady]);
+          const firstWorker = order === "refresh-first" ? refreshWorker : ownerWorker;
+          const secondWorker = order === "refresh-first" ? ownerWorker : refreshWorker;
+          const firstBarrier = order === "refresh-first" ? refreshBarrier : ownerBarrier;
+          const secondBarrier = order === "refresh-first" ? ownerBarrier : refreshBarrier;
+          const firstAttempting = order === "refresh-first" ? refreshAttempting : ownerAttempting;
+          const secondAttempting = order === "refresh-first" ? ownerAttempting : refreshAttempting;
+          const firstBegun = order === "refresh-first" ? refreshBegun : ownerBegun;
+          const secondBegun = order === "refresh-first" ? ownerBegun : refreshBegun;
+
+          firstWorker.postMessage("go");
+          await firstAttempting;
+          await firstBegun;
+          secondWorker.postMessage("go");
+          await secondAttempting;
+          release(firstBarrier);
+          await secondBegun;
+          release(secondBarrier);
+
+          const [refreshMessage, ownerMessage] = await Promise.all([refreshSettled, ownerSettled]);
+          expect(refreshMessage.ok).toBe(true);
+          expect(ownerMessage.ok).toBe(true);
+          const refreshResult = refreshMessage.result as { status: string };
+          const ownerResult = ownerMessage.result as {
+            status: string;
+            entry: { gaiaKeyedOutput?: { accepted?: { acceptedAt?: number } } };
+          };
+          expect(refreshResult.status).toBe(order === "refresh-first" ? "accepted" : "conflict");
+          expect(ownerResult.status).toBe("new");
+
+          const persisted = recoverGaiaAcceptance(
+            {
+              runId: initial.runId,
+              sessionKey: initial.sessionKey,
+              agentId: initial.agentId,
+              receiptPluginId: initial.receiptPluginId,
+            },
+            stateDir,
+          );
+          expect(persisted.status).toBe("found");
+          if (persisted.status !== "found") {
+            throw new Error("expected the acceptance row to persist");
+          }
+          expect(persisted.accepted).toEqual(order === "refresh-first" ? refreshed : initial);
+
+          const owner = inspectGaiaKeyedOutput(initial, stateDir);
+          expect(owner).not.toBeNull();
+          if (!owner) {
+            throw new Error("expected the keyed owner row to persist");
+          }
+          const persistedOwnerAcceptedAt = owner.entry.gaiaKeyedOutput?.accepted.acceptedAt;
+          const reportedOwnerAcceptedAt = ownerResult.entry.gaiaKeyedOutput?.accepted?.acceptedAt;
+          expect(reportedOwnerAcceptedAt).toBe(persistedOwnerAcceptedAt);
+          expect(persistedOwnerAcceptedAt).toBe(persisted.accepted.acceptedAt);
+          if (refreshResult.status === "accepted" && ownerResult.status === "new") {
+            expect(persistedOwnerAcceptedAt).toBe(persisted.accepted.acceptedAt);
+          }
+        } finally {
+          release(refreshBarrier);
+          release(ownerBarrier);
+          await Promise.all([refreshWorker.terminate(), ownerWorker.terminate()]);
+        }
+      }
+    });
+
+    it("atomically admits one owner and reports a two-payload race as conflict", async () => {
+      persistAcceptance("accepted-run-1");
+      const [first, second] = await Promise.all([
+        admitGaiaKeyedOutput(gaiaParams("first"), tmpDir()),
+        admitGaiaKeyedOutput(gaiaParams("second"), tmpDir()),
+      ]);
+
+      expect([first.status, second.status].toSorted()).toEqual(["conflict", "new"]);
+      const owner = first.status === "new" ? first : second;
+      const conflict = first.status === "conflict" ? first : second;
+      expect(owner.ownerId).toBe(deriveGaiaKeyedOutputOwnerId("accepted-run-1"));
+      expect(conflict.entry.payloads).toEqual(owner.entry.payloads);
+      await expect(admitGaiaKeyedOutput(gaiaParams("first"), tmpDir())).resolves.toMatchObject({
+        status: "duplicate",
+        ownerId: owner.ownerId,
+      });
+      expect(await loadPendingDeliveries(tmpDir())).toHaveLength(1);
+    });
+
+    it("sends a newly admitted owner through its exact durable queue row", async () => {
+      persistAcceptance("accepted-run-1");
+      const admitted = await admitGaiaKeyedOutput(gaiaParams("send"), tmpDir());
+      const deliver = vi.fn().mockResolvedValue([]);
+
+      await drainPendingDeliveries({
+        drainKey: `gaia-test:${admitted.ownerId}`,
+        logLabel: "Gaia test",
+        cfg: baseCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir(),
+        deliver: asDeliverFn(deliver),
+        selectEntry: (entry) => ({
+          match: entry.id === admitted.ownerId,
+          bypassBackoff: true,
+        }),
+      });
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(mockCallArg(deliver)).toMatchObject({
+        deliveryQueueId: admitted.ownerId,
+        payloads: [{ text: "send" }],
+        skipQueue: true,
+      });
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("completed");
+    });
+
+    it.each(["pending", "completed", "failed"] as const)(
+      "does not mutate a %s Gaia winner when stale recovery loses the send fence",
+      async (winnerStatus) => {
+        const runId = `stale-loser-${winnerStatus}-run`;
+        persistAcceptance(runId);
+        const admitted = await admitGaiaKeyedOutput(gaiaParams("stale-loser", runId), tmpDir());
+        let winnerEntry: ReturnType<typeof readQueuedEntry> | undefined;
+        const deliver = vi.fn(async () => {
+          expect(acquireGaiaSlackSendFence(admitted.ownerId, tmpDir()).status).toBe("acquired");
+          if (winnerStatus === "completed") {
+            await completeDelivery(admitted.ownerId, tmpDir());
+          } else if (winnerStatus === "failed") {
+            await moveToFailed(admitted.ownerId, tmpDir());
+          }
+          winnerEntry = readQueuedEntry(tmpDir(), admitted.ownerId);
+          return [];
+        });
+
+        await drainPendingDeliveries({
+          drainKey: `stale-loser:${admitted.ownerId}`,
+          logLabel: "Gaia test",
+          cfg: baseCfg,
+          log: createRecoveryLog(),
+          stateDir: tmpDir(),
+          deliver: asDeliverFn(deliver),
+          selectEntry: (entry) => ({ match: entry.id === admitted.ownerId, bypassBackoff: true }),
+        });
+
+        expect(deliver).toHaveBeenCalledOnce();
+        expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe(winnerStatus);
+        expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toEqual(winnerEntry);
+        expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toMatchObject({
+          retryCount: 0,
+        });
+        if (winnerStatus === "pending") {
+          expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toMatchObject({
+            recoveryState: "send_attempt_started",
+          });
+        }
+      },
+    );
+
+    it("reconciles durable send evidence before permanent owner failure", async () => {
+      persistAcceptance("accepted-run-1");
+      const admitted = await admitGaiaKeyedOutput(gaiaParams("marked"), tmpDir());
+      const error = "No conversation reference found for C123";
+      const reconcileUnknownSend = vi.fn().mockResolvedValue({ status: "not_sent" });
+      resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+        durableFinal: {
+          capabilities: { reconcileUnknownSend: true },
+          reconcileUnknownSend,
+        },
+      });
+      const deliver = vi.fn(async () => {
+        await markDeliveryPlatformSendAttemptStarted(admitted.ownerId, tmpDir());
+        throw new Error(error);
+      });
+      const { result } = await runRecovery({ deliver });
+      const entry = readQueuedEntry(tmpDir(), admitted.ownerId);
+      expect(result).toMatchObject({ recovered: 0, failed: 1 });
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("pending");
+      expect(entry).toMatchObject({
+        lastError: "Slack durable send readback returned not_sent after the permanent send fence",
+        recoveryState: "unknown_after_send",
+        reconciliationAttemptCount: 1,
+      });
+    });
+
+    it("completes a fenced owner from exact sent readback without replay", async () => {
+      persistAcceptance("fenced-sent-run");
+      const admitted = await admitGaiaKeyedOutput(
+        gaiaParams("fenced-sent", "fenced-sent-run"),
+        tmpDir(),
+      );
+      expect(acquireGaiaSlackSendFence(admitted.ownerId, tmpDir()).status).toBe("acquired");
+      const reconcileUnknownSend = vi.fn().mockResolvedValue({
+        status: "sent",
+        messageId: "slack-sent-1",
+        receipt: {
+          primaryPlatformMessageId: "slack-sent-1",
+          platformMessageIds: ["slack-sent-1"],
+          parts: [{ platformMessageId: "slack-sent-1", kind: "text", index: 0 }],
+          sentAt: Date.now(),
+        },
+      });
+      resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+        durableFinal: { capabilities: { reconcileUnknownSend: true }, reconcileUnknownSend },
+      });
+      const deliver = vi.fn();
+
+      await runRecovery({ deliver });
+
+      expect(reconcileUnknownSend).toHaveBeenCalledOnce();
+      expect(deliver).not.toHaveBeenCalled();
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("completed");
+      expect(inspectGaiaKeyedOutput(accepted("fenced-sent-run"), tmpDir())?.status).toBe(
+        "completed",
+      );
+    });
+
+    it("serializes the SQLite Gaia fence across two child processes", async () => {
+      const stateDir = tmpDir();
+      const acceptedEnvelope = accepted("cross-process-fence-run");
+      persistAcceptance(acceptedEnvelope.runId, stateDir);
+      const admitted = await admitGaiaKeyedOutput(
+        gaiaParams("cross-process-fence", acceptedEnvelope.runId),
+        stateDir,
+      );
+      const bundle = await build({
+        bundle: true,
+        format: "esm",
+        platform: "node",
+        target: "node22",
+        write: false,
+        stdin: {
+          contents: `export * from ${JSON.stringify(
+            path.resolve(process.cwd(), "src/infra/outbound/delivery-queue-storage.ts"),
+          )};`,
+          resolveDir: process.cwd(),
+          sourcefile: "fence-storage-entry.ts",
+        },
+      });
+      const bundlePath = path.join(stateDir, "fence-storage.mjs");
+      fs.writeFileSync(bundlePath, bundle.outputFiles[0]!.contents);
+      const childScript = `
+        const { pathToFileURL } = await import('node:url');
+        const storage = await import(pathToFileURL(process.env.BUNDLE_PATH).href);
+        const result = storage.acquireGaiaSlackSendFence(process.env.OWNER_ID, process.env.STATE_DIR);
+        console.log(JSON.stringify({ type: 'fenced', status: result.status }));
+        await new Promise((resolve) => process.stdin.once('data', resolve));
+        console.log(JSON.stringify({ type: 'adapterCalls', count: result.status === 'acquired' ? 1 : 0 }));
+        storage.closeOpenClawStateDatabaseForTest();
+      `;
+      const launch = () =>
+        spawn(process.execPath, ["--input-type=module", "-e", childScript], {
+          env: {
+            ...process.env,
+            BUNDLE_PATH: bundlePath,
+            OWNER_ID: admitted.ownerId,
+            STATE_DIR: stateDir,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      const readMessage = (child: ReturnType<typeof spawn>, type: string) =>
+        new Promise<Record<string, unknown>>((resolve, reject) => {
+          let buffer = "";
+          const onData = (chunk: Buffer | string) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+            for (const line of lines) {
+              try {
+                const message = JSON.parse(line) as Record<string, unknown>;
+                if (message.type === type) {
+                  child.stdout?.off("data", onData);
+                  resolve(message);
+                  return;
+                }
+              } catch {
+                // Ignore child runtime warnings and wait for the protocol line.
+              }
+            }
+          };
+          child.stdout?.on("data", onData);
+          child.once("error", reject);
+          child.once("exit", (code) => {
+            if (code !== 0) reject(new Error(`fence child exited with ${code}`));
+          });
+        });
+      const winner = launch();
+      expect((await readMessage(winner, "fenced")).status).toBe("acquired");
+      const loser = launch();
+      expect((await readMessage(loser, "fenced")).status).toBe("owned");
+      loser.stdin.end("release\n");
+      expect((await readMessage(loser, "adapterCalls")).count).toBe(0);
+      winner.stdin.end("release\n");
+      expect((await readMessage(winner, "adapterCalls")).count).toBe(1);
+      await Promise.all([
+        new Promise<void>((resolve) => loser.once("exit", () => resolve())),
+        new Promise<void>((resolve) => winner.once("exit", () => resolve())),
+      ]);
+    });
+
+    it("converges repeated fenced unresolved and not_sent readback to ambiguous failure", async () => {
+      persistAcceptance("fenced-ambiguous-run");
+      const admitted = await admitGaiaKeyedOutput(
+        gaiaParams("fenced-ambiguous", "fenced-ambiguous-run"),
+        tmpDir(),
+      );
+      expect(acquireGaiaSlackSendFence(admitted.ownerId, tmpDir()).status).toBe("acquired");
+      const reconcileUnknownSend = vi
+        .fn()
+        .mockResolvedValue({
+          status: "unresolved",
+          error: "Slack history contains no exact durable delivery marker",
+          retryable: true,
+        })
+        .mockResolvedValueOnce({
+          status: "unresolved",
+          error: "Slack history contains no exact durable delivery marker",
+          retryable: true,
+        })
+        .mockResolvedValueOnce({
+          status: "unresolved",
+          error: "Slack history contains no exact durable delivery marker",
+          retryable: true,
+        })
+        .mockResolvedValueOnce({
+          status: "unresolved",
+          error: "Slack history contains no exact durable delivery marker",
+          retryable: true,
+        })
+        .mockResolvedValueOnce({
+          status: "unresolved",
+          error: "Slack history contains no exact durable delivery marker",
+          retryable: true,
+        })
+        .mockResolvedValueOnce({ status: "not_sent" });
+      resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+        durableFinal: { capabilities: { reconcileUnknownSend: true }, reconcileUnknownSend },
+      });
+      const deliver = vi.fn();
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+        await drainPendingDeliveries({
+          drainKey: `fenced-ambiguous:${admitted.ownerId}:${attempt}`,
+          logLabel: "Gaia test",
+          cfg: baseCfg,
+          log: createRecoveryLog(),
+          stateDir: tmpDir(),
+          deliver: asDeliverFn(deliver),
+          selectEntry: (entry) => ({ match: entry.id === admitted.ownerId, bypassBackoff: true }),
+        });
+      }
+
+      expect(reconcileUnknownSend).toHaveBeenCalledTimes(MAX_RETRIES);
+      expect(deliver).not.toHaveBeenCalled();
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("failed");
+      expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toMatchObject({
+        reconciliationAttemptCount: MAX_RETRIES,
+        recoveryState: "ambiguous_failure",
+        lastError: "Slack durable send readback returned not_sent after the permanent send fence",
+      });
+      expect(inspectGaiaKeyedOutput(accepted("fenced-ambiguous-run"), tmpDir())?.status).toBe(
+        "ambiguous_failure",
+      );
+      expect(resumeGaiaKeyedOutput(accepted("fenced-ambiguous-run"), tmpDir())?.status).toBe(
+        "ambiguous_failure",
+      );
+    });
+
+    it.each([
+      { kind: "ordinary", isGaia: false },
+      { kind: "Gaia", isGaia: true },
+    ] as const)(
+      "persists a permanent error through a delayed not_sent readback for $kind",
+      async ({ kind, isGaia }) => {
+        const error = "No conversation reference found for C123";
+        const runId = `delayed-${kind.toLowerCase()}-run`;
+        let id: string;
+        if (isGaia) {
+          persistAcceptance(runId);
+          id = (await admitGaiaKeyedOutput(gaiaParams("delayed", runId), tmpDir())).ownerId;
+        } else {
+          id = await enqueueDelivery(
+            { channel: "demo-channel-a", to: "+1", payloads: [{ text: "delayed" }] },
+            tmpDir(),
+          );
+        }
+        const reconcileUnknownSend = vi
+          .fn()
+          .mockResolvedValueOnce({
+            status: "unresolved",
+            error: "temporary readback gap",
+            retryable: true,
+          })
+          .mockResolvedValueOnce({ status: "not_sent" });
+        resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+          durableFinal: {
+            capabilities: { reconcileUnknownSend: true },
+            reconcileUnknownSend,
+          },
+        });
+        const deliver = vi.fn(async () => {
+          await markDeliveryPlatformSendAttemptStarted(id, tmpDir());
+          throw new Error(error);
+        });
+
+        const first = await runRecovery({ deliver });
+        expect(first.result).toMatchObject({ recovered: 0, failed: 1 });
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect(readQueuedEntry(tmpDir(), id)).toMatchObject({
+          pendingPermanentError: error,
+          recoveryState: isGaia ? "unknown_after_send" : "send_attempt_started",
+        });
+
+        await drainPendingDeliveries({
+          drainKey: `delayed-permanent:${id}`,
+          logLabel: "Delayed permanent test",
+          cfg: baseCfg,
+          log: createRecoveryLog(),
+          stateDir: tmpDir(),
+          deliver: asDeliverFn(deliver),
+          selectEntry: (entry) => ({ match: entry.id === id, bypassBackoff: true }),
+        });
+
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect(reconcileUnknownSend).toHaveBeenCalledTimes(2);
+        if (isGaia) {
+          expect(readOutboundQueueStatus(tmpDir(), id)).toBe("pending");
+          expect(readQueuedEntry(tmpDir(), id)).toMatchObject({
+            lastError:
+              "Slack durable send readback returned not_sent after the permanent send fence",
+            pendingPermanentError: error,
+            recoveryState: "unknown_after_send",
+            reconciliationAttemptCount: 2,
+          });
+          expect(inspectGaiaKeyedOutput(accepted(runId), tmpDir())).toMatchObject({
+            status: "pending",
+            entry: { recoveryState: "unknown_after_send" },
+          });
+          expect(resumeGaiaKeyedOutput(accepted(runId), tmpDir())?.status).toBe("pending");
+        } else {
+          expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
+          expect(readQueuedEntry(tmpDir(), id)).toMatchObject({
+            lastError: error,
+            pendingPermanentError: error,
+          });
+        }
+      },
+    );
+
+    it("keeps a keyed owner permanently failed after a pre-send permanent error", async () => {
+      const acceptedEnvelope = accepted("permanent-pre-send-run");
+      persistAcceptance(acceptedEnvelope.runId);
+      const admitted = await admitGaiaKeyedOutput(
+        { ...gaiaParams("permanent", acceptedEnvelope.runId), accepted: acceptedEnvelope },
+        tmpDir(),
+      );
+      const error = "No conversation reference found for C123";
+      const deliver = vi.fn().mockRejectedValue(new Error(error));
+
+      const { result } = await runRecovery({ deliver });
+
+      expect(result).toMatchObject({ recovered: 0, failed: 1 });
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("failed");
+      expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toMatchObject({
+        lastError: error,
+        recoveryState: "permanent_pre_send_failure",
+      });
+      expect(resumeGaiaKeyedOutput(acceptedEnvelope, tmpDir())?.status).toBe("permanent_failure");
+
+      await drainPendingDeliveries({
+        drainKey: `gaia-test:${admitted.ownerId}`,
+        logLabel: "Gaia test",
+        cfg: baseCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir(),
+        deliver,
+        selectEntry: (entry) => ({ match: entry.id === admitted.ownerId, bypassBackoff: true }),
+      });
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(inspectGaiaKeyedOutput(acceptedEnvelope, tmpDir())).toMatchObject({
+        ownerId: admitted.ownerId,
+        status: "permanent_failure",
+        entry: { lastError: error, recoveryState: "permanent_pre_send_failure" },
+      });
+    });
+
+    it("retries the exact pending and failed owner rows", async () => {
+      persistAcceptance("pending-run");
+      persistAcceptance("failed-run");
+      const pending = await admitGaiaKeyedOutput(gaiaParams("pending", "pending-run"), tmpDir());
+      const failed = await admitGaiaKeyedOutput(gaiaParams("failed", "failed-run"), tmpDir());
+      await moveToFailed(failed.ownerId, tmpDir());
+
+      expect(resumeGaiaKeyedOutput(accepted("pending-run"), tmpDir())?.status).toBe("pending");
+      expect(resumeGaiaKeyedOutput(accepted("failed-run"), tmpDir())?.status).toBe("pending");
+
+      const deliver = vi.fn().mockResolvedValue([]);
+      for (const ownerId of [pending.ownerId, failed.ownerId]) {
+        await drainPendingDeliveries({
+          drainKey: `gaia-test:${ownerId}`,
+          logLabel: "Gaia test",
+          cfg: baseCfg,
+          log: createRecoveryLog(),
+          stateDir: tmpDir(),
+          deliver: asDeliverFn(deliver),
+          selectEntry: (entry) => ({
+            match: entry.id === ownerId,
+            bypassBackoff: true,
+          }),
+        });
+      }
+
+      expect(deliver.mock.calls.map(([params]) => params.deliveryQueueId)).toEqual([
+        pending.ownerId,
+        failed.ownerId,
+      ]);
+      expect(readOutboundQueueStatus(tmpDir(), pending.ownerId)).toBe("completed");
+      expect(readOutboundQueueStatus(tmpDir(), failed.ownerId)).toBe("completed");
+    });
+
+    it("resets an exhausted pre-send retry budget without changing the owner", async () => {
+      const acceptedEnvelope = accepted("retry-reset-run");
+      persistAcceptance(acceptedEnvelope.runId);
+      const admitted = await admitGaiaKeyedOutput(
+        { ...gaiaParams("retry-reset", acceptedEnvelope.runId), accepted: acceptedEnvelope },
+        tmpDir(),
+      );
+      const lastAttemptAt = Date.now() - 60_000;
+      setQueuedEntryState(tmpDir(), admitted.ownerId, {
+        retryCount: MAX_RETRIES,
+        reconciliationAttemptCount: 4,
+        lastAttemptAt,
+        lastError: "pre-send retry budget exhausted",
+      });
+
+      const exhausted = vi.fn();
+      const exhaustedRecovery = await runRecovery({ deliver: exhausted });
+      expect(exhaustedRecovery.result).toMatchObject({ skippedMaxRetries: 1 });
+      expect(exhausted).not.toHaveBeenCalled();
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("failed");
+
+      const resumed = resumeGaiaKeyedOutput(acceptedEnvelope, tmpDir());
+      expect(resumed).toMatchObject({
+        ownerId: admitted.ownerId,
+        status: "pending",
+        entry: {
+          retryCount: 0,
+          reconciliationAttemptCount: 4,
+          lastAttemptAt,
+          lastError: "pre-send retry budget exhausted",
+          payloads: [{ text: "retry-reset" }],
+        },
+      });
+      expect(resumed?.entry.gaiaKeyedOutput).toEqual(admitted.entry.gaiaKeyedOutput);
+
+      const receiptCommit = vi.fn();
+      const receipt = attachOutboundDeliveryCommitHook(
+        { channel: "slack", messageId: "retry-reset-receipt" },
+        receiptCommit,
+      );
+      const deliver = vi.fn().mockResolvedValue([receipt]);
+      const recovered = await runRecovery({ deliver });
+
+      expect(recovered.result).toMatchObject({ recovered: 1, failed: 0 });
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(receiptCommit).toHaveBeenCalledOnce();
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("completed");
+
+      const repeated = await runRecovery({ deliver });
+      expect(repeated.result).toMatchObject({ recovered: 0, failed: 0 });
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(inspectGaiaKeyedOutput(acceptedEnvelope, tmpDir())?.status).toBe("completed");
+    });
+
+    it("does not double-send concurrent duplicate owner drains", async () => {
+      persistAcceptance("accepted-run-1");
+      const [first, duplicate] = await Promise.all([
+        admitGaiaKeyedOutput(gaiaParams("same"), tmpDir()),
+        admitGaiaKeyedOutput(gaiaParams("same"), tmpDir()),
+      ]);
+      expect([first.status, duplicate.status].toSorted()).toEqual(["duplicate", "new"]);
+      const ownerId = first.ownerId;
+      let release!: () => void;
+      let startDelivery!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startDelivery = resolve;
+      });
+      const deliver = vi.fn(async () => {
+        startDelivery();
+        await new Promise<void>((next) => {
+          release = next;
+        });
+        return [];
+      });
+      const firstDrain = drainPendingDeliveries({
+        drainKey: `gaia-test:${ownerId}`,
+        logLabel: "Gaia test",
+        cfg: baseCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir(),
+        deliver: asDeliverFn(deliver),
+        selectEntry: (entry) => ({
+          match: entry.id === ownerId,
+          bypassBackoff: true,
+        }),
+      });
+      await started;
+      const duplicateDeliver = vi.fn().mockResolvedValue([]);
+      const secondDrain = drainPendingDeliveries({
+        drainKey: `gaia-test:${ownerId}`,
+        logLabel: "Gaia test",
+        cfg: baseCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir(),
+        deliver: asDeliverFn(duplicateDeliver),
+        selectEntry: (entry) => ({
+          match: entry.id === ownerId,
+          bypassBackoff: true,
+        }),
+      });
+      await secondDrain;
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(duplicateDeliver).not.toHaveBeenCalled();
+      release();
+      await firstDrain;
+      expect(readOutboundQueueStatus(tmpDir(), ownerId)).toBe("completed");
+    });
+
+    it("restarts inspection and resume from the durable owner row", async () => {
+      persistAcceptance("accepted-run-1");
+      const admitted = await admitGaiaKeyedOutput(gaiaParams("restart"), tmpDir());
+      expect(inspectGaiaKeyedOutput(accepted(), tmpDir())).toMatchObject({
+        ownerId: admitted.ownerId,
+        status: "pending",
+      });
+      expect(resumeGaiaKeyedOutput(accepted(), tmpDir())).toMatchObject({
+        ownerId: admitted.ownerId,
+        status: "pending",
+        entry: { payloads: [{ text: "restart" }] },
+      });
+
+      await completeDelivery(admitted.ownerId, tmpDir());
+      expect(resumeGaiaKeyedOutput(accepted(), tmpDir())).toMatchObject({
+        ownerId: admitted.ownerId,
+        status: "completed",
+        entry: { gaiaKeyedOutput: { fingerprint: admitted.fingerprint } },
+      });
+    });
+
+    it("does not overwrite an unreadable Gaia owner during completion", async () => {
+      persistAcceptance("corrupt-owner-run");
+      const admitted = await admitGaiaKeyedOutput(
+        gaiaParams("corrupt-owner", "corrupt-owner-run"),
+        tmpDir(),
+      );
+      const { db } = openOpenClawStateDatabase({
+        env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() },
+      });
+      db.prepare(
+        "UPDATE delivery_queue_entries SET entry_json = ? WHERE queue_name = 'outbound' AND id = ?",
+      ).run("{", admitted.ownerId);
+      expect(() => completeDeliveryQueueEntry("outbound", admitted.ownerId, tmpDir())).toThrow(
+        /No pending outbound delivery queue entry/,
+      );
+      const row = db
+        .prepare(
+          "SELECT status, entry_json, entry_kind FROM delivery_queue_entries WHERE queue_name = 'outbound' AND id = ?",
+        )
+        .get(admitted.ownerId) as { status: string; entry_json: string; entry_kind: string };
+      expect(row).toEqual({ status: "pending", entry_json: "{", entry_kind: "outbound" });
+    });
+
+    it("terminalizes a non-retryable Slack readback gap as ambiguous failure", async () => {
+      const acceptedEnvelope = accepted("readback-gap-run");
+      persistAcceptance(acceptedEnvelope.runId);
+      const admitted = await admitGaiaKeyedOutput(
+        gaiaParams("readback-gap", acceptedEnvelope.runId),
+        tmpDir(),
+      );
+      expect(acquireGaiaSlackSendFence(admitted.ownerId, tmpDir()).status).toBe("acquired");
+      const reconcileUnknownSend = vi.fn().mockResolvedValue({
+        status: "unresolved",
+        error: "signed Slack readback gap",
+        retryable: false,
+      });
+      resolveOutboundChannelMessageAdapterMock.mockReturnValue({
+        durableFinal: {
+          capabilities: { reconcileUnknownSend: true },
+          reconcileUnknownSend,
+        },
+      });
+
+      const { result } = await runRecovery({ deliver: vi.fn() });
+
+      expect(result).toMatchObject({ recovered: 0, failed: 1 });
+      expect(reconcileUnknownSend).toHaveBeenCalledOnce();
+      expect(readOutboundQueueStatus(tmpDir(), admitted.ownerId)).toBe("failed");
+      expect(readQueuedEntry(tmpDir(), admitted.ownerId)).toMatchObject({
+        reconciliationAttemptCount: 1,
+        recoveryState: "ambiguous_failure",
+        lastError: "signed Slack readback gap",
+      });
+      expect(inspectGaiaKeyedOutput(acceptedEnvelope, tmpDir())?.status).toBe("ambiguous_failure");
+    });
+
+    it("retains a Gaia completed-admission tombstone while another owner is live", async () => {
+      persistAcceptance("completed-run");
+      persistAcceptance("live-run");
+      const completed = await admitGaiaKeyedOutput(gaiaParams("done", "completed-run"), tmpDir());
+      const live = await admitGaiaKeyedOutput(gaiaParams("live", "live-run"), tmpDir());
+      await completeDelivery(completed.ownerId, tmpDir());
+
+      expect(inspectGaiaKeyedOutput(accepted("completed-run"), tmpDir())?.status).toBe("completed");
+      expect(inspectGaiaKeyedOutput(accepted("live-run"), tmpDir())?.status).toBe("pending");
+      expect(live.entry.gaiaKeyedOutput?.version).toBe("gaia-slack-output-v1");
+    });
+
+    it("retains keyed Gaia tombstones past a configured 31-day admission window", async () => {
+      const gaiaRetentionMs = 31 * 24 * 60 * 60 * 1000;
+      expect(gaiaRetentionMs).toBeGreaterThan(30 * 24 * 60 * 60 * 1000);
+      persistAcceptance("retention-run");
+      const completed = await admitGaiaKeyedOutput(
+        gaiaParams("retention", "retention-run"),
+        tmpDir(),
+      );
+      await completeDelivery(completed.ownerId, tmpDir());
+      const oldEnqueuedAt = Date.now() - gaiaRetentionMs - 1;
+      const { db } = openOpenClawStateDatabase({
+        env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() },
+      });
+      db.prepare(
+        "UPDATE delivery_queue_entries SET enqueued_at = ? WHERE queue_name = 'outbound' AND id = ?",
+      ).run(oldEnqueuedAt, completed.ownerId);
+
+      const ordinary = await enqueueDelivery(
+        { channel: "slack", to: "C123", payloads: [{ text: "ordinary" }] },
+        tmpDir(),
+      );
+      await completeDelivery(ordinary, tmpDir());
+
+      expect(inspectGaiaKeyedOutput(accepted("retention-run"), tmpDir())?.status).toBe("completed");
+    });
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

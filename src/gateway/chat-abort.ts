@@ -498,41 +498,110 @@ export function removeChatAbortControllerEntry(
   return true;
 }
 
+export type ExactChatAbortTarget = {
+  entry: ChatAbortControllerEntry;
+  matches: (entry: ChatAbortControllerEntry) => boolean;
+};
+
+type ChatAbortFailureReason = "no-active-run" | "target-mismatch" | "not-abortable";
+
+type ChatAbortRunResult = { aborted: true } | { aborted: false; reason?: ChatAbortFailureReason };
+
+function chatAbortFailure(
+  exactTarget: ExactChatAbortTarget | undefined,
+  reason: ChatAbortFailureReason,
+): ChatAbortRunResult {
+  return exactTarget ? { aborted: false, reason } : { aborted: false };
+}
+
 export function abortChatRunById(
   ops: ChatAbortOps,
   params: {
     runId: string;
     sessionKey: string;
     stopReason?: string;
+    /** Strict callers must mutate the exact entry they compared. */
+    exactTarget?: ExactChatAbortTarget;
   },
-): { aborted: boolean } {
+): ChatAbortRunResult {
   const { runId, sessionKey, stopReason } = params;
   const active = ops.chatAbortControllers.get(runId);
   if (!active) {
+    return chatAbortFailure(params.exactTarget, "no-active-run");
+  }
+  if (params.exactTarget) {
+    let matches = active === params.exactTarget.entry;
+    if (matches) {
+      try {
+        matches = params.exactTarget.matches(active);
+      } catch {
+        matches = false;
+      }
+    }
+    if (matches && ops.chatAbortControllers.get(runId) !== active) {
+      matches = false;
+    }
+    if (!matches) {
+      return chatAbortFailure(params.exactTarget, "target-mismatch");
+    }
+  } else if (active.sessionKey !== sessionKey) {
     return { aborted: false };
   }
-  if (active.sessionKey !== sessionKey) {
-    return { aborted: false };
+  if (params.exactTarget && active.projectSessionTerminalPersistence) {
+    return chatAbortFailure(params.exactTarget, "target-mismatch");
   }
   if (!isChatAbortControllerEntryAbortable(active)) {
-    return { aborted: false };
+    return chatAbortFailure(params.exactTarget, "not-abortable");
+  }
+  if (params.exactTarget && ops.chatAbortControllers.get(runId) !== active) {
+    return chatAbortFailure(params.exactTarget, "target-mismatch");
   }
 
   const bufferedText = ops.chatRunBuffers.get(runId);
   const partialText = bufferedText && bufferedText.trim() ? bufferedText : undefined;
-  ops.chatAbortedRuns.set(runId, createChatAbortMarker());
+  const strictTarget = params.exactTarget !== undefined;
+  let removed: ReturnType<ChatAbortOps["removeChatRun"]> | undefined;
+  const abortMarker = createChatAbortMarker();
+  const rejectStrictReplacement = () => {
+    if (ops.chatAbortedRuns.get(runId) === abortMarker) ops.chatAbortedRuns.delete(runId);
+    try {
+      active.onRemoved?.();
+    } catch {}
+    return chatAbortFailure(params.exactTarget, "target-mismatch");
+  };
+  ops.chatAbortedRuns.set(runId, abortMarker);
   if (stopReason) {
     active.abortStopReason = stopReason;
   }
   active.projectSessionActive = false;
+  if (strictTarget) {
+    active.isAbortable = () => false;
+  }
   // Reserve terminal ownership before abort listeners run; synchronous caller
   // cleanup must not erase the entry before Gateway observes the event below.
   active.projectSessionTerminalPending = true;
   active.projectSessionTerminalObservedAt = undefined;
   active.registrationCleanupRequested = true;
+  if (strictTarget) {
+    // Detach the selected owner without running its release hook before abort listeners run.
+    ops.clearChatRunState(runId);
+    if (ops.chatAbortControllers.get(runId) !== active) {
+      return chatAbortFailure(params.exactTarget, "target-mismatch");
+    }
+    ops.chatAbortControllers.delete(runId);
+    removed = ops.removeChatRun(runId, runId, sessionKey);
+  }
   active.controller.abort(createChatAbortSignalReason(stopReason));
-  ops.clearChatRunState(runId);
-  const removed = ops.removeChatRun(runId, runId, sessionKey);
+  if (strictTarget && ops.chatAbortControllers.get(runId) !== undefined) {
+    return rejectStrictReplacement();
+  }
+  if (strictTarget) {
+    ops.chatAbortControllers.set(runId, active);
+  }
+  if (!strictTarget) {
+    ops.clearChatRunState(runId);
+    removed = ops.removeChatRun(runId, runId, sessionKey);
+  }
   if (active.controlUiVisible !== false) {
     broadcastChatAborted(ops, {
       runId,
@@ -559,14 +628,25 @@ export function abortChatRunById(
       endedAt: Date.now(),
     },
   });
-  // Gateway listeners synchronously stamp the terminal observation. Keep the
-  // entry as suspension-visible ownership until its persistence write settles.
+  // Gateway listeners may synchronously stamp the terminal observation. Legacy
+  // callers retain the entry for the observed terminal cleanup path unless persistence owns it.
   if (
+    !strictTarget &&
     ops.chatAbortControllers.get(runId) === active &&
-    active.projectSessionTerminalObservedAt === undefined &&
-    !active.projectSessionTerminalPersistence
+    !active.projectSessionTerminalPersistence &&
+    active.projectSessionTerminalObservedAt === undefined
   ) {
     removeChatAbortControllerEntry(ops.chatAbortControllers, runId, active);
+  }
+  if (strictTarget) {
+    if (ops.chatAbortControllers.get(runId) !== active || active.projectSessionActive !== false) {
+      return rejectStrictReplacement();
+    }
+    ops.agentRunSeq.delete(runId);
+    if (removed?.clientRunId) {
+      ops.agentRunSeq.delete(removed.clientRunId);
+    }
+    return { aborted: true };
   }
   ops.agentRunSeq.delete(runId);
   if (removed?.clientRunId) {

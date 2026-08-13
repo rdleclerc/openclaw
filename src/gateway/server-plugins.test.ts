@@ -13,6 +13,7 @@ import type { GatewayRequestContext, GatewayRequestOptions } from "./server-meth
 
 const loadOpenClawPlugins = vi.hoisted(() => vi.fn());
 const clearActivatedPluginRuntimeState = vi.hoisted(() => vi.fn());
+const GAIA_PLUGIN_ID = "gaia-workflow-preflight";
 const loadPluginLookUpTable = vi.hoisted(() =>
   vi.fn(() => ({
     startup: {
@@ -452,6 +453,32 @@ describe("loadGatewayPlugins", () => {
       "[plugins] failed to load plugin: boom (plugin=telegram, source=/tmp/telegram/index.ts)",
     );
     expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  test("names only Gaia as critical in the gateway startup plugin scope", () => {
+    loadOpenClawPlugins.mockReturnValue(createRegistry([]));
+    loadGatewayPluginsForTest({ pluginIds: [GAIA_PLUGIN_ID, "telegram"] });
+
+    expect(getLastPluginLoadOption("criticalPluginIds")).toEqual([GAIA_PLUGIN_ID]);
+  });
+
+  test("does not name unrelated gateway plugins as critical when Gaia is absent", () => {
+    loadOpenClawPlugins.mockReturnValue(createRegistry([]));
+    loadGatewayPluginsForTest({ pluginIds: ["telegram"] });
+
+    expect(getLastPluginLoadOption("criticalPluginIds")).toBeUndefined();
+  });
+
+  test("propagates gateway plugin load failures before channel binding priming", () => {
+    const failure = new Error("plugin load failed");
+    loadOpenClawPlugins.mockImplementation(() => {
+      throw failure;
+    });
+
+    expect(() => loadGatewayStartupPluginsForTest({ pluginIds: [GAIA_PLUGIN_ID] })).toThrow(
+      failure,
+    );
+    expect(primeConfiguredBindingRegistry).not.toHaveBeenCalled();
   });
 
   test("loads only gateway startup plugin ids", () => {

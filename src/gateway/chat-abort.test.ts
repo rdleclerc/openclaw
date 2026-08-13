@@ -341,6 +341,67 @@ describe("abortChatRunById", () => {
     }
   });
 
+  it("does not report strict success when persistence retains the selected entry", () => {
+    const { runId, sessionKey, entry, ops } = createAbortRunFixture({});
+    entry.projectSessionTerminalPersistence = Promise.resolve();
+
+    const result = abortChatRunById(ops, {
+      runId,
+      sessionKey,
+      stopReason: "user",
+      exactTarget: {
+        entry,
+        matches: (candidate) => candidate === entry,
+      },
+    });
+
+    expect(result).toEqual({ aborted: false, reason: "target-mismatch" });
+    expect(entry.controller.signal.aborted).toBe(false);
+    expect(ops.chatAbortControllers.get(runId)).toBe(entry);
+    expect(ops.removeChatRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["abort", "broadcast"] as const)(
+    "does not report strict success when %s installs a same-run replacement",
+    (installAt) => {
+      const { runId, sessionKey, entry, ops } = createAbortRunFixture({});
+      const replacement = createActiveEntry(sessionKey);
+      const onRemoved = vi.fn();
+      entry.onRemoved = onRemoved;
+      const installReplacement = () => {
+        ops.chatAbortControllers.set(runId, replacement);
+        ops.chatRunBuffers.set(runId, "replacement-buffer");
+      };
+      if (installAt === "abort")
+        entry.controller.signal.addEventListener("abort", installReplacement);
+      else ops.broadcast.mockImplementation(installReplacement);
+      ops.agentRunSeq.set(runId, 7);
+
+      const result = abortChatRunById(ops, {
+        runId,
+        sessionKey,
+        stopReason: "user",
+        exactTarget: {
+          entry,
+          matches: (candidate) => candidate === entry,
+        },
+      });
+
+      expect(result).toEqual({ aborted: false, reason: "target-mismatch" });
+      expect(entry.controller.signal.aborted).toBe(true);
+      expect(replacement.controller.signal.aborted).toBe(false);
+      expect(ops.chatAbortControllers.get(runId)).toBe(replacement);
+      expect(onRemoved).toHaveBeenCalledOnce();
+      expect({
+        buffer: ops.chatRunBuffers.get(runId),
+        sequence: ops.agentRunSeq.get(runId),
+        marker: ops.chatAbortedRuns.has(runId),
+      }).toEqual({ buffer: "replacement-buffer", sequence: 7, marker: false });
+      expect(ops.broadcast).toHaveBeenCalledTimes(installAt === "broadcast" ? 1 : 0);
+      expect(ops.nodeSendToSession).toHaveBeenCalledTimes(installAt === "broadcast" ? 1 : 0);
+    },
+  );
+
   it("broadcasts aborted payload with partial message when buffered text exists", () => {
     const now = new Date("2026-01-02T03:04:05.000Z");
     const { runId, sessionKey, entry, ops } = createAbortRunFixture({

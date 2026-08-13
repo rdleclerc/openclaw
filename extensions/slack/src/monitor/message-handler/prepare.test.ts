@@ -1289,8 +1289,33 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     expect(prepared.ctxPayload.SenderIsBot).toBe(true);
   });
 
-  it("omits SenderIsBot for human messages", async () => {
-    const prepared = await prepareWithDefaultCtx(createSlackMessage({ text: "hello" }));
+  it("projects raw human messages as non-bot without using outer app identity", async () => {
+    const prepared = await prepareWithDefaultCtx({
+      ...createSlackMessage({ text: "hello", user: "U123" }),
+      api_app_id: "A_OUTER_ONLY",
+    } as SlackMessageEvent);
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.SenderIsBot).toBe(false);
+  });
+
+  it.each([
+    ["bot profile", { bot_profile: { id: "B123" } }],
+    ["bot subtype", { subtype: "bot_message" }],
+    ["message app id", { app_id: "A123" }],
+    ["message app name", { app_name: "Deployments" }],
+  ] as const)("projects %s as bot author evidence", async (_label, evidence) => {
+    const prepared = await prepareWithDefaultCtx(createSlackMessage({ user: "U123", ...evidence }));
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.SenderIsBot).toBe(true);
+  });
+
+  it("omits SenderIsBot when the message author is unknown", async () => {
+    const prepared = await prepareWithDefaultCtx({
+      ...createSlackMessage({ text: "hello", user: "unknown-author" }),
+      api_app_id: "A_OUTER_ONLY",
+    } as SlackMessageEvent);
 
     assertPrepared(prepared);
     expect(prepared.ctxPayload.SenderIsBot).toBeUndefined();

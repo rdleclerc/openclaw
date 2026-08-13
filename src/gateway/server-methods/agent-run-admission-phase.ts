@@ -7,9 +7,19 @@ import {
 } from "../../agents/embedded-agent-runner/runs.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
+import { resolveStateDir } from "../../config/paths.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { claimAgentRunContext } from "../../infra/agent-events.js";
+import { claimAgentRunContext, clearAgentRunContext } from "../../infra/agent-events.js";
+import {
+  admitGaiaAcceptance as admitGaiaAcceptanceToStore,
+  type GaiaAcceptedEnvelope,
+} from "../../infra/outbound/delivery-queue-storage.js";
+import {
+  bindGaiaAcceptedEnvelope,
+  getPluginRuntimeGatewayRequestScope,
+} from "../../plugins/runtime/gateway-request-scope.js";
+import { normalizeAgentId } from "../../routing/session-key.js";
 import type { InputProvenance } from "../../sessions/input-provenance.js";
 import type { SessionWorkAdmissionLease } from "../../sessions/session-lifecycle-admission.js";
 import { normalizeDeliveryContext } from "../../utils/delivery-context.shared.js";
@@ -44,6 +54,73 @@ export type PreparedAgentRunDispatch = {
   resolvedThreadId?: string | number;
   dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
 };
+
+export type AgentRunAcceptedResponse = {
+  runId: string;
+  sessionKey?: string;
+  status: "accepted";
+  acceptedAt: number;
+  agentId?: string;
+  receiptPluginId?: "gaia-workflow-preflight";
+};
+
+/** Build the host-owned acceptance shape before it is sent or cached. */
+export function buildAgentRunAcceptedResponse(params: {
+  runId: string;
+  resolvedSessionKey?: string;
+  activeSessionAgentId: string;
+  acceptedAt: number;
+  gaiaWorkflowPreflight: boolean;
+  admissionAgentId?: string;
+}): AgentRunAcceptedResponse {
+  const accepted: AgentRunAcceptedResponse = {
+    runId: params.runId,
+    sessionKey: params.resolvedSessionKey,
+    ...(params.resolvedSessionKey === "global" ? { agentId: params.activeSessionAgentId } : {}),
+    status: "accepted",
+    acceptedAt: params.acceptedAt,
+  };
+  if (
+    params.gaiaWorkflowPreflight &&
+    params.resolvedSessionKey &&
+    params.resolvedSessionKey !== "global"
+  ) {
+    return {
+      ...accepted,
+      agentId: normalizeAgentId(params.admissionAgentId ?? params.activeSessionAgentId),
+      receiptPluginId: "gaia-workflow-preflight",
+    };
+  }
+  return accepted;
+}
+
+function compensateGaiaAdmission(params: {
+  context: GatewayRequestHandlerOptions["context"];
+  runId: string;
+  sessionKey: string;
+  lifecycleGeneration: string;
+  activeGatewayWorkAdmission: SessionWorkAdmissionLease;
+  activeRunAbort: ReturnType<typeof registerChatAbortController>;
+  chatRunRegistered: boolean;
+  runContextClaimed: boolean;
+  dedupeKeys: readonly string[];
+}): void {
+  if (params.activeRunAbort.registered) {
+    params.activeRunAbort.controller.abort();
+    params.activeRunAbort.cleanup({ force: true });
+  }
+  if (params.chatRunRegistered) {
+    params.context.clearChatRunState(params.runId);
+    params.context.removeChatRun(params.runId, params.runId, params.sessionKey);
+  }
+  if (params.runContextClaimed) {
+    clearAgentRunContext(params.runId, params.lifecycleGeneration);
+  }
+  params.activeGatewayWorkAdmission.release();
+  for (const key of params.dedupeKeys) {
+    params.context.dedupe.delete(key);
+  }
+}
 
 export async function prepareAgentRunDispatch(params: {
   request: AgentRunRequest;
@@ -86,6 +163,9 @@ export async function prepareAgentRunDispatch(params: {
   setAdmittedRunAbort: (value: ReturnType<typeof registerChatAbortController>) => void;
   getAdmittedRunAbort: () => ReturnType<typeof registerChatAbortController> | undefined;
   markAgentRunAccepted: (accepted: boolean) => void;
+  gaiaAcceptanceStateDir?: string;
+  admitGaiaAcceptance?: typeof admitGaiaAcceptanceToStore;
+  registerPluginSubagentRun?: typeof registerPluginSubagentRunFromGateway;
 }): Promise<PreparedAgentRunDispatch | undefined> {
   const preRegistrationAbort = readGatewayDedupeEntry({
     dedupe: params.context.dedupe,
@@ -172,7 +252,8 @@ export async function prepareAgentRunDispatch(params: {
             config: params.cfgForAgent ?? params.cfg,
           }),
           isAbortable: () => isEmbeddedAgentRunAbortableForRunId(params.runId),
-          onRemoved: () => clearEmbeddedAgentRunAbortabilityForRunId(params.runId),
+          onRemoved: () =>
+            clearEmbeddedAgentRunAbortabilityForRunId(params.runId, params.lifecycleGeneration),
           controlUiVisible: !params.suppressVisibleSessionEffects,
           kind: "agent",
           lifecycleGeneration: params.lifecycleGeneration,
@@ -205,6 +286,8 @@ export async function prepareAgentRunDispatch(params: {
     );
     return undefined;
   }
+  let chatRunRegistered = false;
+  let runContextClaimed = false;
   const existingRunAbort = params.context.chatAbortControllers.get(params.runId);
   if (!activeRunAbort.registered && existingRunAbort) {
     activeGatewayWorkAdmission.release();
@@ -224,6 +307,7 @@ export async function prepareAgentRunDispatch(params: {
         ...params.pendingChatRun,
         clientRunId: params.runId,
       });
+      chatRunRegistered = true;
     }
     if (params.resolvedSessionKey) {
       claimAgentRunContext(
@@ -235,11 +319,29 @@ export async function prepareAgentRunDispatch(params: {
               lifecycleGeneration: params.lifecycleGeneration,
             },
       );
+      runContextClaimed = true;
     }
   }
 
   const resolvedThreadId =
     params.delivery.explicitThreadId ?? params.delivery.deliveryPlan.resolvedThreadId;
+  const requestPluginId = getPluginRuntimeGatewayRequestScope()?.pluginId;
+  const clientPluginId = normalizeOptionalString(params.client?.internal?.pluginRuntimeOwnerId);
+  const gaiaWorkflowPreflight =
+    requestPluginId === "gaia-workflow-preflight" &&
+    (clientPluginId === undefined || clientPluginId === "gaia-workflow-preflight");
+  const admissionAgentId = params.admissionAgentId();
+  const gaiaSessionKey = normalizeOptionalString(params.resolvedSessionKey);
+  const gaiaAcceptedEnvelope: GaiaAcceptedEnvelope | undefined =
+    gaiaWorkflowPreflight && gaiaSessionKey && gaiaSessionKey !== "global"
+      ? {
+          runId: params.runId.trim(),
+          sessionKey: gaiaSessionKey,
+          agentId: normalizeAgentId(admissionAgentId ?? params.activeSessionAgentId),
+          acceptedAt: Date.now(),
+          receiptPluginId: "gaia-workflow-preflight",
+        }
+      : undefined;
   const taskTrackingMode = resolveGatewayAgentTaskTrackingMode({
     client: params.client,
     sessionKey: params.resolvedSessionKey,
@@ -254,12 +356,12 @@ export async function prepareAgentRunDispatch(params: {
   });
   let dispatchTaskTrackingMode: PreparedAgentRunDispatch["dispatchTaskTrackingMode"] =
     taskTrackingMode === "cli" ? "cli" : "none";
-  if (taskTrackingMode === "plugin_subagent" && params.resolvedSessionKey) {
+  const registerPluginSubagentRun = async () => {
     try {
-      await registerPluginSubagentRunFromGateway({
+      await (params.registerPluginSubagentRun ?? registerPluginSubagentRunFromGateway)({
         cfg: params.cfg,
         runId: params.runId,
-        childSessionKey: params.resolvedSessionKey,
+        childSessionKey: params.resolvedSessionKey ?? "",
         task: params.request.message.trim(),
         requesterOrigin: normalizeDeliveryContext({
           channel: params.delivery.resolvedChannel,
@@ -270,19 +372,71 @@ export async function prepareAgentRunDispatch(params: {
         pluginId: normalizeOptionalString(params.client?.internal?.pluginRuntimeOwnerId),
       });
     } catch (err) {
+      if (gaiaAcceptedEnvelope) {
+        throw err;
+      }
       params.context.logGateway.warn(
         `failed to register plugin subagent run ${params.runId}; falling back to cli task tracking: ${formatForLog(err)}`,
       );
       dispatchTaskTrackingMode = "cli";
     }
-  }
-  const accepted = {
-    runId: params.runId,
-    sessionKey: params.resolvedSessionKey,
-    ...(params.resolvedSessionKey === "global" ? { agentId: params.activeSessionAgentId } : {}),
-    status: "accepted" as const,
-    acceptedAt: Date.now(),
   };
+  // Gaia subagent rows are authority, so create them only after durable acceptance.
+  if (
+    taskTrackingMode === "plugin_subagent" &&
+    params.resolvedSessionKey &&
+    !gaiaAcceptedEnvelope
+  ) {
+    await registerPluginSubagentRun();
+  }
+  let accepted: AgentRunAcceptedResponse;
+  if (gaiaAcceptedEnvelope) {
+    try {
+      const admission = (params.admitGaiaAcceptance ?? admitGaiaAcceptanceToStore)(
+        gaiaAcceptedEnvelope,
+        params.gaiaAcceptanceStateDir ?? resolveStateDir(),
+      );
+      if (admission.status === "conflict") {
+        throw new Error(admission.reason);
+      }
+      bindGaiaAcceptedEnvelope(admission.accepted);
+      if (taskTrackingMode === "plugin_subagent" && params.resolvedSessionKey) {
+        await registerPluginSubagentRun();
+      }
+      accepted = buildAgentRunAcceptedResponse({
+        runId: admission.accepted.runId,
+        resolvedSessionKey: admission.accepted.sessionKey,
+        activeSessionAgentId: params.activeSessionAgentId,
+        acceptedAt: admission.accepted.acceptedAt,
+        gaiaWorkflowPreflight: true,
+        admissionAgentId: admission.accepted.agentId,
+      });
+    } catch (err) {
+      compensateGaiaAdmission({
+        context: params.context,
+        runId: params.runId,
+        sessionKey: params.resolvedSessionKey ?? gaiaAcceptedEnvelope.sessionKey,
+        lifecycleGeneration: params.lifecycleGeneration,
+        activeGatewayWorkAdmission,
+        activeRunAbort,
+        chatRunRegistered,
+        runContextClaimed,
+        dedupeKeys: params.agentDedupeKeys,
+      });
+      params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+      return undefined;
+    }
+  } else {
+    const acceptedAt = Date.now();
+    accepted = buildAgentRunAcceptedResponse({
+      runId: params.runId,
+      resolvedSessionKey: params.resolvedSessionKey,
+      activeSessionAgentId: params.activeSessionAgentId,
+      acceptedAt,
+      gaiaWorkflowPreflight,
+      admissionAgentId,
+    });
+  }
   params.markAgentRunAccepted(true);
   setGatewayDedupeEntries({
     dedupe: params.context.dedupe,

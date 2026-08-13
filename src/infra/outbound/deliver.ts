@@ -43,6 +43,11 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { resolveAgentScopedOutboundMediaAccess } from "../../media/read-capability.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import {
+  getPluginRuntimeGatewayRequestScope,
+  readGaiaAcceptedEnvelope,
+  type GaiaHostAcceptedEnvelope,
+} from "../../plugins/runtime/gateway-request-scope.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import { isProvenDeliveryNotSentError } from "../delivery-recovery.shared.js";
 import { diagnosticErrorCategory } from "../diagnostic-error-metadata.js";
@@ -67,6 +72,15 @@ import {
   runOutboundDeliveryCommitHooks,
   type OutboundDeliveryCommitHook,
 } from "./delivery-commit-hooks.js";
+import {
+  acquireGaiaSlackSendFence,
+  admitGaiaKeyedOutput,
+  completeDelivery,
+  deriveGaiaKeyedOutputOwnerId,
+  fingerprintGaiaKeyedOutput,
+  inspectGaiaKeyedOutput,
+  type GaiaKeyedOutputOwner,
+} from "./delivery-queue-storage.js";
 import {
   ackDelivery,
   enqueueDelivery,
@@ -754,6 +768,8 @@ type DeliverOutboundPayloadsCoreParams = {
   requiredUnknownSendReconciliation?: boolean;
   /** @internal Caller preflight explicitly required provider unknown-send reconciliation. */
   requireUnknownSendReconciliation?: boolean;
+  /** @internal Persisted Gaia owner used only by exact crash recovery. */
+  gaiaKeyedOutput?: GaiaKeyedOutputOwner;
   /** @internal Refresh durable timing before recipient-visible or finalizing platform I/O. */
   onPlatformSendDispatch?: () => Promise<void>;
   /** Session/agent context used for hooks and media local-root scoping. */
@@ -784,6 +800,115 @@ export type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & 
   renderedBatchPlan?: QueuedRenderedMessageBatchPlan;
   onDeliveryIntent?: (intent: OutboundDeliveryIntent) => void;
 };
+
+type GaiaOutputMode = "live" | "recovery";
+
+class GaiaSendFenceNotAcquiredError extends Error {
+  readonly noSend = true;
+
+  constructor(status: string) {
+    super(`Gaia Slack send fence was not acquired (${status})`);
+    this.name = "GaiaSendFenceNotAcquiredError";
+  }
+}
+
+function isGaiaSendFenceNotAcquiredError(err: unknown): boolean {
+  return (
+    err instanceof GaiaSendFenceNotAcquiredError ||
+    (err instanceof OutboundDeliveryError && err.cause instanceof GaiaSendFenceNotAcquiredError)
+  );
+}
+
+function sameGaiaAcceptedEnvelope(
+  left: GaiaHostAcceptedEnvelope | undefined,
+  right: GaiaHostAcceptedEnvelope,
+): boolean {
+  return Boolean(
+    left &&
+    left.runId === right.runId &&
+    left.sessionKey === right.sessionKey &&
+    left.agentId === right.agentId &&
+    left.acceptedAt === right.acceptedAt &&
+    left.receiptPluginId === right.receiptPluginId,
+  );
+}
+
+function matchesGaiaRecoveryOwner(
+  params: DeliverOutboundPayloadsParams,
+  expectedAccepted?: GaiaHostAcceptedEnvelope,
+): boolean {
+  const owner = params.gaiaKeyedOutput;
+  if (
+    !owner ||
+    owner.version !== "gaia-slack-output-v1" ||
+    params.channel !== "slack" ||
+    !params.deliveryQueueId ||
+    params.deliveryQueueId !== deriveGaiaKeyedOutputOwnerId(owner.accepted.runId)
+  ) {
+    return false;
+  }
+  const accepted = owner.accepted;
+  const inspection = inspectGaiaKeyedOutput(accepted, params.deliveryQueueStateDir);
+  const fingerprint = fingerprintGaiaKeyedOutput(params);
+  return (
+    (!expectedAccepted || sameGaiaAcceptedEnvelope(accepted, expectedAccepted)) &&
+    params.replyPayloadSendingHook?.runId === accepted.runId &&
+    params.replyPayloadSendingHook.sessionKey === accepted.sessionKey &&
+    params.replyPayloadSendingHook.messageSentReceiptPluginId === accepted.receiptPluginId &&
+    inspection?.status === "pending" &&
+    inspection.entry.gaiaKeyedOutput?.fingerprint === fingerprint &&
+    owner.fingerprint === fingerprint
+  );
+}
+
+function resolveGaiaOutputMode(
+  params: DeliverOutboundPayloadsParams,
+  requestScope: ReturnType<typeof getPluginRuntimeGatewayRequestScope>,
+  hostAcceptedEnvelope: GaiaHostAcceptedEnvelope | undefined,
+): GaiaOutputMode | undefined {
+  if (!hostAcceptedEnvelope) {
+    if (params.gaiaKeyedOutput) {
+      if (!params.skipQueue || !matchesGaiaRecoveryOwner(params)) {
+        throw new Error("Gaia keyed recovery requires the exact persisted owner and receipt hook.");
+      }
+      return "recovery";
+    }
+    return undefined;
+  }
+
+  const reject = (reason: string): never => {
+    throw new Error(`Gaia host-accepted output rejected: ${reason}.`);
+  };
+  if (requestScope?.pluginId !== "gaia-workflow-preflight" || !requestScope.context) {
+    reject("the exact gaia-workflow-preflight gateway request scope is required");
+  }
+  if (params.channel !== "slack") {
+    reject("the accepted envelope is valid only for Slack output");
+  }
+  const hook = params.replyPayloadSendingHook;
+  if (!hook) {
+    reject("the exact receipt hook is missing");
+  }
+  if (hook.runId !== hostAcceptedEnvelope.runId) {
+    reject("the receipt hook run does not match the accepted run");
+  }
+  if (hook.sessionKey !== hostAcceptedEnvelope.sessionKey) {
+    reject("the receipt hook session does not match the accepted session");
+  }
+  if (hook.messageSentReceiptPluginId !== hostAcceptedEnvelope.receiptPluginId) {
+    reject("the receipt hook owner does not match the accepted receipt plugin");
+  }
+  if (params.deliveryQueueId !== undefined && !params.skipQueue) {
+    reject("a caller-supplied queue owner is not permitted");
+  }
+  if (params.skipQueue) {
+    if (!matchesGaiaRecoveryOwner(params, hostAcceptedEnvelope)) {
+      reject("skipQueue is reserved for the exact persisted recovery owner");
+    }
+    return "recovery";
+  }
+  return "live";
+}
 
 type MessageSentEvent = {
   success: boolean;
@@ -1372,6 +1497,9 @@ export async function deliverOutboundPayloadsInternal(
 ): Promise<OutboundDeliveryResult[]> {
   const auditStartedAt = Date.now();
   const { channel, to, payloads } = params;
+  const requestScope = getPluginRuntimeGatewayRequestScope();
+  const hostAcceptedEnvelope = readGaiaAcceptedEnvelope();
+  const gaiaOutputMode = resolveGaiaOutputMode(params, requestScope, hostAcceptedEnvelope);
   const emitPreQueueFailure = (): void => {
     // Recovery owns the stable queue terminal for replayed intents.
     if (params.deliveryQueueId !== undefined) {
@@ -1415,38 +1543,80 @@ export async function deliverOutboundPayloadsInternal(
     ? createRenderedMessageBatchPlan(queuePayloads)
     : renderedBatchPlan;
 
+  const gaiaKeyedOutputAdmission =
+    gaiaOutputMode === "live"
+      ? await admitGaiaKeyedOutput({
+          accepted: hostAcceptedEnvelope!,
+          channel,
+          to,
+          accountId: params.accountId,
+          queuePolicy,
+          requireUnknownSendReconciliation: params.requireUnknownSendReconciliation,
+          payloads: queuePayloads,
+          renderedBatchPlan: queueRenderedBatchPlan,
+          threadId: params.threadId,
+          replyToId: params.replyToId,
+          replyToMode: params.replyToMode,
+          formatting: params.formatting,
+          identity: params.identity,
+          bestEffort: params.bestEffort,
+          gifPlayback: params.gifPlayback,
+          forceDocument: params.forceDocument,
+          replyPayloadSendingHook: params.replyPayloadSendingHook,
+          silent: params.silent,
+          mirror: params.mirror,
+          session: params.session,
+          gatewayClientScopes: params.gatewayClientScopes,
+        }).catch((err: unknown) => {
+          if (gaiaOutputMode === "live" || queuePolicy === "required") {
+            emitPreQueueFailure();
+            throw err;
+          }
+          return null;
+        })
+      : undefined;
+  if (gaiaKeyedOutputAdmission?.status === "conflict") {
+    throw new Error(
+      `Gaia keyed output owner conflict for accepted run ${hostAcceptedEnvelope?.runId ?? ""}.`,
+    );
+  }
+  if (gaiaKeyedOutputAdmission?.status === "duplicate") {
+    return [];
+  }
   // Invocation authority is not queued; recovery must re-enter delegated after restart.
   // Write-ahead delivery queue: persist before sending, remove after success.
   const queueId = params.skipQueue
     ? null
-    : await enqueueDelivery({
-        channel,
-        to,
-        accountId: params.accountId,
-        queuePolicy,
-        requireUnknownSendReconciliation: params.requireUnknownSendReconciliation,
-        payloads: queuePayloads,
-        renderedBatchPlan: queueRenderedBatchPlan,
-        threadId: params.threadId,
-        replyToId: params.replyToId,
-        replyToMode: params.replyToMode,
-        formatting: params.formatting,
-        identity: params.identity,
-        bestEffort: params.bestEffort,
-        gifPlayback: params.gifPlayback,
-        forceDocument: params.forceDocument,
-        replyPayloadSendingHook: params.replyPayloadSendingHook,
-        silent: params.silent,
-        mirror: params.mirror,
-        session: params.session,
-        gatewayClientScopes: params.gatewayClientScopes,
-      }).catch((err: unknown) => {
-        if (queuePolicy === "required") {
-          emitPreQueueFailure();
-          throw err;
-        }
-        return null;
-      }); // Best-effort delivery falls back to direct send if the queue write fails.
+    : gaiaKeyedOutputAdmission?.status === "new"
+      ? gaiaKeyedOutputAdmission.ownerId
+      : await enqueueDelivery({
+          channel,
+          to,
+          accountId: params.accountId,
+          queuePolicy,
+          requireUnknownSendReconciliation: params.requireUnknownSendReconciliation,
+          payloads: queuePayloads,
+          renderedBatchPlan: queueRenderedBatchPlan,
+          threadId: params.threadId,
+          replyToId: params.replyToId,
+          replyToMode: params.replyToMode,
+          formatting: params.formatting,
+          identity: params.identity,
+          bestEffort: params.bestEffort,
+          gifPlayback: params.gifPlayback,
+          forceDocument: params.forceDocument,
+          replyPayloadSendingHook: params.replyPayloadSendingHook,
+          silent: params.silent,
+          mirror: params.mirror,
+          session: params.session,
+          gatewayClientScopes: params.gatewayClientScopes,
+        }).catch((err: unknown) => {
+          if (queuePolicy === "required") {
+            emitPreQueueFailure();
+            throw err;
+          }
+          return null;
+        }); // Best-effort delivery falls back to direct send if the queue write fails.
 
   if (queueId) {
     params.onDeliveryIntent?.({
@@ -1459,13 +1629,18 @@ export async function deliverOutboundPayloadsInternal(
   }
 
   if (!queueId) {
-    return await deliverOutboundPayloadsWithQueueCleanup(params, null, auditStartedAt);
+    return await deliverOutboundPayloadsWithQueueCleanup(
+      params,
+      null,
+      auditStartedAt,
+      gaiaOutputMode,
+    );
   }
 
   // Hold the same in-process claim used by recovery/drain while the live send
   // owns this queue entry.
   const claimResult = await withActiveDeliveryClaim(queueId, () =>
-    deliverOutboundPayloadsWithQueueCleanup(params, queueId, auditStartedAt),
+    deliverOutboundPayloadsWithQueueCleanup(params, queueId, auditStartedAt, gaiaOutputMode),
   );
   if (claimResult.status === "claimed-by-other-owner") {
     return [];
@@ -1477,6 +1652,7 @@ async function deliverOutboundPayloadsWithQueueCleanup(
   params: DeliverOutboundPayloadsParams,
   queueId: string | null,
   auditStartedAt: number,
+  gaiaOutputMode?: GaiaOutputMode,
 ): Promise<OutboundDeliveryResult[]> {
   // Wrap onError to detect partial failures under bestEffort mode.
   // When bestEffort is true, per-payload errors are caught and passed to onError
@@ -1494,6 +1670,11 @@ async function deliverOutboundPayloadsWithQueueCleanup(
   const platformQueueId = queueId ?? params.deliveryQueueId;
   const platformQueuePolicy = queueId ? queuePolicy : (params.queuePolicy ?? "required");
   const platformQueueStateDir = queueId ? undefined : params.deliveryQueueStateDir;
+  const isGaiaSlackFence =
+    params.channel === "slack" && (gaiaOutputMode === "live" || gaiaOutputMode === "recovery");
+  const ownsGaiaKeyedOutput = queueId !== null && gaiaOutputMode === "live";
+  const completeQueuedDelivery = (id: string): Promise<void> =>
+    ownsGaiaKeyedOutput ? completeDelivery(id) : ackDelivery(id);
   const exactReconciliationRequired =
     params.requireUnknownSendReconciliation === true && platformQueueId !== undefined;
   const failClosed = exactReconciliationRequired;
@@ -1537,7 +1718,18 @@ async function deliverOutboundPayloadsWithQueueCleanup(
     requiredUnknownSendReconciliation: exactReconciliationRequired,
     onPlatformSendStart: async (route) => {
       platformSendRoute = route;
-      if (platformQueueId && !exactReconciliationRequired && queuedPreSendState === undefined) {
+      if (platformQueueId && isGaiaSlackFence && queuedPreSendState === undefined) {
+        const fence = acquireGaiaSlackSendFence(platformQueueId, platformQueueStateDir, route);
+        if (fence.status !== "acquired") {
+          throw new GaiaSendFenceNotAcquiredError(fence.status);
+        }
+        queuedPreSendState = "marked";
+      } else if (
+        platformQueueId &&
+        !isGaiaSlackFence &&
+        !exactReconciliationRequired &&
+        queuedPreSendState === undefined
+      ) {
         queuedPreSendState = await persistQueuedPreSendState({
           queueId: platformQueueId,
           queuePolicy: platformQueuePolicy,
@@ -1551,7 +1743,7 @@ async function deliverOutboundPayloadsWithQueueCleanup(
       await params.onPlatformSendStart?.(route);
     },
     onPlatformSendDispatch: async () => {
-      if (platformQueueId && queuedPreSendState !== "acked") {
+      if (platformQueueId && !isGaiaSlackFence && queuedPreSendState !== "acked") {
         try {
           await markDeliveryPlatformSendDispatched(
             platformQueueId,
@@ -1670,7 +1862,7 @@ async function deliverOutboundPayloadsWithQueueCleanup(
             ? true
             : postSendState === "failed"
               ? false
-              : await ackDelivery(queueId)
+              : await completeQueuedDelivery(queueId)
                   .then(() => true)
                   .catch(async (err: unknown) => {
                     const hasSendEvidence =
@@ -1718,12 +1910,17 @@ async function deliverOutboundPayloadsWithQueueCleanup(
     }
     return results;
   } catch (err) {
+    if (isGaiaSendFenceNotAcquiredError(err)) {
+      // A losing live/recovery caller has no delivery ownership. In particular,
+      // do not turn the winner's durable send evidence into a retry or failure.
+      return [];
+    }
     if (err instanceof OutboundDeliveryError && err.results.length > 0) {
       deliveredResults = err.results;
     }
     if (queueId) {
       if (isDeliveryAbortError(err) && !failClosed) {
-        const acked = await ackDelivery(queueId)
+        const acked = await completeQueuedDelivery(queueId)
           .then(() => true)
           .catch(() => false);
         if (acked) {
@@ -2539,6 +2736,12 @@ async function deliverOutboundPayloadsCore(
         messageId: lastMessageId,
       });
     } catch (err) {
+      if (isGaiaSendFenceNotAcquiredError(err)) {
+        // This caller lost durable send ownership before adapter entry. Do not
+        // publish a failed payload outcome that recovery could apply to the
+        // winner's row.
+        throw err;
+      }
       // A rejected adapter has no final return to reconcile with its progress
       // results. Keep the results, but never match them to a later payload.
       reportedResults = [];

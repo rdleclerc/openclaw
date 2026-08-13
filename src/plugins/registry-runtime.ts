@@ -1,7 +1,18 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeOptionalAgentRuntimeId } from "../agents/agent-runtime-id.js";
+import type { ReplyPayload } from "../auto-reply/types.js";
 import { createChannelIngressQueue } from "../channels/message/ingress-queue.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import {
+  admitGaiaKeyedOutput,
+  recoverGaiaAcceptance,
+  type GaiaAcceptedEnvelope,
+  type GaiaAcceptanceSelector,
+  type GaiaKeyedOutputDeliveryParams,
+  inspectGaiaKeyedOutput,
+  resumeGaiaKeyedOutput,
+} from "../infra/outbound/delivery-queue-storage.js";
+import { drainPendingDeliveries } from "../plugin-sdk/delivery-queue-runtime.js";
 import {
   createPluginStateKeyedStore,
   createPluginStateSyncKeyedStore,
@@ -16,6 +27,9 @@ import {
 import type { PluginRegistryState } from "./registry-state.js";
 import type { PluginRecord } from "./registry-types.js";
 import {
+  assertGaiaWorkflowPreflightPluginScope,
+  getPluginRuntimeGatewayRequestScope,
+  readGaiaAcceptedEnvelope,
   withPluginRuntimePluginIdScope,
   withPluginRuntimePluginScope,
 } from "./runtime/gateway-request-scope.js";
@@ -49,10 +63,253 @@ const PLUGIN_GATEWAY_GLOBAL_SESSION_MUTATION_METHODS = new Set([
   "sessions.groups.rename",
 ]);
 
+type GaiaCanonicalOutputTarget = {
+  channel: string;
+  accountId?: string;
+  destination: string;
+  replyId?: string;
+  threadId?: string;
+};
+
+type GaiaCanonicalOutputRequest = {
+  accepted: GaiaAcceptedEnvelope;
+  target: GaiaCanonicalOutputTarget;
+  payload: ReplyPayload;
+};
+
+const GAIA_ACCEPTED_ENVELOPE_KEYS = [
+  "acceptedAt",
+  "agentId",
+  "receiptPluginId",
+  "runId",
+  "sessionKey",
+];
+const GAIA_ACCEPTANCE_SELECTOR_KEYS = ["agentId", "receiptPluginId", "runId", "sessionKey"];
+const GAIA_OUTPUT_REQUEST_KEYS = ["accepted", "payload", "target"];
+const GAIA_OUTPUT_TARGET_KEYS = ["accountId", "channel", "destination", "replyId", "threadId"];
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).toSorted();
+  const expected = keys.toSorted();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function normalizeGaiaAcceptedEnvelope(value: unknown): GaiaAcceptedEnvelope {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !hasExactKeys(value as Record<string, unknown>, GAIA_ACCEPTED_ENVELOPE_KEYS)
+  ) {
+    throw new Error("Gaia keyed output requires an exact accepted envelope.");
+  }
+  const record = value as Record<string, unknown>;
+  const runId = typeof record.runId === "string" ? record.runId.trim() : "";
+  const sessionKey = typeof record.sessionKey === "string" ? record.sessionKey.trim() : "";
+  const agentId = typeof record.agentId === "string" ? record.agentId.trim().toLowerCase() : "";
+  if (
+    !runId ||
+    !sessionKey ||
+    !agentId ||
+    typeof record.acceptedAt !== "number" ||
+    !Number.isSafeInteger(record.acceptedAt) ||
+    record.acceptedAt <= 0 ||
+    record.receiptPluginId !== "gaia-workflow-preflight"
+  ) {
+    throw new Error("Gaia keyed output accepted envelope is invalid.");
+  }
+  return {
+    runId,
+    sessionKey,
+    agentId,
+    acceptedAt: record.acceptedAt,
+    receiptPluginId: "gaia-workflow-preflight",
+  };
+}
+
+function sameGaiaAcceptedEnvelope(
+  left: GaiaAcceptedEnvelope | undefined,
+  right: GaiaAcceptedEnvelope,
+): boolean {
+  return Boolean(
+    left &&
+    left.runId === right.runId &&
+    left.sessionKey === right.sessionKey &&
+    left.agentId === right.agentId &&
+    left.acceptedAt === right.acceptedAt &&
+    left.receiptPluginId === right.receiptPluginId,
+  );
+}
+
+function normalizeGaiaAcceptanceSelector(value: unknown): GaiaAcceptanceSelector {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !hasExactKeys(value as Record<string, unknown>, GAIA_ACCEPTANCE_SELECTOR_KEYS)
+  ) {
+    throw new Error("Gaia keyed output recovery requires the complete acceptance selector.");
+  }
+  const record = value as Record<string, unknown>;
+  const runId = typeof record.runId === "string" ? record.runId.trim() : "";
+  const sessionKey = typeof record.sessionKey === "string" ? record.sessionKey.trim() : "";
+  const agentId = typeof record.agentId === "string" ? record.agentId.trim().toLowerCase() : "";
+  if (!runId || !sessionKey || !agentId || record.receiptPluginId !== "gaia-workflow-preflight") {
+    throw new Error("Gaia keyed output recovery selector is invalid.");
+  }
+  return {
+    runId,
+    sessionKey,
+    agentId,
+    receiptPluginId: "gaia-workflow-preflight",
+  };
+}
+
+function requireGaiaAcceptedEnvelope(
+  accepted: GaiaAcceptedEnvelope,
+  stateDir: string,
+): GaiaAcceptedEnvelope {
+  const hostAccepted = readGaiaAcceptedEnvelope();
+  if (hostAccepted) {
+    if (!sameGaiaAcceptedEnvelope(hostAccepted, accepted)) {
+      throw new Error(
+        "Gaia keyed output accepted envelope must match the current host acceptance.",
+      );
+    }
+  }
+
+  const recovered = recoverGaiaAcceptance(
+    {
+      runId: accepted.runId,
+      sessionKey: accepted.sessionKey,
+      agentId: accepted.agentId,
+      receiptPluginId: accepted.receiptPluginId,
+    },
+    stateDir,
+  );
+  if (recovered.status === "found") {
+    if (!sameGaiaAcceptedEnvelope(recovered.accepted, accepted)) {
+      throw new Error("Gaia keyed output accepted envelope must match the durable acceptance row.");
+    }
+    return recovered.accepted;
+  }
+  if (recovered.status === "corrupt") {
+    throw new Error(
+      "Gaia keyed output requires valid durable acceptance; the stored evidence is corrupt.",
+    );
+  }
+  if (recovered.status === "mismatch") {
+    throw new Error(
+      "Gaia keyed output accepted envelope does not match durable acceptance evidence.",
+    );
+  }
+  if (!getPluginRuntimeGatewayRequestScope()?.context) {
+    throw new Error("Gaia keyed output requires a gateway request scope.");
+  }
+  throw new Error("Gaia keyed output requires a matching durable acceptance row.");
+}
+
+function normalizeGaiaCanonicalOutputRequest(value: unknown): GaiaCanonicalOutputRequest {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !hasExactKeys(value as Record<string, unknown>, GAIA_OUTPUT_REQUEST_KEYS)
+  ) {
+    throw new Error("Gaia keyed output accepts only { accepted, target, payload }.");
+  }
+  const record = value as Record<string, unknown>;
+  const accepted = normalizeGaiaAcceptedEnvelope(record.accepted);
+  if (
+    !record.target ||
+    typeof record.target !== "object" ||
+    Array.isArray(record.target) ||
+    !hasExactKeys(record.target as Record<string, unknown>, GAIA_OUTPUT_TARGET_KEYS)
+  ) {
+    throw new Error("Gaia keyed output target is invalid.");
+  }
+  if (!record.payload || typeof record.payload !== "object" || Array.isArray(record.payload)) {
+    throw new Error("Gaia keyed output payload is invalid.");
+  }
+  const targetRecord = record.target as Record<string, unknown>;
+  const channel =
+    typeof targetRecord.channel === "string" ? targetRecord.channel.trim().toLowerCase() : "";
+  const destination =
+    typeof targetRecord.destination === "string" ? targetRecord.destination.trim() : "";
+  const accountId = typeof targetRecord.accountId === "string" ? targetRecord.accountId.trim() : "";
+  const replyId = typeof targetRecord.replyId === "string" ? targetRecord.replyId.trim() : "";
+  const threadId = typeof targetRecord.threadId === "string" ? targetRecord.threadId.trim() : "";
+  if (channel !== "slack" || !destination) {
+    throw new Error("Gaia keyed output target must identify a Slack destination.");
+  }
+  return {
+    accepted,
+    target: {
+      channel,
+      accountId: accountId || "default",
+      destination,
+      replyId,
+      threadId,
+    },
+    payload: record.payload as ReplyPayload,
+  };
+}
+
+function toGaiaKeyedOutputDeliveryParams(
+  request: GaiaCanonicalOutputRequest,
+): GaiaKeyedOutputDeliveryParams {
+  const { accepted, target, payload } = request;
+  return {
+    accepted,
+    channel: "slack",
+    to: target.destination,
+    accountId: target.accountId,
+    queuePolicy: "required",
+    requireUnknownSendReconciliation: true,
+    payloads: [payload],
+    threadId: target.threadId || null,
+    replyToId: target.replyId || null,
+    replyPayloadSendingHook: {
+      kind: "final",
+      channel: "slack",
+      sessionKey: accepted.sessionKey,
+      runId: accepted.runId,
+      messageSentReceiptPluginId: accepted.receiptPluginId,
+      context: {
+        channelId: target.destination,
+        accountId: target.accountId,
+        conversationId: target.destination,
+        messageId: target.replyId || undefined,
+        replyToId: target.replyId || undefined,
+        threadId: target.threadId || undefined,
+        sessionKey: accepted.sessionKey,
+        runId: accepted.runId,
+      } as never,
+    },
+  };
+}
+
 export function createPluginRuntimeResolver(state: PluginRegistryState) {
   const { registry, registryParams } = state;
   const pluginRuntimeById = new Map<string, PluginRuntime>();
   const pluginRuntimeRecordById = new Map<string, PluginRecord>();
+
+  const wakeGaiaKeyedOutput = async (ownerId: string, stateDir: string): Promise<void> => {
+    await drainPendingDeliveries({
+      drainKey: `gaia-keyed-output:${ownerId}`,
+      logLabel: "Gaia keyed output",
+      cfg: registryParams.runtime.config.current(),
+      log: registryParams.runtime.logging.getChildLogger({
+        plugin: "gaia-workflow-preflight",
+        component: "gaia-keyed-output",
+      }),
+      stateDir,
+      selectEntry: (entry) => ({
+        match: entry.id === ownerId,
+        bypassBackoff: true,
+      }),
+    });
+  };
 
   const addPluginRuntimeResolutionContext = (params: {
     error: unknown;
@@ -85,6 +342,7 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
     if (cached) {
       return cached;
     }
+    const runtimePluginId = pluginId;
     const resolveHarnessRegistration = (harnessId: unknown) => {
       const normalizedHarnessId = normalizeOptionalAgentRuntimeId(harnessId);
       return normalizedHarnessId
@@ -487,8 +745,74 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
             }
             return record;
           };
-          return {
-            ...baseState,
+          const assertGaiaOutputProxy = () => {
+            if (runtimePluginId !== "gaia-workflow-preflight") {
+              throw new Error(
+                "Gaia keyed output requires the exact gaia-workflow-preflight plugin scope.",
+              );
+            }
+            assertGaiaWorkflowPreflightPluginScope();
+          };
+          const gaiaOutput = {
+            submit: (params: unknown) =>
+              runWithPluginScope(async () => {
+                assertGaiaOutputProxy();
+                const request = normalizeGaiaCanonicalOutputRequest(params);
+                const stateDir = baseState.resolveStateDir();
+                const accepted = requireGaiaAcceptedEnvelope(request.accepted, stateDir);
+                const admission = await admitGaiaKeyedOutput(
+                  toGaiaKeyedOutputDeliveryParams({ ...request, accepted }),
+                  stateDir,
+                );
+                if (admission.status !== "conflict") {
+                  await wakeGaiaKeyedOutput(admission.ownerId, stateDir);
+                }
+                return admission;
+              }),
+            inspect: (accepted: unknown) =>
+              runWithPluginScope(() => {
+                assertGaiaOutputProxy();
+                const stateDir = baseState.resolveStateDir();
+                const normalizedAccepted = requireGaiaAcceptedEnvelope(
+                  normalizeGaiaAcceptedEnvelope(accepted),
+                  stateDir,
+                );
+                const inspection = inspectGaiaKeyedOutput(normalizedAccepted, stateDir);
+                return inspection ?? { status: "absent" as const };
+              }),
+            resume: (accepted: unknown) =>
+              runWithPluginScope(async () => {
+                assertGaiaOutputProxy();
+                const stateDir = baseState.resolveStateDir();
+                const normalizedAccepted = requireGaiaAcceptedEnvelope(
+                  normalizeGaiaAcceptedEnvelope(accepted),
+                  stateDir,
+                );
+                const inspection = resumeGaiaKeyedOutput(normalizedAccepted, stateDir);
+                if (
+                  inspection &&
+                  (inspection.status === "pending" || inspection.status === "failed")
+                ) {
+                  await wakeGaiaKeyedOutput(inspection.ownerId, stateDir);
+                  return (
+                    inspectGaiaKeyedOutput(normalizedAccepted, stateDir) ?? {
+                      status: "absent" as const,
+                    }
+                  );
+                }
+                return inspection ?? { status: "absent" as const };
+              }),
+            recoverAccepted: (selector: unknown) =>
+              runWithPluginScope(() => {
+                assertGaiaOutputProxy();
+                return recoverGaiaAcceptance(
+                  normalizeGaiaAcceptanceSelector(selector),
+                  baseState.resolveStateDir(),
+                );
+              }),
+          };
+          return Object.assign({}, baseState, {
+            gaiaOutput,
             openKeyedStore: <T>(options: OpenKeyedStoreOptions): PluginStateKeyedStore<T> => {
               assertPluginStateAllowed();
               return createPluginStateKeyedStore<T>(pluginId, options);
@@ -518,7 +842,7 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
                 stateDir,
               });
             },
-          } satisfies PluginRuntime["state"];
+          }) as PluginRuntime["state"];
         }
         if (prop === "config") {
           const config: PluginRuntime["config"] = getRuntimeProperty();

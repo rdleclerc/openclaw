@@ -23,6 +23,7 @@ import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 export type EmbeddedAgentQueueHandle = {
   kind?: "embedded";
   runId?: string;
+  lifecycleGeneration?: string;
   queueMessage: (text: string, options?: EmbeddedAgentQueueMessageOptions) => Promise<void>;
   isStreaming: () => boolean;
   isStopped?: () => boolean;

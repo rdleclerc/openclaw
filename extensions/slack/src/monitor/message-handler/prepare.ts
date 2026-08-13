@@ -118,6 +118,20 @@ function recordNullableString(
   return normalizeOptionalString(record[key]);
 }
 
+function resolveSlackSenderIsBot(message: SlackMessageEvent): boolean | undefined {
+  const hasBotEvidence =
+    Boolean(normalizeOptionalString(message.bot_id)) ||
+    message.bot_profile != null ||
+    message.subtype === "bot_message" ||
+    Boolean(normalizeOptionalString(message.app_id)) ||
+    Boolean(normalizeOptionalString(message.app_name));
+  if (hasBotEvidence) {
+    return true;
+  }
+  const userId = normalizeOptionalString(message.user);
+  return userId && /^[UW][A-Z0-9]+$/.test(userId) ? false : undefined;
+}
+
 function mergeSlackAssistantThreadContext(
   primary: Omit<SlackAssistantThreadContext, "updatedAt"> | undefined,
   fallback: Omit<SlackAssistantThreadContext, "updatedAt"> | undefined,
@@ -1500,7 +1514,7 @@ export async function prepareSlackMessage(params: {
       id: senderId,
       name: senderName,
       displayLabel: senderName,
-      isBot: isBotMessage || undefined,
+      isBot: resolveSlackSenderIsBot(message),
     },
     conversation: {
       kind: chatType,

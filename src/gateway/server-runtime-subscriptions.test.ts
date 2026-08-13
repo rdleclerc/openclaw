@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   emitAgentAuditEvent,
   emitAgentEvent,
+  getAgentEventLifecycleGeneration,
   resetAgentEventsForTest,
 } from "../infra/agent-events.js";
 import type { SubsystemLogger } from "../logging/subsystem.js";
@@ -15,6 +16,11 @@ import { createTaskRecord } from "../tasks/task-registry.js";
 import { getTaskRegistryObservers } from "../tasks/task-registry.store.js";
 import { resetTaskRegistryForTests } from "../tasks/task-runtime.test-helpers.js";
 import { installInMemoryTaskRegistryRuntime } from "../test-utils/task-registry-runtime.js";
+import {
+  abortChatRunById,
+  type ChatAbortControllerEntry,
+  type ChatAbortOps,
+} from "./chat-abort.js";
 import {
   createChatRunState,
   createSessionEventSubscriberRegistry,
@@ -210,6 +216,60 @@ describe("startGatewayEventSubscriptions", () => {
       "Lifecycle event dispatch failed",
       expect.objectContaining({ sessionKey: "agent:main:main" }),
     );
+  });
+
+  it("returns aborted when the real terminal subscriber attaches the exact fence", async () => {
+    const params = createParams();
+    const runId = "run-strict-subscriber";
+    const sessionKey = "agent:main:main";
+    const entry: ChatAbortControllerEntry = {
+      controller: new AbortController(),
+      sessionId: "session-strict-subscriber",
+      sessionKey,
+      lifecycleGeneration: getAgentEventLifecycleGeneration(),
+      agentId: "main",
+      startedAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+    };
+    params.chatAbortControllers.set(runId, entry);
+    const persistence = new Promise<void>((resolve) => setImmediate(resolve));
+    agentEventHandlerMocks.create.mockImplementation(
+      (options) => (event: { runId: string; ts: number }) =>
+        options.trackTrackedRunTerminalPersistence({
+          runId: event.runId,
+          clientRunId: event.runId,
+          sessionId: entry.sessionId,
+          observedAt: event.ts,
+          persistence,
+        }),
+    );
+    unsubs = startGatewayEventSubscriptions(params);
+
+    const ops: ChatAbortOps = {
+      chatAbortControllers: params.chatAbortControllers,
+      chatRunBuffers: new Map(),
+      chatAbortedRuns: new Map(),
+      clearChatRunState: vi.fn(),
+      removeChatRun: vi.fn().mockReturnValue({ sessionKey, clientRunId: runId }),
+      agentRunSeq: params.agentRunSeq,
+      broadcast: vi.fn(),
+      nodeSendToSession: vi.fn(),
+    };
+    const result = abortChatRunById(ops, {
+      runId,
+      sessionKey,
+      stopReason: "rpc",
+      exactTarget: {
+        entry,
+        matches: (candidate) => candidate.sessionKey === sessionKey && candidate.agentId === "main",
+      },
+    });
+
+    expect(entry.projectSessionTerminalObservedAt).toEqual(expect.any(Number));
+    expect(result).toEqual({ aborted: true });
+    expect(params.chatAbortControllers.get(runId)).toBe(entry);
+    await vi.waitFor(() => expect(entry.projectSessionTerminalPersistence).toBe(persistence));
+    await vi.waitFor(() => expect(params.chatAbortControllers.has(runId)).toBe(false));
   });
 
   it("broadcasts bounded public task summaries with ledger statuses", async () => {

@@ -2475,6 +2475,33 @@ describe("agent event handler", () => {
     });
   });
 
+  it("hands a cancelled lifecycle event to terminal persistence", () => {
+    const trackTrackedRunTerminalPersistence = vi.fn();
+    const { handler } = createHarness({
+      resolveSessionKeyForRun: () => "session-cancelled",
+      trackTrackedRunTerminalPersistence,
+    });
+
+    handler({
+      runId: "run-cancelled",
+      seq: 2,
+      stream: "lifecycle",
+      sessionKey: "session-cancelled",
+      sessionId: "session-cancelled",
+      ts: 2_200,
+      data: { phase: "end", status: "cancelled", aborted: true, endedAt: 2_200 },
+    });
+
+    expect(persistGatewaySessionLifecycleEventMock).toHaveBeenCalledOnce();
+    expect(trackTrackedRunTerminalPersistence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "run-cancelled",
+        sessionKey: "session-cancelled",
+        persistence: expect.any(Promise),
+      }),
+    );
+  });
+
   it("keeps live session status running while another recovery run remains", async () => {
     const restartRecoveryRuns = [
       {

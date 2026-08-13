@@ -18,6 +18,18 @@ type PluginRuntimeGatewayRequestScope = {
   gatewayMethodDispatchAllowed?: boolean;
 };
 
+type GaiaAcceptedEnvelopeStore = {
+  value?: GaiaHostAcceptedEnvelope;
+};
+
+export type GaiaHostAcceptedEnvelope = Readonly<{
+  runId: string;
+  sessionKey: string;
+  agentId: string;
+  acceptedAt: number;
+  receiptPluginId: "gaia-workflow-preflight";
+}>;
+
 type PluginRuntimePluginScope = {
   pluginId: string;
   pluginSource?: string;
@@ -36,6 +48,14 @@ const pluginRuntimeGatewayRequestScope = resolveGlobalSingleton<
   () => new AsyncLocalStorage<PluginRuntimeGatewayRequestScope>(),
 );
 
+const GAIA_ACCEPTED_ENVELOPE_STORE_KEY: unique symbol = Symbol.for(
+  "openclaw.gaiaAcceptedEnvelopeStore",
+);
+
+const gaiaAcceptedEnvelopeStore = resolveGlobalSingleton<
+  AsyncLocalStorage<GaiaAcceptedEnvelopeStore>
+>(GAIA_ACCEPTED_ENVELOPE_STORE_KEY, () => new AsyncLocalStorage<GaiaAcceptedEnvelopeStore>());
+
 /**
  * Runs plugin gateway handlers with request-scoped context that runtime helpers can read.
  */
@@ -43,7 +63,16 @@ export function withPluginRuntimeGatewayRequestScope<T>(
   scope: PluginRuntimeGatewayRequestScope,
   run: () => T,
 ): T {
-  return pluginRuntimeGatewayRequestScope.run(scope, run);
+  const current = pluginRuntimeGatewayRequestScope.getStore();
+  const requestScope: PluginRuntimeGatewayRequestScope =
+    current?.pluginId && scope.pluginId === undefined
+      ? { ...scope, pluginId: current.pluginId }
+      : scope;
+  // A gateway request is a new authority boundary. Preserve the caller's
+  // plugin identity, but never carry a prior request's accepted envelope into it.
+  return pluginRuntimeGatewayRequestScope.run(requestScope, () =>
+    gaiaAcceptedEnvelopeStore.run({}, run),
+  );
 }
 
 /**
@@ -89,4 +118,68 @@ export function getPluginRuntimeGatewayRequestScope():
   | PluginRuntimeGatewayRequestScope
   | undefined {
   return pluginRuntimeGatewayRequestScope.getStore();
+}
+
+/** Bind the host-accepted Gaia envelope to the current gateway request only. */
+export function bindGaiaAcceptedEnvelope(envelope: GaiaHostAcceptedEnvelope): void {
+  const scope = getPluginRuntimeGatewayRequestScope();
+  if (!scope?.context) {
+    throw new Error("Gaia host acceptance requires a gateway request scope.");
+  }
+  if (scope.pluginId && scope.pluginId !== "gaia-workflow-preflight") {
+    throw new Error(
+      "Gaia host acceptance requires the exact gaia-workflow-preflight plugin scope.",
+    );
+  }
+  if (
+    !envelope.runId.trim() ||
+    !envelope.sessionKey.trim() ||
+    !envelope.agentId.trim() ||
+    !Number.isSafeInteger(envelope.acceptedAt) ||
+    envelope.acceptedAt <= 0 ||
+    envelope.receiptPluginId !== "gaia-workflow-preflight"
+  ) {
+    throw new Error("Gaia host acceptance envelope is invalid.");
+  }
+  const normalized: GaiaHostAcceptedEnvelope = Object.freeze({
+    runId: envelope.runId.trim(),
+    sessionKey: envelope.sessionKey.trim(),
+    agentId: envelope.agentId.trim().toLowerCase(),
+    acceptedAt: envelope.acceptedAt,
+    receiptPluginId: "gaia-workflow-preflight",
+  });
+  const stored = gaiaAcceptedEnvelopeStore.getStore();
+  if (!stored) {
+    throw new Error("Gaia host acceptance requires a gateway request scope.");
+  }
+  const current = stored.value;
+  if (current) {
+    if (
+      current.runId !== normalized.runId ||
+      current.sessionKey !== normalized.sessionKey ||
+      current.agentId !== normalized.agentId ||
+      current.acceptedAt !== normalized.acceptedAt ||
+      current.receiptPluginId !== normalized.receiptPluginId
+    ) {
+      throw new Error("Gaia host acceptance envelope cannot be replaced.");
+    }
+    return;
+  }
+  stored.value = normalized;
+}
+
+/** Read the exact host-accepted Gaia envelope from the current Gaia request. */
+export function readGaiaAcceptedEnvelope(): GaiaHostAcceptedEnvelope | undefined {
+  return gaiaAcceptedEnvelopeStore.getStore()?.value;
+}
+
+/**
+ * Requires the exact Gaia workflow preflight plugin and gateway request scopes.
+ * Caller-supplied run IDs are not authority; the full accepted envelope remains required.
+ */
+export function assertGaiaWorkflowPreflightPluginScope(): void {
+  const scope = getPluginRuntimeGatewayRequestScope();
+  if (scope?.pluginId !== "gaia-workflow-preflight") {
+    throw new Error("Gaia keyed output requires the exact gaia-workflow-preflight plugin scope.");
+  }
 }

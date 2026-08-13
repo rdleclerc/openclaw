@@ -342,6 +342,8 @@ export const SessionsAbortParamsSchema = closedObject({
   key: Type.Optional(NonEmptyString),
   runId: Type.Optional(NonEmptyString),
   agentId: Type.Optional(NonEmptyString),
+  /** Require an exact active-run match; does not use broad abort resolution. */
+  requireExactTarget: Type.Optional(Type.Boolean()),
 });
 
 /** Mutable per-session preferences and routing metadata. */

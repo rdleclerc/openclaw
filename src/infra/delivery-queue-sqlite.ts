@@ -9,9 +9,10 @@ import {
 
 // Generic durable delivery queue storage shared by session and outbound queues.
 // Queue-specific wrappers own payload shape; this layer owns SQLite state.
-type QueueStatus = "pending" | "failed" | "completed";
+export type QueueStatus = "pending" | "failed" | "completed";
 type DeliveryQueueDatabase = Pick<OpenClawStateKyselyDatabase, "delivery_queue_entries">;
 const COMPLETED_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const NON_EVICTABLE_QUEUE_NAMES = new Set(["gaia-acceptance"]);
 
 /** Indexed metadata extracted from queue payloads for diagnostics and recovery. */
 export type DeliveryQueueRowMetadata = {
@@ -27,6 +28,17 @@ type DeliveryQueueEntryState = {
   id: string;
   enqueuedAt: number;
   retryCount: number;
+  gaiaKeyedOutput?: {
+    version: string;
+    accepted: {
+      runId: string;
+      sessionKey: string;
+      agentId: string;
+      acceptedAt: number;
+      receiptPluginId: "gaia-workflow-preflight";
+    };
+    fingerprint: string;
+  };
   acknowledgedAt?: number;
   lastAttemptAt?: number;
   lastError?: string;
@@ -38,6 +50,8 @@ type FailPendingDeliveryQueueEntryResult = { status: "failed" } | { status: "not
 
 type QueueRow = {
   id: string;
+  status: QueueStatus;
+  entry_kind: string | null;
   entry_json: string;
   enqueued_at: number | bigint;
   retry_count: number | bigint;
@@ -45,6 +59,12 @@ type QueueRow = {
   last_error: string | null;
   platform_send_started_at: number | bigint | null;
   recovery_state: string | null;
+};
+
+export type DeliveryQueueEntryRecord = {
+  status: QueueStatus;
+  entry: DeliveryQueueEntryState | null;
+  metadata: Pick<DeliveryQueueRowMetadata, "entryKind">;
 };
 
 function openStateDatabase(stateDir?: string) {
@@ -80,6 +100,17 @@ function inflate(row: QueueRow): DeliveryQueueEntryState | null {
       : { platformSendStartedAt: Number(row.platform_send_started_at) }),
     ...(row.recovery_state == null ? {} : { recoveryState: row.recovery_state }),
   };
+}
+
+function isKeyedOwnerTombstone(entryJson: string): boolean {
+  try {
+    const entry = JSON.parse(entryJson) as { gaiaKeyedOutput?: unknown };
+    return Boolean(entry.gaiaKeyedOutput);
+  } catch {
+    // Preserve unreadable completed rows. A false negative would remove an
+    // owner tombstone before its external admission retention can expire.
+    return true;
+  }
 }
 
 function metadata(entry: DeliveryQueueEntryState): DeliveryQueueRowMetadata {
@@ -211,6 +242,42 @@ export function loadDeliveryQueueEntry(
   return row ? inflate(row) : null;
 }
 
+/** Load one queue row, including completed and failed owner tombstones. */
+export function loadDeliveryQueueEntryRecord(
+  queueName: string,
+  id: string,
+  stateDir?: string,
+): DeliveryQueueEntryRecord | null {
+  const database = openStateDatabase(stateDir);
+  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
+  const row = executeSqliteQueryTakeFirstSync(
+    database.db,
+    queueDb
+      .selectFrom("delivery_queue_entries")
+      .select([
+        "id",
+        "status",
+        "entry_kind",
+        "entry_json",
+        "enqueued_at",
+        "retry_count",
+        "last_attempt_at",
+        "last_error",
+        "platform_send_started_at",
+        "recovery_state",
+      ])
+      .where("queue_name", "=", queueName)
+      .where("id", "=", id),
+  ) as QueueRow | undefined;
+  return row
+    ? {
+        status: row.status,
+        entry: inflate(row),
+        metadata: { entryKind: row.entry_kind ?? undefined },
+      }
+    : null;
+}
+
 /** Read row status without hiding dead-lettered entries. */
 export function getDeliveryQueueEntryStatus(
   queueName: string,
@@ -275,17 +342,32 @@ export function deleteDeliveryQueueEntry(queueName: string, id: string, stateDir
 
 /** Retain a delivered row as a durable idempotency tombstone. */
 export function completeDeliveryQueueEntry(queueName: string, id: string, stateDir?: string): void {
+  if (NON_EVICTABLE_QUEUE_NAMES.has(queueName)) {
+    if (getDeliveryQueueEntryStatus(queueName, id, stateDir) === "completed") {
+      return;
+    }
+    throw enoent(queueName, id);
+  }
   const now = Date.now();
+  const record = loadDeliveryQueueEntryRecord(queueName, id, stateDir);
+  if (record?.status === "completed") {
+    return;
+  }
+  if (!record?.entry) {
+    throw enoent(queueName, id);
+  }
+  const current = record.entry;
   const tombstone = {
     id,
     enqueuedAt: now,
     retryCount: 0,
     acknowledgedAt: now,
+    ...(current?.gaiaKeyedOutput ? { gaiaKeyedOutput: current.gaiaKeyedOutput } : {}),
   };
   const completed = upsertDeliveryQueueEntry({
     queueName,
     entry: tombstone,
-    metadata: {},
+    metadata: record.metadata,
     status: "completed",
     stateDir,
     completeExisting: true,
@@ -296,17 +378,33 @@ export function completeDeliveryQueueEntry(queueName: string, id: string, stateD
     }
     throw enoent(queueName, id);
   }
-  // Thirty days covers delayed producer replays while bounding successful-row growth.
+  // Gaia owns the admission retention window. Keep keyed owner tombstones
+  // until that owner decides they are no longer needed; generic rows keep the
+  // existing thirty-day bound.
   const database = openStateDatabase(stateDir);
   const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
-  executeSqliteQuerySync(
+  const oldRows = executeSqliteQuerySync(
     database.db,
     queueDb
-      .deleteFrom("delivery_queue_entries")
+      .selectFrom("delivery_queue_entries")
+      .select(["id", "entry_json"])
       .where("queue_name", "=", queueName)
       .where("status", "=", "completed")
       .where("enqueued_at", "<", now - COMPLETED_TOMBSTONE_RETENTION_MS),
-  );
+  ).rows as Array<{ id: string; entry_json: string }>;
+  const genericIds = oldRows
+    .filter((row) => !isKeyedOwnerTombstone(row.entry_json))
+    .map((row) => row.id);
+  if (genericIds.length > 0) {
+    executeSqliteQuerySync(
+      database.db,
+      queueDb
+        .deleteFrom("delivery_queue_entries")
+        .where("queue_name", "=", queueName)
+        .where("status", "=", "completed")
+        .where("id", "in", genericIds),
+    );
+  }
 }
 
 /** Load, transform, and persist a pending delivery queue entry. */
@@ -378,13 +476,18 @@ export function failPendingDeliveryQueueEntry(params: {
   expectedStatus: "pending";
   lastError: string;
   entry: DeliveryQueueEntryState;
+  recoveryState?: string;
   stateDir?: string;
 }): FailPendingDeliveryQueueEntryResult {
   if (params.entry.id !== params.id) {
     throw new Error(`Delivery queue entry id mismatch: ${params.entry.id} != ${params.id}`);
   }
   const now = Date.now();
-  const failedEntry = { ...params.entry, lastError: params.lastError };
+  const failedEntry = {
+    ...params.entry,
+    lastError: params.lastError,
+    ...(params.recoveryState === undefined ? {} : { recoveryState: params.recoveryState }),
+  };
   const database = openStateDatabase(params.stateDir);
   const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
   const result = executeSqliteQuerySync(
@@ -394,6 +497,7 @@ export function failPendingDeliveryQueueEntry(params: {
       .set({
         status: "failed",
         last_error: params.lastError,
+        recovery_state: params.recoveryState ?? params.entry.recoveryState ?? null,
         entry_json: JSON.stringify(failedEntry),
         updated_at: now,
         failed_at: now,

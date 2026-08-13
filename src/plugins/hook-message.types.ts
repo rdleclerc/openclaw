@@ -41,6 +41,7 @@ export type PluginHookMessageContext = {
   runId?: string;
   messageId?: string;
   senderId?: string;
+  senderIsBot?: boolean;
   replyToId?: string;
   replyToIdFull?: string;
   replyToBody?: string;
@@ -58,6 +59,7 @@ export type PluginHookInboundClaimContext = PluginHookMessageContext & {
   agentId?: string;
   parentConversationId?: string;
   senderId?: string;
+  senderIsBot?: boolean;
   messageId?: string;
   pluginBinding?: PluginConversationBinding;
 };
@@ -73,6 +75,7 @@ export type PluginHookInboundClaimEvent = {
   conversationId?: string;
   parentConversationId?: string;
   senderId?: string;
+  senderIsBot?: boolean;
   senderName?: string;
   senderUsername?: string;
   replyToId?: string;
@@ -102,6 +105,7 @@ export type PluginHookMessageReceivedEvent = {
   threadId?: string | number;
   messageId?: string;
   senderId?: string;
+  senderIsBot?: boolean;
   replyToId?: string;
   replyToIdFull?: string;
   replyToBody?: string;

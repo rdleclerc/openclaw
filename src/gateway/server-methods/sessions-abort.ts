@@ -12,6 +12,7 @@ import {
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
+import { abortChatRunById } from "../chat-abort.js";
 import { resolveSessionKeyForRun } from "../server-session-key.js";
 import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-create-service.js";
 import {
@@ -24,10 +25,17 @@ import { loadSessionEntry } from "../session-utils.js";
 import { asWorkerInferenceControl } from "../worker-environments/inference-control.js";
 import { resolveWorkerSessionTarget } from "../worker-environments/session-target.js";
 import { setGatewayDedupeEntry } from "./agent-job.js";
+import { canRequesterAbortChatRun, resolveChatAbortRequester } from "./chat-abort-authorization.js";
+import { createChatAbortOps } from "./chat-abort-runtime.js";
 import { chatHandlers } from "./chat.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import { requireSessionKey } from "./sessions-shared.js";
-import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import type {
+  GatewayRequestContext,
+  GatewayRequestHandlerOptions,
+  GatewayRequestHandlers,
+  RespondFn,
+} from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 export function resolveAbortSessionKey(params: {
@@ -111,6 +119,132 @@ function resolveScopedAbortKey(params: {
   });
 }
 
+type StrictAbortIdentity = { canonicalKey: string; agentId: string };
+
+function resolveStrictAbortIdentity(params: {
+  cfg: OpenClawConfig;
+  key: string | undefined;
+  agentId: string | undefined;
+}): StrictAbortIdentity | undefined {
+  const requestedKey = normalizeOptionalString(params.key);
+  if (!requestedKey) {
+    return undefined;
+  }
+  const keyAgentId = resolveSessionKeyAgentId(requestedKey, params.cfg);
+  const requestedAgentId = normalizeOptionalString(params.agentId) ?? keyAgentId;
+  if (!requestedAgentId) {
+    return undefined;
+  }
+  const agentId = normalizeAgentId(requestedAgentId);
+  const scopedKey =
+    requestedKey.toLowerCase() === "global"
+      ? requestedKey
+      : resolveScopedAbortKey({
+          cfg: params.cfg,
+          key: requestedKey,
+          agentId,
+        });
+  if (!scopedKey) {
+    return undefined;
+  }
+  const requestedGlobalAgent = resolveRequestedGlobalAgentId(params.cfg, scopedKey, agentId);
+  if (!requestedGlobalAgent.ok) {
+    return undefined;
+  }
+  const { canonicalKey } = loadSessionEntry(scopedKey, {
+    agentId: requestedGlobalAgent.agentId ?? agentId,
+  });
+  return {
+    canonicalKey,
+    agentId: normalizeAgentId(requestedGlobalAgent.agentId ?? agentId),
+  };
+}
+
+async function handleStrictSessionAbort(params: {
+  cfg: OpenClawConfig;
+  context: GatewayRequestContext;
+  key: string | undefined;
+  runId: string | undefined;
+  agentId: string | undefined;
+  client: GatewayRequestHandlerOptions["client"];
+  respond: RespondFn;
+}): Promise<void> {
+  const noActiveRun = () =>
+    params.respond(true, { ok: true, abortedRunId: null, status: "no-active-run" });
+  const targetMismatch = () =>
+    params.respond(true, { ok: true, abortedRunId: null, status: "target-mismatch" });
+  const runId = params.runId;
+  const activeRun = runId ? params.context.chatAbortControllers.get(runId) : undefined;
+  if (!activeRun) {
+    noActiveRun();
+    return;
+  }
+  if (!canRequesterAbortChatRun(activeRun, resolveChatAbortRequester(params.client))) {
+    params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+    return;
+  }
+  if (!params.key || !params.agentId) {
+    targetMismatch();
+    return;
+  }
+  const requestedIdentity = resolveStrictAbortIdentity({
+    cfg: params.cfg,
+    key: params.key,
+    agentId: params.agentId,
+  });
+  if (!requestedIdentity) {
+    targetMismatch();
+    return;
+  }
+
+  const result = abortChatRunById(createChatAbortOps(params.context), {
+    runId,
+    sessionKey: activeRun.sessionKey,
+    stopReason: "rpc",
+    exactTarget: {
+      entry: activeRun,
+      matches: (candidate) => {
+        const activeIdentity = resolveStrictAbortIdentity({
+          cfg: params.cfg,
+          key: candidate.sessionKey,
+          agentId: candidate.agentId,
+        });
+        return Boolean(
+          activeIdentity &&
+          activeIdentity.canonicalKey === requestedIdentity.canonicalKey &&
+          activeIdentity.agentId === requestedIdentity.agentId,
+        );
+      },
+    },
+  });
+  if (result.aborted) {
+    for (let turn = 0; turn < 8; turn += 1) {
+      const persistenceAttached =
+        activeRun.projectSessionTerminalPersistence !== undefined ||
+        activeRun.projectSessionTerminalPersisted === true;
+      if (activeRun.projectSessionTerminalObservedAt !== undefined && persistenceAttached) {
+        params.respond(true, { ok: true, abortedRunId: runId, status: "aborted" });
+        return;
+      }
+      if (params.context.chatAbortControllers.get(runId) !== activeRun && !persistenceAttached)
+        break;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    targetMismatch();
+    return;
+  }
+  params.respond(true, {
+    ok: true,
+    abortedRunId: null,
+    status:
+      result.reason === "not-abortable"
+        ? "not-abortable"
+        : result.reason === "no-active-run"
+          ? "no-active-run"
+          : "target-mismatch",
+  });
+}
+
 export const sessionAbortHandlers: GatewayRequestHandlers = {
   "sessions.abort": async ({ req, params, respond, context, client, isWebchatConnect }) => {
     if (!assertValidParams(params, validateSessionsAbortParams, "sessions.abort", respond)) {
@@ -121,6 +255,18 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
     const requestedRunId = readStringValue(p.runId);
     const requestedKey = normalizeOptionalString(p.key);
     const requestedParamAgentId = normalizeOptionalString(p.agentId);
+    if (p.requireExactTarget === true) {
+      await handleStrictSessionAbort({
+        cfg,
+        context,
+        key: requestedKey,
+        runId: requestedRunId,
+        agentId: requestedParamAgentId,
+        client,
+        respond,
+      });
+      return;
+    }
     const workerRunSessionId = requestedRunId
       ? asWorkerInferenceControl(context.workerEnvironmentService)?.resolveInferenceSessionForRunId(
           requestedRunId,

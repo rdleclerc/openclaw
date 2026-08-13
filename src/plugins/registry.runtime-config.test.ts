@@ -1,12 +1,24 @@
+import { mkdtempSync } from "node:fs";
 // Verifies plugin registry behavior with runtime config inputs.
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  admitGaiaAcceptance,
+  deriveGaiaAcceptanceId,
+  deriveGaiaKeyedOutputOwnerId,
+} from "../infra/outbound/delivery-queue-storage.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { resolveUserPath } from "../utils.js";
 import { createPluginRecord } from "./loader-records.js";
 import { createPluginRegistry } from "./registry.js";
-import { getPluginRuntimeGatewayRequestScope } from "./runtime/gateway-request-scope.js";
+import {
+  bindGaiaAcceptedEnvelope,
+  getPluginRuntimeGatewayRequestScope,
+  withPluginRuntimeGatewayRequestScope,
+  withPluginRuntimePluginScope,
+} from "./runtime/gateway-request-scope.js";
 import { createPluginRuntime } from "./runtime/index.js";
 import type { PluginRuntime } from "./runtime/types.js";
 
@@ -22,6 +34,22 @@ function createTestRegistry(runtime: PluginRuntime) {
     activateGlobalSideEffects: false,
   });
 }
+
+function readGaiaOwnerStatus(stateDir: string, runId: string): string | undefined {
+  const { db } = openOpenClawStateDatabase({
+    env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+  });
+  const row = db
+    .prepare("SELECT status FROM delivery_queue_entries WHERE queue_name = 'outbound' AND id = ?")
+    .get(deriveGaiaKeyedOutputOwnerId(runId)) as { status?: string } | undefined;
+  return row?.status;
+}
+
+const drainPendingDeliveriesMock = vi.hoisted(() => vi.fn(async (_opts: unknown) => {}));
+
+vi.mock("../plugin-sdk/delivery-queue-runtime.js", () => ({
+  drainPendingDeliveries: drainPendingDeliveriesMock,
+}));
 
 describe("plugin registry runtime config scope", () => {
   it("allows explicitly configured plugins to use only their scoped channel ingress queue", () => {
@@ -58,6 +86,372 @@ describe("plugin registry runtime config scope", () => {
     expect(() => workspaceApi.runtime.state.openChannelIngressQueue({ accountId: "test" })).toThrow(
       "only available to bundled, trusted, or explicitly configured plugins",
     );
+  });
+
+  it("keeps the Gaia keyed output runtime boundary exact and derives ownership in OpenClaw", async () => {
+    drainPendingDeliveriesMock.mockClear();
+    const runtime = createPluginRuntime();
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-gaia-output-"));
+    runtime.state.resolveStateDir = () => stateDir;
+    const pluginRegistry = createTestRegistry(runtime);
+    const record = createPluginRecord({
+      id: "gaia-workflow-preflight",
+      name: "Gaia Workflow Preflight",
+      source: "/plugins/gaia-workflow-preflight/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const api = pluginRegistry.createApi(record, { config: {} as OpenClawConfig });
+    const accepted = {
+      runId: "run-boundary-1",
+      sessionKey: "agent:gaia:slack:channel:C123",
+      agentId: "GAIA",
+      acceptedAt: 1_700_000_000_000,
+      receiptPluginId: "gaia-workflow-preflight" as const,
+    };
+    const request = {
+      accepted,
+      target: {
+        channel: "slack",
+        accountId: "acct-1",
+        destination: "C123",
+        replyId: "1710000000.000001",
+        threadId: "1710000000.000000",
+      },
+      payload: { text: "boundary" },
+    };
+    expect(admitGaiaAcceptance(accepted, stateDir)).toEqual({
+      status: "accepted",
+      accepted: { ...accepted, agentId: "gaia" },
+    });
+
+    const result = await withPluginRuntimeGatewayRequestScope(
+      {
+        context: {} as never,
+        isWebchatConnect: () => false,
+      },
+      () =>
+        withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, async () => {
+          bindGaiaAcceptedEnvelope({ ...accepted, agentId: "gaia" });
+          const gaiaOutput = (
+            api.runtime.state as unknown as {
+              gaiaOutput: {
+                submit: (value: unknown) => Promise<{ status: string; entry: unknown }>;
+                inspect: (value: unknown) => { status: string; entry?: unknown };
+                resume: (value: unknown) => Promise<{ status: string; entry?: unknown }>;
+              };
+            }
+          ).gaiaOutput;
+          const admitted = await gaiaOutput.submit(request);
+          const duplicate = await gaiaOutput.submit(request);
+          const drainCallsBeforeConflict = drainPendingDeliveriesMock.mock.calls.length;
+          const conflict = await gaiaOutput.submit({
+            ...request,
+            payload: { text: "different" },
+          });
+          expect(admitted.status).toBe("new");
+          expect(duplicate.status).toBe("duplicate");
+          expect(conflict.status).toBe("conflict");
+          expect(drainPendingDeliveriesMock).toHaveBeenCalledTimes(drainCallsBeforeConflict);
+          expect(drainPendingDeliveriesMock).toHaveBeenCalledTimes(2);
+          const wake = drainPendingDeliveriesMock.mock.calls[0]?.[0] as {
+            drainKey: string;
+            selectEntry: (
+              entry: { id: string },
+              now: number,
+            ) => {
+              match: boolean;
+              bypassBackoff?: boolean;
+            };
+          };
+          expect(wake.drainKey).toBe(`gaia-keyed-output:${admitted.ownerId}`);
+          expect(wake.selectEntry({ id: admitted.ownerId }, Date.now())).toEqual({
+            match: true,
+            bypassBackoff: true,
+          });
+          expect(wake.selectEntry({ id: "other-owner" }, Date.now()).match).toBe(false);
+          expect((admitted.entry as { gaiaKeyedOutput: unknown }).gaiaKeyedOutput).toMatchObject({
+            accepted: { runId: accepted.runId, sessionKey: accepted.sessionKey, agentId: "gaia" },
+          });
+          expect(gaiaOutput.inspect(accepted).status).toBe("pending");
+          await expect(gaiaOutput.resume(accepted)).resolves.toMatchObject({ status: "pending" });
+          expect(drainPendingDeliveriesMock).toHaveBeenCalledTimes(3);
+          expect(() => gaiaOutput.inspect(accepted.runId)).toThrow("exact accepted envelope");
+          await expect(gaiaOutput.submit({ ...request, ownerId: "caller-owned" })).rejects.toThrow(
+            "only { accepted, target, payload }",
+          );
+          await expect(
+            gaiaOutput.submit({
+              ...request,
+              accepted: { ...accepted, runId: "caller-owned-run" },
+            }),
+          ).rejects.toThrow("current host acceptance");
+          return admitted;
+        }),
+    );
+    expect(result.status).toBe("new");
+  });
+
+  it("requires a Gaia gateway request scope and host acceptance before output", async () => {
+    drainPendingDeliveriesMock.mockClear();
+    const runtime = createPluginRuntime();
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-gaia-output-background-"));
+    runtime.state.resolveStateDir = () => stateDir;
+    const pluginRegistry = createTestRegistry(runtime);
+    const gaiaRecord = createPluginRecord({
+      id: "gaia-workflow-preflight",
+      name: "Gaia Workflow Preflight",
+      source: "/plugins/gaia-workflow-preflight/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const otherRecord = createPluginRecord({
+      id: "other-plugin",
+      name: "Other Plugin",
+      source: "/plugins/other-plugin/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const gaiaApi = pluginRegistry.createApi(gaiaRecord, { config: {} as OpenClawConfig });
+    const otherApi = pluginRegistry.createApi(otherRecord, { config: {} as OpenClawConfig });
+    const accepted = {
+      runId: "background-run-1",
+      sessionKey: "agent:gaia:slack:channel:C123",
+      agentId: "gaia",
+      acceptedAt: 1_700_000_000_001,
+      receiptPluginId: "gaia-workflow-preflight" as const,
+    };
+    const request = {
+      accepted,
+      target: {
+        channel: "slack",
+        accountId: "acct-1",
+        destination: "C123",
+        replyId: "1710000000.000002",
+        threadId: "1710000000.000000",
+      },
+      payload: { text: "background" },
+    };
+    const gaiaOutput = (
+      gaiaApi.runtime.state as unknown as {
+        gaiaOutput: {
+          submit: (value: unknown) => Promise<{ status: string; entry: unknown }>;
+          inspect: (value: unknown) => { status: string; entry?: unknown };
+          resume: (value: unknown) => Promise<{ status: string; entry?: unknown }>;
+        };
+      }
+    ).gaiaOutput;
+    const otherOutput = (
+      otherApi.runtime.state as unknown as {
+        gaiaOutput: { submit: (value: unknown) => Promise<unknown> };
+      }
+    ).gaiaOutput;
+
+    expect(getPluginRuntimeGatewayRequestScope()).toBeUndefined();
+    expect((runtime.state as unknown as { gaiaOutput?: unknown }).gaiaOutput).toBeUndefined();
+    await expect(otherOutput.submit(request)).rejects.toThrow(
+      "exact gaia-workflow-preflight plugin scope",
+    );
+    await expect(gaiaOutput.submit(request)).rejects.toThrow("gateway request scope");
+    expect(() => gaiaOutput.inspect(accepted)).toThrow("gateway request scope");
+    await expect(gaiaOutput.resume(accepted)).rejects.toThrow("gateway request scope");
+
+    await expect(
+      withPluginRuntimeGatewayRequestScope(
+        { context: {} as never, isWebchatConnect: () => false },
+        () =>
+          withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, () =>
+            gaiaOutput.submit(request),
+          ),
+      ),
+    ).rejects.toThrow("matching durable acceptance row");
+    expect(drainPendingDeliveriesMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["absent", "corrupt", "mismatch"] as const)(
+    "requires matching durable acceptance for private runtime operations with %s evidence",
+    async (evidence) => {
+      drainPendingDeliveriesMock.mockClear();
+      const stateDir = mkdtempSync(path.join(os.tmpdir(), `openclaw-gaia-output-${evidence}-`));
+      const runtime = createPluginRuntime();
+      runtime.state.resolveStateDir = () => stateDir;
+      const pluginRegistry = createTestRegistry(runtime);
+      const record = createPluginRecord({
+        id: "gaia-workflow-preflight",
+        name: "Gaia Workflow Preflight",
+        source: "/plugins/gaia-workflow-preflight/index.js",
+        origin: "bundled",
+        enabled: true,
+        configSchema: false,
+      });
+      const api = pluginRegistry.createApi(record, { config: {} as OpenClawConfig });
+      const accepted = {
+        runId: `private-runtime-${evidence}`,
+        sessionKey: "agent:gaia:slack:channel:C123",
+        agentId: "gaia",
+        acceptedAt: 1_700_000_000_020,
+        receiptPluginId: "gaia-workflow-preflight" as const,
+      };
+      const request = {
+        accepted,
+        target: {
+          channel: "slack",
+          accountId: "acct-1",
+          destination: "C123",
+          replyId: "1710000000.000020",
+          threadId: "1710000000.000000",
+        },
+        payload: { text: evidence },
+      };
+      if (evidence === "corrupt") {
+        expect(admitGaiaAcceptance(accepted, stateDir).status).toBe("accepted");
+        const { db } = openOpenClawStateDatabase({
+          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+        });
+        db.prepare(
+          "UPDATE delivery_queue_entries SET entry_json = ? WHERE queue_name = 'gaia-acceptance' AND id = ?",
+        ).run("{", deriveGaiaAcceptanceId(accepted.runId));
+      } else if (evidence === "mismatch") {
+        expect(
+          admitGaiaAcceptance(
+            { ...accepted, sessionKey: "agent:gaia:slack:channel:OTHER" },
+            stateDir,
+          ).status,
+        ).toBe("accepted");
+      }
+
+      const gaiaOutput = (
+        api.runtime.state as unknown as {
+          gaiaOutput: {
+            submit: (value: unknown) => Promise<unknown>;
+            inspect: (value: unknown) => unknown;
+            resume: (value: unknown) => Promise<unknown>;
+          };
+        }
+      ).gaiaOutput;
+      const expectedError =
+        evidence === "absent"
+          ? "matching durable acceptance row"
+          : evidence === "corrupt"
+            ? "stored evidence is corrupt"
+            : "does not match durable acceptance evidence";
+
+      await withPluginRuntimeGatewayRequestScope(
+        { context: {} as never, isWebchatConnect: () => false },
+        () =>
+          withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, async () => {
+            bindGaiaAcceptedEnvelope(accepted);
+            await expect(gaiaOutput.submit(request)).rejects.toThrow(expectedError);
+            expect(() => gaiaOutput.inspect(accepted)).toThrow(expectedError);
+            await expect(gaiaOutput.resume(accepted)).rejects.toThrow(expectedError);
+          }),
+      );
+      expect(readGaiaOwnerStatus(stateDir, accepted.runId)).toBeUndefined();
+      expect(drainPendingDeliveriesMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("recovers durable acceptance and the existing owner from a fresh runtime instance", async () => {
+    drainPendingDeliveriesMock.mockClear();
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-gaia-output-restart-"));
+    const accepted = {
+      runId: "restart-runtime-run",
+      sessionKey: "agent:gaia:slack:channel:C123",
+      agentId: "GAIA",
+      acceptedAt: 1_700_000_000_010,
+      receiptPluginId: "gaia-workflow-preflight" as const,
+    };
+    const request = {
+      accepted,
+      target: {
+        channel: "slack",
+        accountId: "acct-1",
+        destination: "C123",
+        replyId: "1710000000.000010",
+        threadId: "1710000000.000000",
+      },
+      payload: { text: "restart" },
+    };
+    const record = createPluginRecord({
+      id: "gaia-workflow-preflight",
+      name: "Gaia Workflow Preflight",
+      source: "/plugins/gaia-workflow-preflight/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const runtime1 = createPluginRuntime();
+    runtime1.state.resolveStateDir = () => stateDir;
+    const api1 = createTestRegistry(runtime1).createApi(record, {
+      config: {} as OpenClawConfig,
+    });
+    const output1 = (
+      api1.runtime.state as unknown as {
+        gaiaOutput: {
+          submit: (value: unknown) => Promise<{ status: string; ownerId: string }>;
+        };
+      }
+    ).gaiaOutput;
+    expect(admitGaiaAcceptance(accepted, stateDir).status).toBe("accepted");
+    const admitted = await withPluginRuntimeGatewayRequestScope(
+      { context: {} as never, isWebchatConnect: () => false },
+      () =>
+        withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, async () => {
+          bindGaiaAcceptedEnvelope(accepted);
+          return await output1.submit(request);
+        }),
+    );
+    expect(admitted.status).toBe("new");
+
+    const runtime2 = createPluginRuntime();
+    runtime2.state.resolveStateDir = () => stateDir;
+    const api2 = createTestRegistry(runtime2).createApi(record, {
+      config: {} as OpenClawConfig,
+    });
+    const output2 = (
+      api2.runtime.state as unknown as {
+        gaiaOutput: {
+          recoverAccepted: (value: unknown) => {
+            status: string;
+            accepted?: unknown;
+          };
+          inspect: (value: unknown) => { status: string; ownerId?: string };
+          resume: (value: unknown) => Promise<{ status: string; ownerId?: string }>;
+          submit: (value: unknown) => Promise<{ status: string; ownerId?: string }>;
+        };
+      }
+    ).gaiaOutput;
+    const recoveredAccepted = { ...accepted, agentId: "gaia" };
+    const selector = {
+      runId: accepted.runId,
+      sessionKey: accepted.sessionKey,
+      agentId: accepted.agentId,
+      receiptPluginId: accepted.receiptPluginId,
+    };
+
+    await withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, async () => {
+      expect(() => output2.recoverAccepted(accepted)).toThrow("complete acceptance selector");
+      expect(output2.recoverAccepted(selector)).toEqual({
+        status: "found",
+        accepted: recoveredAccepted,
+      });
+      expect(output2.inspect(accepted)).toMatchObject({
+        status: "pending",
+        ownerId: admitted.ownerId,
+      });
+      await expect(output2.resume(accepted)).resolves.toMatchObject({
+        status: "pending",
+        ownerId: admitted.ownerId,
+      });
+      await expect(output2.submit(request)).resolves.toMatchObject({
+        status: "duplicate",
+        ownerId: admitted.ownerId,
+      });
+    });
+    expect(drainPendingDeliveriesMock).toHaveBeenCalledTimes(3);
   });
 
   it("resolves plugin API paths against the plugin root", () => {

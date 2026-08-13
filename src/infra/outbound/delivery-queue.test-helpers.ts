@@ -68,15 +68,21 @@ export function setQueuedEntryState(
   id: string,
   state: {
     retryCount: number;
+    reconciliationAttemptCount?: number;
     lastAttemptAt?: number;
     lastError?: string;
     enqueuedAt?: number;
     platformSendStartedAt?: number;
-    recoveryState?: "send_attempt_started" | "unknown_after_send";
+    recoveryState?: "send_attempt_started" | "unknown_after_send" | "permanent_pre_send_failure";
   },
 ): void {
   const entry = readQueuedEntry(tmpDir, id);
   entry.retryCount = state.retryCount;
+  if (state.reconciliationAttemptCount === undefined) {
+    delete entry.reconciliationAttemptCount;
+  } else {
+    entry.reconciliationAttemptCount = state.reconciliationAttemptCount;
+  }
   if (state.lastAttemptAt === undefined) {
     delete entry.lastAttemptAt;
   } else {

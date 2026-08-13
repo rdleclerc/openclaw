@@ -347,6 +347,7 @@ export function prepareEmbeddedAttemptStream(input: {
   const queueHandle: AttemptStreamQueueHandle = {
     kind: "embedded",
     runId: attempt.runId,
+    lifecycleGeneration: attempt.lifecycleGeneration,
     queueMessage: async (text: string, options) => {
       if (options?.steeringMode) {
         input.activeSession.agent.steeringMode = options.steeringMode;

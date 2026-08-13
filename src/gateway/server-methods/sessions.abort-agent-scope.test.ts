@@ -4,6 +4,8 @@
 
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { onAgentEvent } from "../../infra/agent-events.js";
+import { ADMIN_SCOPE } from "../operator-scopes.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 
 const chatAbortMock = vi.fn();
@@ -90,6 +92,13 @@ function createContext(
   };
   return {
     chatAbortControllers: new Map(options.activeRuns ?? []),
+    chatAbortedRuns: new Map(),
+    chatRunBuffers: new Map(),
+    agentRunSeq: new Map(),
+    clearChatRunState: vi.fn(),
+    removeChatRun: vi.fn(),
+    broadcast: vi.fn(),
+    nodeSendToSession: vi.fn(),
     getRuntimeConfig: () => cfg,
     ...options.extra,
   } as unknown as GatewayRequestContext;
@@ -573,5 +582,227 @@ describe("sessions.abort agent scope", () => {
     );
 
     expectChatAbortParams({ sessionKey: "main", runId: undefined });
+  });
+
+  it("strictly rejects an exact abort from a different owner before mutation", async () => {
+    const activeRun = Object.assign(createActiveRun("agent:main:dashboard:target"), {
+      ownerConnId: "conn-owner",
+    });
+    const context = createContext({ activeRuns: [["run-owner", activeRun]] });
+    const respond = await callSessions(
+      "sessions.abort",
+      { requireExactTarget: true, runId: "run-owner", key: activeRun.sessionKey, agentId: "main" },
+      { context, client: { connId: "conn-other" } as GatewayClient },
+    );
+
+    expect(activeRun.controller.signal.aborted).toBe(false);
+    expect(context.clearChatRunState).not.toHaveBeenCalled();
+    expectRespondErrorMessage(respond, "unauthorized");
+  });
+
+  it("strictly rejects a mismatched exact target without privileged fallback", async () => {
+    const activeRun = createActiveRun("agent:beta:dashboard:target");
+    const context = createBetaRunContext(activeRun);
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-beta",
+        key: "agent:main:dashboard:target",
+        agentId: "main",
+      },
+      {
+        context,
+        reqId: "req-strict-mismatch",
+        client: { connect: { scopes: [ADMIN_SCOPE] } } as GatewayClient,
+      },
+    );
+
+    expect(chatAbortMock).not.toHaveBeenCalled();
+    expect(activeRun.controller.signal.aborted).toBe(false);
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "target-mismatch",
+    });
+  });
+
+  it("strictly reports a present finalizing run without mutating it", async () => {
+    const activeRun = {
+      ...createActiveRun("agent:main:dashboard:target"),
+      isAbortable: () => false,
+    };
+    const context = createContext({ activeRuns: [["run-finalizing", activeRun]] });
+
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-finalizing",
+        key: "agent:main:dashboard:target",
+        agentId: "main",
+      },
+      { context, reqId: "req-strict-finalizing" },
+    );
+
+    expect(activeRun.controller.signal.aborted).toBe(false);
+    expect(context.chatAbortControllers.get("run-finalizing")).toBe(activeRun);
+    expect(chatAbortMock).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "not-abortable",
+    });
+  });
+
+  it("strictly uses canonical cleanup and lifecycle emission", async () => {
+    const runId = "run-strict-cleanup";
+    const sessionKey = "agent:main:dashboard:target";
+    const onRemoved = vi.fn();
+    const chatRunBuffers = new Map([[runId, "partial"]]);
+    const clearChatRunState = vi.fn((id: string) => {
+      chatRunBuffers.delete(id);
+    });
+    const removeChatRun = vi.fn().mockReturnValue({
+      sessionKey,
+      clientRunId: runId,
+    });
+    const activeRun = { ...createActiveRun(sessionKey), onRemoved };
+    const context = createContext({
+      activeRuns: [[runId, activeRun]],
+      extra: {
+        chatRunBuffers,
+        clearChatRunState,
+        removeChatRun,
+        agentRunSeq: new Map([[runId, 1]]),
+      },
+    });
+    const lifecycleEvents: unknown[] = [];
+    const unsubscribe = onAgentEvent((event) => {
+      if (event.runId === runId && event.stream === "lifecycle") {
+        lifecycleEvents.push(event);
+      }
+    });
+
+    try {
+      const respond = await callSessions(
+        "sessions.abort",
+        {
+          requireExactTarget: true,
+          runId,
+          key: sessionKey,
+          agentId: "main",
+        },
+        { context, reqId: "req-strict-cleanup" },
+      );
+
+      expect(respond).toHaveBeenCalledWith(true, {
+        ok: true,
+        abortedRunId: null,
+        status: "target-mismatch",
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(context.chatAbortControllers.get(runId)).toBe(activeRun);
+    expect(activeRun.controller.signal.aborted).toBe(true);
+    expect(onRemoved).not.toHaveBeenCalled();
+    expect(clearChatRunState).toHaveBeenCalledWith(runId);
+    expect(chatRunBuffers.has(runId)).toBe(false);
+    expect(removeChatRun).toHaveBeenCalledWith(runId, runId, sessionKey);
+    expect(lifecycleEvents).toHaveLength(1);
+    expect(lifecycleEvents[0]).toMatchObject({
+      runId,
+      sessionKey,
+      stream: "lifecycle",
+      data: {
+        phase: "end",
+        status: "cancelled",
+        aborted: true,
+        stopReason: "rpc",
+      },
+    });
+  });
+
+  it("strictly reports a replacement installed during abort and preserves it", async () => {
+    const activeRun = createActiveRun("agent:main:dashboard:target");
+    const replacement = createActiveRun("agent:main:dashboard:target");
+    const context = createContext({ activeRuns: [["run-race", activeRun]] });
+    const originalAbort = activeRun.controller.abort.bind(activeRun.controller);
+    vi.spyOn(activeRun.controller, "abort").mockImplementation((reason) => {
+      originalAbort(reason);
+      context.chatAbortControllers.set("run-race", replacement);
+    });
+
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-race",
+        key: "agent:main:dashboard:target",
+        agentId: "main",
+      },
+      { context, reqId: "req-strict-race" },
+    );
+
+    expect(activeRun.controller.signal.aborted).toBe(true);
+    expect(replacement.controller.signal.aborted).toBe(false);
+    expect(context.chatAbortControllers.get("run-race")).toBe(replacement);
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "target-mismatch",
+    });
+  });
+
+  it("strictly matches aliases to a global session in the selected agent scope", async () => {
+    const activeRun = createActiveRun("global", { agentId: "work" });
+    const context = createGlobalWorkRunContext(activeRun);
+    loadSessionEntryMock.mockImplementation((sessionKey: string) => ({
+      canonicalKey:
+        sessionKey === "agent:work:main" || sessionKey === "global" ? "global" : sessionKey,
+    }));
+
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-global",
+        key: "agent:work:main",
+        agentId: "WORK",
+      },
+      { context, reqId: "req-strict-global-alias" },
+    );
+
+    expect(activeRun.controller.signal.aborted).toBe(true);
+    expect(context.chatAbortControllers.get("run-global")).toBe(activeRun);
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "target-mismatch",
+    });
+  });
+
+  it("strictly reports no active run without resolving or mutating anything", async () => {
+    const context = createContext();
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "missing",
+        key: "agent:main:dashboard:target",
+        agentId: "main",
+      },
+      { context, reqId: "req-strict-inactive" },
+    );
+
+    expect(resolveSessionKeyForRunMock).not.toHaveBeenCalled();
+    expect(chatAbortMock).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "no-active-run",
+    });
   });
 });

@@ -189,6 +189,7 @@ export type PluginLoadOptions = {
   activate?: boolean;
   loadModules?: boolean;
   throwOnLoadError?: boolean;
+  criticalPluginIds?: readonly string[];
   manifestRegistry?: PluginManifestRegistry;
   discovery?: PluginDiscoveryResult;
 };
@@ -1431,8 +1432,13 @@ function pushPluginValidationError(params: {
 function maybeThrowOnPluginLoadError(
   registry: PluginRegistry,
   throwOnLoadError: boolean | undefined,
+  criticalPluginIds: readonly string[] | undefined,
 ): void {
-  if (!throwOnLoadError) {
+  const hasCriticalPluginLoadError =
+    criticalPluginIds?.some((pluginId) =>
+      registry.plugins.some((entry) => entry.id === pluginId && entry.status === "error"),
+    ) ?? false;
+  if (!throwOnLoadError && !hasCriticalPluginLoadError) {
     return;
   }
   if (!registry.plugins.some((entry) => entry.status === "error")) {
@@ -1504,6 +1510,11 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
       options,
     });
     if (cached) {
+      maybeThrowOnPluginLoadError(
+        cached.state.registry,
+        options.throwOnLoadError,
+        options.criticalPluginIds,
+      );
       if (shouldActivate) {
         restorePluginProcessGlobalState(cached.state.processGlobalState);
         activatePluginRegistry(
@@ -2538,7 +2549,7 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
       env,
     });
 
-    maybeThrowOnPluginLoadError(registry, options.throwOnLoadError);
+    maybeThrowOnPluginLoadError(registry, options.throwOnLoadError, options.criticalPluginIds);
 
     if (shouldActivate && options.mode !== "validate") {
       const failedPlugins = registry.plugins.filter((plugin) => plugin.failedAt != null);

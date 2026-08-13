@@ -37,14 +37,19 @@ import {
 } from "./delivery-commit-hooks.js";
 import {
   ackDelivery,
+  completeDelivery,
   failDelivery,
   failDeliveryAfterPlatformSend,
   failDeliveryBeforePlatformSend,
+  failPendingGaiaKeyedOutput,
   failPendingDelivery,
+  inspectGaiaKeyedOutput,
   loadPendingDelivery,
   loadPendingDeliveries,
   markDeliveryPlatformOutcomeUnknown,
   moveToFailed,
+  recordPendingPermanentDeliveryError,
+  recordGaiaReadbackGap,
   type QueuedDelivery,
   type QueuedDeliveryPayload,
 } from "./delivery-queue-storage.js";
@@ -111,6 +116,14 @@ const drainInProgress = new Map<string, boolean>();
 const entriesInProgress = new Set<string>();
 const recoveryReplayPacer = createRecoveryReplayPacer();
 
+async function finalizeRecoveredEntry(entry: QueuedDelivery, stateDir?: string): Promise<void> {
+  if (entry.gaiaKeyedOutput) {
+    await completeDelivery(entry.id, stateDir);
+    return;
+  }
+  await ackDelivery(entry.id, stateDir);
+}
+
 function resolveRecoveryDeadlineMs(maxRecoveryMs: number | undefined): number {
   const durationMs =
     typeof maxRecoveryMs === "number" && Number.isFinite(maxRecoveryMs)
@@ -145,7 +158,9 @@ function emitQueuedAuditTerminals(
 
 function queuedDeadLetterAuditTerminals(entry: QueuedDelivery) {
   const ambiguous =
-    entry.recoveryState === "send_attempt_started" || entry.recoveryState === "unknown_after_send";
+    entry.recoveryState === "send_attempt_started" ||
+    entry.recoveryState === "unknown_after_send" ||
+    entry.recoveryState === "ambiguous_failure";
   if (ambiguous) {
     return uniformOutboundAuditTerminals(entry.payloads.length, {
       outcome: "unknown",
@@ -163,6 +178,16 @@ function queuedUnknownAuditTerminals(entry: QueuedDelivery) {
     outcome: "unknown",
     failureStage: "queue",
   });
+}
+
+function isFencedGaiaSlackEntry(entry: QueuedDelivery): boolean {
+  return (
+    entry.channel === "slack" &&
+    entry.gaiaKeyedOutput !== undefined &&
+    (entry.platformSendStartedAt !== undefined ||
+      entry.recoveryState === "send_attempt_started" ||
+      entry.recoveryState === "unknown_after_send")
+  );
 }
 
 export async function withActiveDeliveryClaim<T>(
@@ -201,6 +226,7 @@ function buildRecoveryDeliverParams(entry: QueuedDelivery, cfg: OpenClawConfig, 
     gifPlayback: entry.gifPlayback,
     forceDocument: entry.forceDocument,
     replyPayloadSendingHook: entry.replyPayloadSendingHook,
+    gaiaKeyedOutput: entry.gaiaKeyedOutput,
     silent: entry.silent,
     mirror: entry.mirror,
     session: entry.session,
@@ -230,15 +256,17 @@ async function applyRecoveryDeliveryAdmission(params: {
   if (admission.status === "allowed") {
     return "allowed";
   }
-  const result = await failPendingDelivery(
-    {
-      id: params.entry.id,
-      expectedStatus: "pending",
-      lastError: admission.reason,
-      entry: params.entry,
-    },
-    params.stateDir,
-  );
+  const result = params.entry.gaiaKeyedOutput
+    ? await failPendingGaiaKeyedOutput(params.entry, admission.reason, params.stateDir)
+    : await failPendingDelivery(
+        {
+          id: params.entry.id,
+          expectedStatus: "pending",
+          lastError: admission.reason,
+          entry: params.entry,
+        },
+        params.stateDir,
+      );
   if (result.status === "failed") {
     emitQueuedAuditTerminals(params.entry, () => queuedDeadLetterAuditTerminals(params.entry));
     params.log.warn(
@@ -278,7 +306,12 @@ async function reconcileUnknownQueuedDelivery(opts: {
       to: entry.to,
       ...(entry.accountId !== undefined ? { accountId: entry.accountId } : {}),
       enqueuedAt: entry.enqueuedAt,
-      retryCount: entry.retryCount,
+      retryCount: isFencedGaiaSlackEntry(entry)
+        ? (entry.reconciliationAttemptCount ?? 0)
+        : entry.retryCount,
+      ...(entry.reconciliationAttemptCount !== undefined
+        ? { reconciliationAttemptCount: entry.reconciliationAttemptCount }
+        : {}),
       ...(entry.platformSendStartedAt !== undefined
         ? { platformSendStartedAt: entry.platformSendStartedAt }
         : {}),
@@ -488,7 +521,10 @@ async function persistRecoveredPostSendState(opts: {
     await markDeliveryPlatformOutcomeUnknown(opts.entry.id, opts.stateDir);
     return "marked";
   } catch (markErr) {
-    if (opts.entry.replyPayloadSendingHook?.messageSentReceiptPluginId) {
+    if (
+      opts.entry.gaiaKeyedOutput ||
+      opts.entry.replyPayloadSendingHook?.messageSentReceiptPluginId
+    ) {
       throw markErr;
     }
     // A result proves at least one send completed. If the intermediate marker
@@ -515,6 +551,7 @@ async function drainQueuedEntry(opts: {
   stateDir?: string;
   onRecovered?: (entry: QueuedDelivery) => void;
   onFailed?: (entry: QueuedDelivery, errMsg: string) => void;
+  permanentPreSendFailureError?: string;
 }): Promise<"recovered" | "failed" | "moved-to-failed" | "already-gone"> {
   const { entry } = opts;
   if (
@@ -532,7 +569,7 @@ async function drainQueuedEntry(opts: {
       try {
         const result = buildReconciledSentResult(entry, reconciliation);
         await runReconciledSentMessageHook(entry, result);
-        await ackDelivery(entry.id, opts.stateDir);
+        await finalizeRecoveredEntry(entry, opts.stateDir);
         await runReconciledSentCommitHooks({
           entry,
           cfg: opts.cfg,
@@ -567,12 +604,84 @@ async function drainQueuedEntry(opts: {
         return "failed";
       }
     }
+    if (isFencedGaiaSlackEntry(entry)) {
+      const readbackError =
+        reconciliation?.status === "unresolved"
+          ? (reconciliation.error ?? "Slack durable send readback remained unresolved")
+          : reconciliation?.status === "not_sent"
+            ? "Slack durable send readback returned not_sent after the permanent send fence"
+            : "Slack durable send readback was unavailable after the permanent send fence";
+      const nextAttempt = (entry.reconciliationAttemptCount ?? 0) + 1;
+      const retryable =
+        reconciliation == null
+          ? true
+          : reconciliation.status === "not_sent"
+            ? true
+            : reconciliation.status === "unresolved" && reconciliation.retryable === true;
+      const terminal = !retryable || nextAttempt >= MAX_RETRIES;
+      opts.onFailed?.(entry, readbackError);
+      try {
+        const result = await recordGaiaReadbackGap(entry.id, readbackError, opts.stateDir, {
+          terminal,
+        });
+        if (result === "not_pending") {
+          return "already-gone";
+        }
+        if (result === "failed") {
+          emitQueuedAuditTerminals(entry, () => queuedDeadLetterAuditTerminals(entry));
+          return "moved-to-failed";
+        }
+        opts.log.warn(
+          `Delivery entry ${entry.id} remains pending after fenced Slack readback: ${readbackError}`,
+        );
+        return "failed";
+      } catch (gapErr) {
+        if (getErrnoCode(gapErr) === "ENOENT") {
+          return "already-gone";
+        }
+        opts.log.warn(
+          `Delivery entry ${entry.id} could not persist fenced Slack readback: ${formatErrorMessage(gapErr)}`,
+        );
+        return "failed";
+      }
+    }
+    const permanentError = opts.permanentPreSendFailureError ?? entry.pendingPermanentError;
     const reconciliationProvedPreSendFailure =
-      reconciliation?.status === "not_sent" && entry.recoveryState === "send_attempt_started";
+      reconciliation?.status === "not_sent" &&
+      (entry.recoveryState === "send_attempt_started" || permanentError !== undefined);
     if (reconciliationProvedPreSendFailure) {
-      opts.log.info(
-        `Delivery entry ${entry.id} reconciled ${entry.recoveryState} as not sent; replaying`,
-      );
+      const errMsg =
+        permanentError ??
+        `delivery state is ${entry.recoveryState}; reconciliation proved not sent`;
+      opts.log.info(`Delivery entry ${entry.id} reconciled ${entry.recoveryState} as not sent`);
+      opts.onFailed?.(entry, errMsg);
+      try {
+        if (permanentError !== undefined) {
+          if (entry.gaiaKeyedOutput) {
+            const result = await failPendingGaiaKeyedOutput(entry, permanentError, opts.stateDir);
+            if (result.status === "not_pending") return "already-gone";
+          } else {
+            const result = await failPendingDelivery(
+              {
+                id: entry.id,
+                expectedStatus: "pending",
+                lastError: permanentError,
+                entry,
+              },
+              opts.stateDir,
+            );
+            if (result.status === "not_pending") return "already-gone";
+          }
+          return "moved-to-failed";
+        }
+        await failDeliveryBeforePlatformSend(entry.id, errMsg, opts.stateDir);
+        return "failed";
+      } catch (failErr) {
+        if (getErrnoCode(failErr) === "ENOENT") {
+          return "already-gone";
+        }
+      }
+      return "failed";
     } else {
       let errMsg = `delivery state is ${entry.recoveryState}; refusing blind replay without adapter reconciliation`;
       if (reconciliation?.status === "not_sent") {
@@ -582,6 +691,21 @@ async function drainQueuedEntry(opts: {
       }
       opts.log.warn(`Delivery entry ${entry.id} ${errMsg}`);
       opts.onFailed?.(entry, errMsg);
+      if (
+        reconciliation?.status === "unresolved" &&
+        entry.channel === "slack" &&
+        entry.gaiaKeyedOutput
+      ) {
+        try {
+          await recordGaiaReadbackGap(entry.id, errMsg, opts.stateDir);
+          return "failed";
+        } catch (gapErr) {
+          if (getErrnoCode(gapErr) === "ENOENT") {
+            return "already-gone";
+          }
+        }
+        return "failed";
+      }
       if (reconciliation?.status === "unresolved" && reconciliation.retryable === true) {
         try {
           await failDelivery(entry.id, errMsg, opts.stateDir);
@@ -645,6 +769,27 @@ async function drainQueuedEntry(opts: {
     if (results.length > 0) {
       deliveredResults = [...results];
     }
+    if (entry.gaiaKeyedOutput && results.length === 0 && payloadOutcomes.length === 0) {
+      const currentOwner = inspectGaiaKeyedOutput(entry.gaiaKeyedOutput.accepted, opts.stateDir);
+      if (!currentOwner || currentOwner.status !== "pending") {
+        opts.log.info(
+          `Delivery entry ${entry.id} lost the durable Gaia send fence after the winner settled; preserving its terminal row`,
+        );
+        return "already-gone";
+      }
+      const currentEntry = currentOwner.entry;
+      if (
+        currentEntry.gaiaKeyedOutput &&
+        (currentEntry.platformSendStartedAt !== undefined ||
+          currentEntry.recoveryState === "send_attempt_started" ||
+          currentEntry.recoveryState === "unknown_after_send")
+      ) {
+        opts.log.info(
+          `Delivery entry ${entry.id} lost the durable Gaia send fence; preserving the winner row`,
+        );
+        return "failed";
+      }
+    }
     const failedOutcomes = payloadOutcomes.filter((outcome) => outcome.status === "failed");
     const failedOutcome = failedOutcomes[0];
     if (failedOutcome) {
@@ -692,7 +837,7 @@ async function drainQueuedEntry(opts: {
     }
     if (postSendState !== "acked") {
       try {
-        await ackDelivery(entry.id, opts.stateDir);
+        await finalizeRecoveredEntry(entry, opts.stateDir);
         postSendState = "acked";
       } catch (ackErr) {
         const ackError = `failed to ack recovered delivery: ${formatErrorMessage(ackErr)}`;
@@ -719,7 +864,6 @@ async function drainQueuedEntry(opts: {
     return "recovered";
   } catch (err) {
     const errMsg = formatErrorMessage(err);
-    opts.onFailed?.(entry, errMsg);
     if (isOutboundDeliveryError(err) && err.results.length > 0) {
       deliveredResults = [...err.results];
     }
@@ -728,6 +872,7 @@ async function drainQueuedEntry(opts: {
       postSendState !== undefined ||
       (isOutboundDeliveryError(err) && err.sentBeforeError);
     if (hasSendEvidence) {
+      opts.onFailed?.(entry, errMsg);
       // A rejected batch can still contain successful earlier sends. Preserve
       // that concrete evidence so reconnect recovery never replays the batch.
       try {
@@ -758,7 +903,9 @@ async function drainQueuedEntry(opts: {
       );
       return "failed";
     }
-    if (!(await loadPendingDelivery(entry.id, opts.stateDir))) {
+    const currentEntry = await loadPendingDelivery(entry.id, opts.stateDir);
+    if (!currentEntry) {
+      opts.onFailed?.(entry, errMsg);
       // A best-effort pre-send marker fallback may ack the row before provider
       // I/O. Recovery then owns the stable queue terminal on provider rejection.
       emitQueuedAuditTerminals(entry, () =>
@@ -772,8 +919,40 @@ async function drainQueuedEntry(opts: {
       return "failed";
     }
     if (isPermanentDeliveryError(errMsg)) {
+      const hasDurableSendEvidence =
+        currentEntry.platformSendStartedAt !== undefined ||
+        currentEntry.recoveryState === "send_attempt_started" ||
+        currentEntry.recoveryState === "unknown_after_send";
+      if (hasDurableSendEvidence) {
+        await recordPendingPermanentDeliveryError(entry.id, errMsg, opts.stateDir);
+        const reconciliationEntry =
+          currentEntry.recoveryState === "send_attempt_started" ||
+          currentEntry.recoveryState === "unknown_after_send"
+            ? {
+                ...currentEntry,
+                pendingPermanentError: currentEntry.pendingPermanentError ?? errMsg,
+              }
+            : {
+                ...currentEntry,
+                pendingPermanentError: currentEntry.pendingPermanentError ?? errMsg,
+                recoveryState: "send_attempt_started" as const,
+              };
+        return await drainQueuedEntry({
+          ...opts,
+          entry: reconciliationEntry,
+          permanentPreSendFailureError: errMsg,
+        });
+      }
+      opts.onFailed?.(entry, errMsg);
       try {
-        await moveToFailed(entry.id, opts.stateDir);
+        if (entry.gaiaKeyedOutput) {
+          const result = await failPendingGaiaKeyedOutput(entry, errMsg, opts.stateDir);
+          if (result.status === "not_pending") {
+            return "already-gone";
+          }
+        } else {
+          await moveToFailed(entry.id, opts.stateDir);
+        }
         emitQueuedAuditTerminals(entry, () =>
           failedOutboundAuditTerminals({
             payloadCount: entry.payloads.length,
@@ -789,6 +968,7 @@ async function drainQueuedEntry(opts: {
         }
       }
     } else {
+      opts.onFailed?.(entry, errMsg);
       try {
         const recordFailure = isProvenDeliveryNotSentError(err)
           ? failDeliveryBeforePlatformSend

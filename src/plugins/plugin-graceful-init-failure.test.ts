@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { getActivePluginRegistry } from "./runtime.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
 
 const fixtureTempDirs: string[] = [];
@@ -49,7 +50,11 @@ function readPluginId(pluginPath: string): string {
   return manifest.id;
 }
 
-async function loadPlugins(pluginPaths: string[], warnings?: string[]) {
+async function loadPlugins(
+  pluginPaths: string[],
+  warnings?: string[],
+  criticalPluginIds?: readonly string[],
+) {
   clearPluginLoaderCache();
   const allow = pluginPaths.map((pluginPath) => readPluginId(pluginPath));
   return loadOpenClawPlugins({
@@ -70,6 +75,7 @@ async function loadPlugins(pluginPaths: string[], warnings?: string[]) {
     },
     onlyPluginIds: allow,
     workspaceDir: fixtureRoot,
+    ...(criticalPluginIds !== undefined ? { criticalPluginIds } : {}),
   });
 }
 
@@ -93,6 +99,64 @@ function requireWarning(warnings: string[], text: string): string {
 }
 
 describe("graceful plugin initialization failure", () => {
+  it("throws a critical Gaia load failure before activating the registry", async () => {
+    const plugin = writePlugin({
+      id: "gaia-workflow-preflight",
+      body: `module.exports = { id: "gaia-workflow-preflight", register() { throw new Error("Gaia surface incomplete"); } };`,
+    });
+
+    await expect(loadPlugins([plugin.file], undefined, [plugin.id])).rejects.toMatchObject({
+      name: "PluginLoadFailureError",
+      pluginIds: [plugin.id],
+    });
+    expect(getActivePluginRegistry()?.plugins.some((entry) => entry.id === plugin.id)).toBe(false);
+  });
+
+  it("keeps unrelated failures nonfatal when Gaia is healthy", async () => {
+    const failing = writePlugin({
+      id: "unrelated-plugin",
+      body: `module.exports = { id: "unrelated-plugin", register() { throw new Error("unrelated failure"); } };`,
+    });
+    const gaia = writePlugin({
+      id: "gaia-workflow-preflight",
+      body: `module.exports = { id: "gaia-workflow-preflight", register() {} };`,
+    });
+    const warnings: string[] = [];
+
+    const registry = await loadPlugins([failing.file, gaia.file], warnings, [
+      "gaia-workflow-preflight",
+    ]);
+
+    expect(requirePluginEntry(registry, failing.id).status).toBe("error");
+    expect(requirePluginEntry(registry, gaia.id).status).toBe("loaded");
+    expect(requireWarning(warnings, "failed to initialize")).toContain(failing.id);
+  });
+
+  it("keeps the current nonfatal behavior when Gaia is absent", async () => {
+    const failing = writePlugin({
+      id: "unrelated-plugin-without-gaia",
+      body: `module.exports = { id: "unrelated-plugin-without-gaia", register() { throw new Error("unrelated failure"); } };`,
+    });
+    const warnings: string[] = [];
+
+    const registry = await loadPlugins([failing.file], warnings, ["gaia-workflow-preflight"]);
+
+    expect(requirePluginEntry(registry, failing.id).status).toBe("error");
+    expect(requireWarning(warnings, "failed to initialize")).toContain(failing.id);
+  });
+
+  it("loads Gaia normally when its registration succeeds", async () => {
+    const plugin = writePlugin({
+      id: "gaia-workflow-preflight",
+      body: `module.exports = { id: "gaia-workflow-preflight", register() {} };`,
+    });
+
+    const registry = await loadPlugins([plugin.file], undefined, [plugin.id]);
+
+    expect(requirePluginEntry(registry, plugin.id).status).toBe("loaded");
+    expect(getActivePluginRegistry()).toBe(registry);
+  });
+
   it("marks plugin entry errored when register throws", async () => {
     const plugin = writePlugin({
       id: "throws-on-register",

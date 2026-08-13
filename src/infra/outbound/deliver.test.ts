@@ -1,5 +1,7 @@
 // Covers outbound delivery core: hooks, queue cleanup, durable capability
 // checks, adapter sends, transcript mirroring, and payload outcomes.
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,13 +25,20 @@ import {
   releasePinnedPluginChannelRegistry,
   setActivePluginRegistry,
 } from "../../plugins/runtime.js";
+import {
+  bindGaiaAcceptedEnvelope,
+  withPluginRuntimeGatewayRequestScope,
+  withPluginRuntimePluginScope,
+} from "../../plugins/runtime/gateway-request-scope.js";
 import type { PluginHookRegistration } from "../../plugins/types.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import {
   createChannelTestPluginBase,
   createOutboundTestPlugin,
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
+import { getDeliveryQueueEntryStatus } from "../delivery-queue-sqlite.js";
 import {
   onInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -38,6 +47,14 @@ import {
 import { retryAsync } from "../retry.js";
 import { resolvePreferredOpenClawTmpDir } from "../tmp-openclaw-dir.js";
 import { PlatformMessageNotDispatchedError } from "./deliver-types.js";
+import {
+  ackDelivery as ackStoredDelivery,
+  admitGaiaAcceptance,
+  admitGaiaKeyedOutput,
+  completeDelivery,
+  deriveGaiaKeyedOutputOwnerId,
+  loadPendingDelivery,
+} from "./delivery-queue-storage.js";
 
 const mocks = vi.hoisted(() => ({
   appendAssistantMessageToSessionTranscript: vi.fn<() => Promise<SessionTranscriptAppendResult>>(
@@ -140,6 +157,7 @@ const matrixChunkConfig: OpenClawConfig = {
 };
 
 const expectedPreferredTmpRoot = resolvePreferredOpenClawTmpDir();
+const gaiaRecoveryStateDirs: string[] = [];
 
 type DeliverOutboundArgs = Parameters<DeliverModule["deliverOutboundPayloads"]>[0];
 type DeliverOutboundPayload = DeliverOutboundArgs["payloads"][number];
@@ -148,6 +166,88 @@ type MatrixSendFn = (
   text: string,
   options?: Record<string, unknown>,
 ) => Promise<{ messageId: string } & Record<string, unknown>>;
+
+const GAIA_ACCEPTED_ENVELOPE = {
+  runId: "gaia-delivery-run-1",
+  sessionKey: "agent:gaia:slack:channel:C123",
+  agentId: "gaia",
+  acceptedAt: 1_700_000_000_000,
+  receiptPluginId: "gaia-workflow-preflight" as const,
+};
+
+function createGaiaReceiptHook(
+  overrides: Partial<NonNullable<DeliverOutboundArgs["replyPayloadSendingHook"]>> = {},
+): NonNullable<DeliverOutboundArgs["replyPayloadSendingHook"]> {
+  return {
+    kind: "final",
+    channel: "slack",
+    sessionKey: GAIA_ACCEPTED_ENVELOPE.sessionKey,
+    runId: GAIA_ACCEPTED_ENVELOPE.runId,
+    messageSentReceiptPluginId: GAIA_ACCEPTED_ENVELOPE.receiptPluginId,
+    context: {
+      channelId: "C123",
+      conversationId: "C123",
+      runId: GAIA_ACCEPTED_ENVELOPE.runId,
+    } as never,
+    ...overrides,
+  };
+}
+
+function createGaiaDeliveryParams(
+  overrides: Partial<DeliverOutboundArgs> = {},
+): DeliverOutboundArgs {
+  return {
+    cfg: {},
+    channel: "slack",
+    to: "C123",
+    payloads: [{ text: "hello" }],
+    replyPayloadSendingHook: createGaiaReceiptHook(),
+    ...overrides,
+  };
+}
+
+function withGaiaHostAcceptance<T>(run: () => T): T {
+  return withPluginRuntimeGatewayRequestScope(
+    { context: {} as never, isWebchatConnect: () => false },
+    () =>
+      withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, () => {
+        bindGaiaAcceptedEnvelope(GAIA_ACCEPTED_ENVELOPE);
+        return run();
+      }),
+  );
+}
+
+async function createGaiaPendingOwner() {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-gaia-recovery-"));
+  gaiaRecoveryStateDirs.push(stateDir);
+  admitGaiaAcceptance(GAIA_ACCEPTED_ENVELOPE, stateDir);
+  const admitted = await admitGaiaKeyedOutput(
+    {
+      accepted: GAIA_ACCEPTED_ENVELOPE,
+      channel: "slack",
+      to: "C123",
+      payloads: [{ text: "hello" }],
+      replyPayloadSendingHook: createGaiaReceiptHook(),
+    },
+    stateDir,
+  );
+  return { stateDir, admitted };
+}
+
+function createGaiaRecoveryParams(
+  stateDir: string,
+  admitted: Awaited<ReturnType<typeof createGaiaPendingOwner>>["admitted"],
+  overrides: Partial<DeliverOutboundArgs> = {},
+): DeliverOutboundArgs {
+  return createGaiaDeliveryParams({
+    gaiaKeyedOutput: admitted.entry.gaiaKeyedOutput,
+    deliveryQueueId: admitted.ownerId,
+    deliveryQueueStateDir: stateDir,
+    deferredDeliveryAdmissionPassed: true,
+    skipQueue: true,
+    ...overrides,
+  });
+}
 
 function resolveMatrixSender(deps: DeliverOutboundArgs["deps"]): MatrixSendFn {
   const sender = deps?.matrix;
@@ -352,10 +452,231 @@ describe("deliverOutboundPayloads", () => {
     logMocks.warn.mockClear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     resetDiagnosticEventsForTest();
     releasePinnedPluginChannelRegistry();
     setActivePluginRegistry(emptyRegistry);
+    for (const stateDir of gaiaRecoveryStateDirs.splice(0)) {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when a host-accepted Gaia output has no receipt hook", async () => {
+    await expect(
+      withGaiaHostAcceptance(() =>
+        deliverOutboundPayloads(createGaiaDeliveryParams({ replyPayloadSendingHook: undefined })),
+      ),
+    ).rejects.toThrow("exact receipt hook is missing");
+    expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["run", { runId: "wrong-run" }, "receipt hook run"],
+    ["session", { sessionKey: "agent:other:slack:channel:C123" }, "receipt hook session"],
+    ["receipt plugin", { messageSentReceiptPluginId: "other-plugin" }, "receipt hook owner"],
+  ] as const)(
+    "fails closed for a host-accepted Gaia output with a wrong %s",
+    async (_, hook, message) => {
+      await expect(
+        withGaiaHostAcceptance(() =>
+          deliverOutboundPayloads(
+            createGaiaDeliveryParams({ replyPayloadSendingHook: createGaiaReceiptHook(hook) }),
+          ),
+        ),
+      ).rejects.toThrow(message);
+      expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed when the host-accepted Gaia output has the wrong plugin scope", async () => {
+    await expect(
+      withPluginRuntimeGatewayRequestScope(
+        { context: {} as never, isWebchatConnect: () => false },
+        () =>
+          withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, () => {
+            bindGaiaAcceptedEnvelope(GAIA_ACCEPTED_ENVELOPE);
+            return withPluginRuntimePluginScope({ pluginId: "other-plugin" }, () =>
+              deliverOutboundPayloads(createGaiaDeliveryParams()),
+            );
+          }),
+      ),
+    ).rejects.toThrow("exact gaia-workflow-preflight gateway request scope");
+    expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the host-accepted Gaia output has no plugin scope", async () => {
+    await expect(
+      withPluginRuntimeGatewayRequestScope(
+        { context: {} as never, isWebchatConnect: () => false },
+        async () => {
+          await withPluginRuntimePluginScope({ pluginId: "gaia-workflow-preflight" }, () => {
+            bindGaiaAcceptedEnvelope(GAIA_ACCEPTED_ENVELOPE);
+          });
+          return await deliverOutboundPayloads(createGaiaDeliveryParams());
+        },
+      ),
+    ).rejects.toThrow("exact gaia-workflow-preflight gateway request scope");
+    expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a host-accepted Gaia output requests skipQueue without exact recovery state", async () => {
+    await expect(
+      withGaiaHostAcceptance(() =>
+        deliverOutboundPayloads(createGaiaDeliveryParams({ skipQueue: true })),
+      ),
+    ).rejects.toThrow("skipQueue is reserved");
+    expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "completed"] as const)(
+    "rejects a %s Gaia recovery owner before adapter send",
+    async (disposition) => {
+      const { stateDir, admitted } = await createGaiaPendingOwner();
+      if (disposition === "missing") {
+        await ackStoredDelivery(admitted.ownerId, stateDir);
+      } else {
+        await completeDelivery(admitted.ownerId, stateDir);
+      }
+      await expect(
+        withGaiaHostAcceptance(() =>
+          deliverOutboundPayloads(createGaiaRecoveryParams(stateDir, admitted)),
+        ),
+      ).rejects.toThrow("skipQueue is reserved");
+    },
+  );
+
+  it.each([
+    ["payload", { payloads: [{ text: "changed" }] }],
+    ["target", { to: "C999" }],
+  ] as const)("rejects Gaia recovery when actual %s drifts", async (_, overrides) => {
+    const { stateDir, admitted } = await createGaiaPendingOwner();
+    await expect(
+      withGaiaHostAcceptance(() =>
+        deliverOutboundPayloads(createGaiaRecoveryParams(stateDir, admitted, overrides)),
+      ),
+    ).rejects.toThrow("skipQueue is reserved");
+  });
+
+  it("sends with the exact pending Gaia recovery owner", async () => {
+    const { stateDir, admitted } = await createGaiaPendingOwner();
+    const sendSlack = vi.fn().mockResolvedValue({ channel: "slack", messageId: "recovered" });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "slack",
+          source: "test",
+          plugin: createOutboundTestPlugin({
+            id: "slack",
+            outbound: { deliveryMode: "direct", sendText: async () => sendSlack() },
+          }),
+        },
+      ]),
+    );
+    await withGaiaHostAcceptance(() =>
+      deliverOutboundPayloads(createGaiaRecoveryParams(stateDir, admitted)),
+    );
+    expect(sendSlack).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows only the durable Gaia Slack fence winner to enter the adapter", async () => {
+    const { stateDir, admitted } = await createGaiaPendingOwner();
+    let signalAdapterEntered: (() => void) | undefined;
+    let releaseAdapter: (() => void) | undefined;
+    const adapterEntered = new Promise<void>((resolve) => {
+      signalAdapterEntered = resolve;
+    });
+    const adapterHold = new Promise<void>((resolve) => {
+      releaseAdapter = resolve;
+    });
+    const adapterSend = vi.fn(async () => {
+      signalAdapterEntered?.();
+      await adapterHold;
+      return { channel: "slack", messageId: "winner" };
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "slack",
+          source: "test",
+          plugin: createOutboundTestPlugin({
+            id: "slack",
+            outbound: { deliveryMode: "direct", sendText: adapterSend },
+          }),
+        },
+      ]),
+    );
+
+    const winner = withGaiaHostAcceptance(() =>
+      deliverOutboundPayloads(createGaiaRecoveryParams(stateDir, admitted)),
+    );
+    await adapterEntered;
+    const winnerRow = await loadPendingDelivery(admitted.ownerId, stateDir);
+    const loserOutcome = vi.fn();
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await expect(
+        withGaiaHostAcceptance(() =>
+          deliverOutboundPayloads(
+            createGaiaRecoveryParams(stateDir, admitted, {
+              onPayloadDeliveryOutcome: loserOutcome,
+            }),
+          ),
+        ),
+      ).resolves.toEqual([]);
+    }
+    expect(adapterSend).toHaveBeenCalledTimes(1);
+    expect(loserOutcome).not.toHaveBeenCalled();
+    expect(await loadPendingDelivery(admitted.ownerId, stateDir)).toEqual(winnerRow);
+    releaseAdapter?.();
+    await expect(winner).resolves.toEqual([{ channel: "slack", messageId: "winner" }]);
+    expect(adapterSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not create a second send authority when a live Gaia owner corrupts at completion", async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-gaia-live-corrupt-"));
+    gaiaRecoveryStateDirs.push(stateDir);
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const sendSlack = vi.fn(async ({ deliveryQueueId }: { deliveryQueueId?: string }) => {
+      const { db } = openOpenClawStateDatabase();
+      db.prepare(
+        "UPDATE delivery_queue_entries SET entry_json = ? WHERE queue_name = 'outbound' AND id = ?",
+      ).run("{", deliveryQueueId);
+      return { channel: "slack", messageId: "live-1" };
+    });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "slack",
+          source: "test",
+          plugin: createOutboundTestPlugin({
+            id: "slack",
+            outbound: { deliveryMode: "direct", sendText: sendSlack },
+          }),
+        },
+      ]),
+    );
+    admitGaiaAcceptance(GAIA_ACCEPTED_ENVELOPE, stateDir);
+
+    try {
+      const deliver = () =>
+        withGaiaHostAcceptance(() =>
+          deliverOutboundPayloads(createGaiaDeliveryParams({ queuePolicy: "required" })),
+        );
+      await expect(deliver()).rejects.toThrow();
+      expect(
+        getDeliveryQueueEntryStatus(
+          "outbound",
+          deriveGaiaKeyedOutputOwnerId(GAIA_ACCEPTED_ENVELOPE.runId),
+          stateDir,
+        ),
+      ).toBe("pending");
+      await expect(deliver()).resolves.toEqual([]);
+      expect(sendSlack).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+      else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
   });
 
   it("delivers through full active plugin when pinned setup channel has no sender", async () => {

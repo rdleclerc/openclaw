@@ -41,6 +41,7 @@ export type CanonicalInboundMessageHookContext = {
   runId?: string;
   messageId?: string;
   senderId?: string;
+  senderIsBot?: boolean;
   senderName?: string;
   senderUsername?: string;
   senderE164?: string;
@@ -187,6 +188,7 @@ export function deriveInboundMessageHookContext(
       ctx.MessageSidFirst ??
       ctx.MessageSidLast,
     senderId: ctx.SenderId,
+    ...(ctx.SenderIsBot !== undefined ? { senderIsBot: ctx.SenderIsBot } : {}),
     senderName: ctx.SenderName,
     senderUsername: ctx.SenderUsername,
     senderE164: ctx.SenderE164,
@@ -298,6 +300,9 @@ export function toPluginMessageContext(
   if ("senderId" in canonical && canonical.senderId) {
     context.senderId = canonical.senderId;
   }
+  if ("senderIsBot" in canonical && canonical.senderIsBot !== undefined) {
+    context.senderIsBot = canonical.senderIsBot;
+  }
   if ("replyToId" in canonical && canonical.replyToId !== undefined) {
     context.replyToId = canonical.replyToId;
   }
@@ -360,6 +365,7 @@ export function toPluginInboundClaimContext(
     agentId: canonical.agentId,
     parentConversationId: conversation.parentConversationId,
     senderId: canonical.senderId,
+    ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
     messageId: canonical.messageId,
     runId: canonical.runId,
     callDepth: canonical.callDepth,
@@ -402,6 +408,7 @@ export function toPluginInboundClaimEvent(
     conversationId: context.conversationId,
     parentConversationId: context.parentConversationId,
     senderId: canonical.senderId,
+    ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
     senderName: canonical.senderName,
     senderUsername: canonical.senderUsername,
     ...(canonical.replyToId !== undefined ? { replyToId: canonical.replyToId } : {}),
@@ -424,6 +431,7 @@ export function toPluginInboundClaimEvent(
       originatingChannel: canonical.originatingChannel,
       originatingTo: canonical.originatingTo,
       senderE164: canonical.senderE164,
+      ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
       replyToId: canonical.replyToId,
       replyToIdFull: canonical.replyToIdFull,
       replyToBody: canonical.replyToBody,
@@ -458,6 +466,7 @@ export function toPluginMessageReceivedEvent(
     threadId: canonical.threadId,
     messageId: canonical.messageId,
     senderId: canonical.senderId,
+    ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
     ...(canonical.replyToId !== undefined ? { replyToId: canonical.replyToId } : {}),
     ...(canonical.replyToIdFull !== undefined ? { replyToIdFull: canonical.replyToIdFull } : {}),
     ...(canonical.replyToBody !== undefined ? { replyToBody: canonical.replyToBody } : {}),
@@ -477,6 +486,7 @@ export function toPluginMessageReceivedEvent(
       senderName: canonical.senderName,
       senderUsername: canonical.senderUsername,
       senderE164: canonical.senderE164,
+      ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
       replyToId: canonical.replyToId,
       replyToIdFull: canonical.replyToIdFull,
       replyToBody: canonical.replyToBody,
@@ -536,6 +546,7 @@ export function toInternalMessageReceivedContext(
       surface: canonical.surface,
       threadId: canonical.threadId,
       senderId: canonical.senderId,
+      ...(canonical.senderIsBot !== undefined ? { senderIsBot: canonical.senderIsBot } : {}),
       senderName: canonical.senderName,
       senderUsername: canonical.senderUsername,
       senderE164: canonical.senderE164,

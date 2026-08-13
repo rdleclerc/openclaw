@@ -56,6 +56,7 @@ function createRunHandle(
     isStreaming?: boolean;
     isStopped?: () => boolean;
     runId?: string;
+    lifecycleGeneration?: string;
     queueMessage?: (
       text: string,
       options?: Parameters<RunHandle["queueMessage"]>[1],
@@ -68,6 +69,7 @@ function createRunHandle(
   const abort = overrides.abort ?? (() => {});
   return {
     runId: overrides.runId,
+    lifecycleGeneration: overrides.lifecycleGeneration,
     queueMessage: overrides.queueMessage ?? (async () => {}),
     isStreaming: () => overrides.isStreaming ?? true,
     ...(overrides.isStopped ? { isStopped: overrides.isStopped } : {}),
@@ -227,6 +229,23 @@ describe("embedded-agent runner run registry", () => {
 
     clearEmbeddedAgentRunAbortabilityForRunId("run-finalizing");
     expect(isEmbeddedAgentRunAbortableForRunId("run-finalizing")).toBe(true);
+  });
+
+  it("keeps a same-run replacement after stale generation cleanup", () => {
+    const oldHandle = createRunHandle({ runId: "run-generation", lifecycleGeneration: "old" });
+    const replacement = createRunHandle({
+      runId: "run-generation",
+      lifecycleGeneration: "new",
+      isAbortable: false,
+    });
+    setActiveEmbeddedRun("session-generation", oldHandle);
+    setActiveEmbeddedRun("session-generation", replacement);
+
+    clearEmbeddedAgentRunAbortabilityForRunId("run-generation", "old");
+
+    expect(isEmbeddedAgentRunAbortableForRunId("run-generation")).toBe(false);
+    clearEmbeddedAgentRunAbortabilityForRunId("run-generation", "new");
+    expect(isEmbeddedAgentRunAbortableForRunId("run-generation")).toBe(true);
   });
 
   it("passes restart ownership to every aborted run", () => {

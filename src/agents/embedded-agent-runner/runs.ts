@@ -381,9 +381,19 @@ export function isEmbeddedAgentRunAbortableForRunId(runId: string): boolean {
   return handle ? isEmbeddedRunHandleAbortable(normalizedRunId, handle) : true;
 }
 
-export function clearEmbeddedAgentRunAbortabilityForRunId(runId: string): void {
+export function clearEmbeddedAgentRunAbortabilityForRunId(
+  runId: string,
+  expectedLifecycleGeneration?: string,
+): void {
   const normalizedRunId = runId.trim();
   if (normalizedRunId) {
+    const activeHandle = ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(normalizedRunId);
+    if (
+      expectedLifecycleGeneration !== undefined &&
+      activeHandle?.lifecycleGeneration !== expectedLifecycleGeneration
+    ) {
+      return;
+    }
     ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.delete(normalizedRunId);
     RETAINED_EMBEDDED_RUN_ABORTABILITY_RUN_IDS.delete(normalizedRunId);
   }
