@@ -606,6 +606,7 @@ export async function dispatchTrustedPluginGatewayMethod<T>(
     configuredPluginConfig?.gatewayAgentExactAbortAllowed === true &&
     exactAbortRunIdPrefix &&
     exactAbortRunId?.startsWith(exactAbortRunIdPrefix) &&
+    params.runId === exactAbortRunId &&
     exactAbortKeys.length === 4 &&
     exactAbortKeys.every(
       (key) =>

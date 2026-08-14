@@ -1684,11 +1684,25 @@ describe("loadGatewayPlugins", () => {
       allowed: boolean;
     }> = [
       {
-        name: "exact authority",
+        name: "canonical exact authority",
         config: exactConfig,
         method: "sessions.abort",
         params: exactParams,
         allowed: true,
+      },
+      {
+        name: "leading whitespace run ID",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, runId: ` ${exactParams.runId}` },
+        allowed: false,
+      },
+      {
+        name: "trailing whitespace run ID",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, runId: `${exactParams.runId} ` },
+        allowed: false,
       },
       {
         name: "observation only",
@@ -1767,6 +1781,7 @@ describe("loadGatewayPlugins", () => {
           { pluginId: "configured-receipt-owner", pluginOrigin: "config" },
           () => runtime.gateway.request(testCase.method, testCase.params, testCase.options),
         );
+      const dispatchCount = handleGatewayRequest.mock.calls.length;
       if (testCase.allowed) {
         await expect(request()).resolves.toEqual({});
         expect(getLastDispatchedMethod()).toBe("sessions.abort");
@@ -1776,6 +1791,7 @@ describe("loadGatewayPlugins", () => {
         );
       } else {
         await expect(request()).rejects.toThrow("bundled or trusted official plugins");
+        expect(handleGatewayRequest.mock.calls).toHaveLength(dispatchCount);
       }
     }
   });
