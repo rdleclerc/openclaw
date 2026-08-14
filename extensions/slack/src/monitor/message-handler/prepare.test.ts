@@ -1321,6 +1321,25 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     expect(prepared.ctxPayload.SenderIsBot).toBeUndefined();
   });
 
+  it.each([
+    { label: "human thread_broadcast", isBot: false, subtype: "thread_broadcast" },
+    { label: "bot file_share", isBot: true, subtype: "file_share" },
+  ] as const)("preserves Slack subtype and sender facts for $label", async ({ isBot, subtype }) => {
+    const ctx = isBot
+      ? createOwnerScopedBotRoomCtx({ members: ["UOWNER"] }).slackCtx
+      : createDefaultSlackCtx();
+    const message = isBot ? createBotRoomMessage({ subtype }) : createSlackMessage({ subtype });
+    const prepared = await prepareMessageWith(
+      ctx,
+      isBot ? createSlackAccount({ allowBots: true }) : defaultAccount,
+      message,
+    );
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.MessageSubtype).toBe(subtype);
+    expect(prepared.ctxPayload.SenderIsBot).toBe(isBot);
+  });
+
   it("allows bot-authored room messages when the bot is explicitly channel-allowlisted (#59284)", async () => {
     const members = vi.fn();
     const slackCtx = createInboundSlackCtx({

@@ -41,6 +41,7 @@ export type CanonicalInboundMessageHookContext = {
   runId?: string;
   messageId?: string;
   senderId?: string;
+  messageSubtype?: string;
   senderIsBot?: boolean;
   senderName?: string;
   senderUsername?: string;
@@ -188,7 +189,8 @@ export function deriveInboundMessageHookContext(
       ctx.MessageSidFirst ??
       ctx.MessageSidLast,
     senderId: ctx.SenderId,
-    ...(ctx.SenderIsBot !== undefined ? { senderIsBot: ctx.SenderIsBot } : {}),
+    messageSubtype: readNonBlankString(ctx.MessageSubtype),
+    ...(typeof ctx.SenderIsBot === "boolean" ? { senderIsBot: ctx.SenderIsBot } : {}),
     senderName: ctx.SenderName,
     senderUsername: ctx.SenderUsername,
     senderE164: ctx.SenderE164,

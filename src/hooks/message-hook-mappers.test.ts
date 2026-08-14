@@ -158,6 +158,17 @@ describe("message hook mappers", () => {
     }
   });
 
+  it.each([
+    { label: "human thread_broadcast", subtype: "thread_broadcast", isBot: false },
+    { label: "bot file_share", subtype: "file_share", isBot: true },
+  ])("preserves $label in the canonical inbound context", ({ subtype, isBot }) => {
+    const canonical = deriveInboundMessageHookContext(
+      makeInboundCtx({ MessageSubtype: subtype, SenderIsBot: isBot }),
+    );
+
+    expect(canonical).toMatchObject({ messageSubtype: subtype, senderIsBot: isBot });
+  });
+
   it("uses the session key as the Control UI conversation id", () => {
     const canonical = deriveInboundMessageHookContext(
       makeInboundCtx({

@@ -1559,6 +1559,8 @@ async function dispatchReplyFromConfigInner(
                     channel: hookContext.channelId,
                     sessionKey: sessionStoreEntry.sessionKey ?? sessionKey,
                     senderId: hookContext.senderId,
+                    messageSubtype: hookContext.messageSubtype,
+                    senderIsBot: hookContext.senderIsBot,
                     replyToId: hookContext.replyToId,
                     replyToIdFull: hookContext.replyToIdFull,
                     replyToBody: hookContext.replyToBody,

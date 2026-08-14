@@ -1573,6 +1573,7 @@ export async function prepareSlackMessage(params: {
       groupSystemPrompt,
     },
     extra: {
+      MessageSubtype: message.subtype,
       GroupSubject: isRoomish ? roomLabel : undefined,
       UntrustedContext: untrustedChannelMetadata ? [untrustedChannelMetadata] : undefined,
       TransportThreadId: directThreadRoutedToDmSession ? threadContext.messageThreadId : undefined,

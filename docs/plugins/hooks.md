@@ -554,6 +554,10 @@ has visibility-filtered quoted message data: `replyToId`, `replyToIdFull`,
 `replyToBody`, `replyToSender`, and `replyToIsQuote`. Prefer these
 first-class fields before reading legacy metadata.
 
+Inbound `before_dispatch` events may also expose the optional
+`messageSubtype` and `senderIsBot` transport facts when the channel supplies
+them. If absent, the fact is unknown.
+
 Prefer typed `threadId` and `replyToId` fields before using channel-specific
 metadata.
 

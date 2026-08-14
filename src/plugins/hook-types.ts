@@ -481,6 +481,8 @@ export type PluginHookBeforeDispatchEvent = {
   channel?: string;
   sessionKey?: string;
   senderId?: string;
+  messageSubtype?: string;
+  senderIsBot?: boolean;
   replyToId?: string;
   replyToIdFull?: string;
   replyToBody?: string;
