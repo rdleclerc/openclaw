@@ -591,7 +591,38 @@ export async function dispatchTrustedPluginGatewayMethod<T>(
         params.limit >= 1 &&
         params.limit <= 20)),
   );
-  if (!trustedOfficial && !configuredAgentDispatch && !configuredAgentObservation) {
+  const exactAbortRunId =
+    typeof params.runId === "string" && params.runId.trim() ? params.runId.trim() : undefined;
+  const exactAbortRunIdPrefix =
+    typeof configuredPluginConfig?.gatewayAgentExactAbortRunIdPrefix === "string"
+      ? configuredPluginConfig.gatewayAgentExactAbortRunIdPrefix.trim()
+      : "";
+  const exactAbortKeys = Object.keys(params);
+  const configuredExactAbort = Boolean(
+    method === "sessions.abort" &&
+    pluginId &&
+    scope?.pluginOrigin === "config" &&
+    options?.scopes === undefined &&
+    configuredPluginConfig?.gatewayAgentExactAbortAllowed === true &&
+    exactAbortRunIdPrefix &&
+    exactAbortRunId?.startsWith(exactAbortRunIdPrefix) &&
+    exactAbortKeys.length === 4 &&
+    exactAbortKeys.every(
+      (key) =>
+        key === "key" || key === "runId" || key === "agentId" || key === "requireExactTarget",
+    ) &&
+    params.requireExactTarget === true &&
+    typeof params.key === "string" &&
+    params.key.trim() &&
+    typeof params.agentId === "string" &&
+    params.agentId.trim(),
+  );
+  if (
+    !trustedOfficial &&
+    !configuredAgentDispatch &&
+    !configuredAgentObservation &&
+    !configuredExactAbort
+  ) {
     throw new Error("Gateway requests are only available to bundled or trusted official plugins.");
   }
   const trustedRequestMessageId =

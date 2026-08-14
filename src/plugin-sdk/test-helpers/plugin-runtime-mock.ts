@@ -372,6 +372,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
         agentWaitProviderStarted: true,
         agentWaitTimeoutPhase: true,
         auditAgentRunSourceSequence: true,
+        sessionsAbortDurableTerminal: true,
       }),
       isAvailable: vi.fn(async () => false),
       request: vi.fn(),

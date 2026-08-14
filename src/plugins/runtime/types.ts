@@ -111,6 +111,7 @@ export type RuntimeGatewayCapabilities = Readonly<{
   agentWaitProviderStarted: true;
   agentWaitTimeoutPhase: true;
   auditAgentRunSourceSequence: true;
+  sessionsAbortDurableTerminal: true;
 }>;
 
 /** Trusted in-process runtime surface injected into native plugins. */

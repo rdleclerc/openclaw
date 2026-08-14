@@ -1655,6 +1655,131 @@ describe("loadGatewayPlugins", () => {
     ).rejects.toThrow("bundled or trusted official plugins");
   });
 
+  test("grants configured plugins only the closed exact abort authority", async () => {
+    loadOpenClawPlugins.mockReturnValue(
+      addLoadedPlugin(createRegistry([]), {
+        id: "configured-receipt-owner",
+        origin: "config",
+      }),
+    );
+    loadGatewayStartupPluginsForTest();
+    const configuredContext = createTestContext("configured-receipt-owner-abort");
+    const runtime = runtimeModule.createPluginRuntime();
+    const exactConfig = {
+      gatewayAgentExactAbortAllowed: true,
+      gatewayAgentExactAbortRunIdPrefix: "gaia-slack-admission-replay:",
+    };
+    const exactParams = {
+      key: "agent:main:slack:channel:c123:thread:1784768109.234419",
+      runId: "gaia-slack-admission-replay:request-1",
+      agentId: "main",
+      requireExactTarget: true,
+    };
+    const cases: Array<{
+      name: string;
+      config: Record<string, unknown>;
+      method: string;
+      params: Record<string, unknown>;
+      options?: GatewayRequestOptions;
+      allowed: boolean;
+    }> = [
+      {
+        name: "exact authority",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: exactParams,
+        allowed: true,
+      },
+      {
+        name: "observation only",
+        config: {
+          gatewayAgentObservationAllowed: true,
+          gatewayAgentObservationRunIdPrefix: exactConfig.gatewayAgentExactAbortRunIdPrefix,
+        },
+        method: "sessions.abort",
+        params: exactParams,
+        allowed: false,
+      },
+      {
+        name: "exact flag false",
+        config: { ...exactConfig, gatewayAgentExactAbortAllowed: false },
+        method: "sessions.abort",
+        params: exactParams,
+        allowed: false,
+      },
+      {
+        name: "prefix mismatch",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, runId: "other-run" },
+        allowed: false,
+      },
+      {
+        name: "extra parameter",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, timeoutMs: 0 },
+        allowed: false,
+      },
+      {
+        name: "non-exact flag",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, requireExactTarget: false },
+        allowed: false,
+      },
+      {
+        name: "missing session",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, key: "" },
+        allowed: false,
+      },
+      {
+        name: "missing agent",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: { ...exactParams, agentId: "" },
+        allowed: false,
+      },
+      {
+        name: "caller scope",
+        config: exactConfig,
+        method: "sessions.abort",
+        params: exactParams,
+        options: { scopes: ["operator.admin"] },
+        allowed: false,
+      },
+      { name: "other method", config: exactConfig, method: "health", params: {}, allowed: false },
+    ];
+
+    for (const testCase of cases) {
+      serverPluginsModule.setFallbackGatewayContext({
+        ...configuredContext,
+        getRuntimeConfig: () => ({
+          plugins: {
+            entries: { "configured-receipt-owner": { config: testCase.config } },
+          },
+        }),
+      } as GatewayRequestContext);
+      const request = () =>
+        gatewayRequestScopeModule.withPluginRuntimePluginScope(
+          { pluginId: "configured-receipt-owner", pluginOrigin: "config" },
+          () => runtime.gateway.request(testCase.method, testCase.params, testCase.options),
+        );
+      if (testCase.allowed) {
+        await expect(request()).resolves.toEqual({});
+        expect(getLastDispatchedMethod()).toBe("sessions.abort");
+        expect(getLastDispatchedParams()).toEqual(exactParams);
+        expect(getLastDispatchedClientInternal().pluginRuntimeOwnerId).toBe(
+          "configured-receipt-owner",
+        );
+      } else {
+        await expect(request()).rejects.toThrow("bundled or trusted official plugins");
+      }
+    }
+  });
+
   test("does not let arbitrary plugin nodes runtime mint admin scope for browser proxy", async () => {
     loadOpenClawPlugins.mockReturnValue(
       addLoadedPlugin(createRegistry([]), { id: "third-party", origin: "global" }),

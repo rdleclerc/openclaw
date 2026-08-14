@@ -277,7 +277,8 @@ two-party event loops that do not go through the shared inbound reply runner.
 
     `api.runtime.gateway.capabilities` is a frozen host descriptor. Contract version 1 declares
     the accepted-callback execution barrier, `agent.wait` fields for `providerStarted` and
-    `timeoutPhase`, and per-run `sourceSequence` on `agent_run` audit events. A plugin that takes
+    `timeoutPhase`, per-run `sourceSequence` on `agent_run` audit events, and the
+    `sessionsAbortDurableTerminal` Boolean for exact durable terminal abort results. A plugin that takes
     durable ownership before dispatch should validate this descriptor before writing its row;
     method-name availability alone does not prove those observation semantics.
 
@@ -298,6 +299,10 @@ two-party event loops that do not go through the shared inbound reply runner.
     `gatewayAgentObservationAllowed: true` plus non-empty
     `gatewayAgentObservationRunIdPrefix` permits only nonblocking `agent.wait` and bounded
     `audit.activity.list` calls for `agent_run` events whose exact run ID starts with that prefix.
+    A separate `gatewayAgentExactAbortAllowed: true` plus non-empty
+    `gatewayAgentExactAbortRunIdPrefix` permits only the closed exact-target
+    `sessions.abort` shape for runs in that prefix. It does not grant broad abort
+    resolution or any observation permission.
     Neither exception permits caller-supplied scopes or other Gateway methods. Failed methods throw a
     `GatewayClientRequestError`, preserving structured `details`, retry metadata, and the Gateway
     error code for recovery flows. Use `isAvailable()` before choosing this path from tools that can

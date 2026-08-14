@@ -26,6 +26,7 @@ function browserRuntime(request: TestGatewayRequest): PluginRuntime {
       agentWaitProviderStarted: true,
       agentWaitTimeoutPhase: true,
       auditAgentRunSourceSequence: true,
+      sessionsAbortDurableTerminal: true,
     }),
     isAvailable: async () => true,
     request: async <T = unknown>(

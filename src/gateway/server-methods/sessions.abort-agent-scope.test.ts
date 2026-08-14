@@ -13,6 +13,7 @@ const resolveSessionKeyForRunMock = vi.fn();
 const listSessionsFromStoreAsyncMock = vi.fn();
 const loadCombinedSessionStoreForGatewayMock = vi.fn();
 const isEmbeddedAgentRunActiveMock = vi.fn();
+const listTaskRecordsUnsortedMock = vi.fn(() => []);
 const loadSessionEntryMock = vi.fn((sessionKey: string, _opts?: { agentId?: string }) => ({
   canonicalKey: sessionKey,
 }));
@@ -43,6 +44,16 @@ vi.mock("../session-utils.js", async () => {
       loadCombinedSessionStoreForGatewayMock(...args),
     loadSessionEntry: (...args: unknown[]) =>
       loadSessionEntryMock(...(args as [string, { agentId?: string }?])),
+  };
+});
+
+vi.mock("../../tasks/runtime-internal.js", async () => {
+  const actual = await vi.importActual<typeof import("../../tasks/runtime-internal.js")>(
+    "../../tasks/runtime-internal.js",
+  );
+  return {
+    ...actual,
+    listTaskRecordsUnsorted: (...args: unknown[]) => listTaskRecordsUnsortedMock(...args),
   };
 });
 
@@ -208,6 +219,8 @@ describe("sessions.abort agent scope", () => {
     loadSessionEntryMock.mockClear();
     isEmbeddedAgentRunActiveMock.mockReset();
     isEmbeddedAgentRunActiveMock.mockReturnValue(false);
+    listTaskRecordsUnsortedMock.mockReset();
+    listTaskRecordsUnsortedMock.mockReturnValue([]);
   });
 
   it("does not abort an active run whose session key belongs to another requested agent", async () => {
@@ -624,6 +637,168 @@ describe("sessions.abort agent scope", () => {
       ok: true,
       abortedRunId: null,
       status: "target-mismatch",
+    });
+  });
+
+  it("keeps active registry ownership ahead of durable terminal lookup", async () => {
+    const activeRun = {
+      ...createActiveRun("agent:main:dashboard:target"),
+      isAbortable: () => false,
+    };
+    const context = createContext({ activeRuns: [["run-terminal", activeRun]] });
+    listTaskRecordsUnsortedMock.mockReturnValue([{ runId: "run-terminal", status: "cancelled" }]);
+
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-terminal",
+        key: activeRun.sessionKey,
+        agentId: "main",
+      },
+      { context, reqId: "req-active-wins" },
+    );
+
+    expect(listTaskRecordsUnsortedMock).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "not-abortable",
+    });
+  });
+
+  it.each([
+    { label: "succeeded", status: "succeeded", expected: true, overrides: {} },
+    { label: "failed", status: "failed", expected: true, overrides: {} },
+    { label: "timed out", status: "timed_out", expected: true, overrides: {} },
+    { label: "cancelled", status: "cancelled", expected: true, overrides: {} },
+    { label: "lost", status: "lost", expected: true, overrides: {} },
+    { label: "queued", status: "queued", expected: false, overrides: {} },
+    { label: "running", status: "running", expected: false, overrides: {} },
+    {
+      label: "wrong runtime",
+      status: "cancelled",
+      expected: false,
+      overrides: { runtime: "subagent" },
+    },
+    {
+      label: "wrong source",
+      status: "cancelled",
+      expected: false,
+      overrides: { sourceId: "other-run" },
+    },
+    {
+      label: "wrong scope",
+      status: "cancelled",
+      expected: false,
+      overrides: { scopeKind: "system" },
+    },
+    {
+      label: "wrong owner",
+      status: "cancelled",
+      expected: false,
+      overrides: { ownerKey: "agent:main:other" },
+    },
+    {
+      label: "wrong child",
+      status: "cancelled",
+      expected: false,
+      overrides: { childSessionKey: "agent:main:other" },
+    },
+    { label: "wrong agent", status: "cancelled", expected: false, overrides: { agentId: "work" } },
+    { label: "wrong run", status: "cancelled", expected: false, overrides: { runId: "other-run" } },
+    {
+      label: "missing ended time",
+      status: "cancelled",
+      expected: false,
+      overrides: { endedAt: undefined },
+    },
+    {
+      label: "invalid ended time",
+      status: "cancelled",
+      expected: false,
+      overrides: { endedAt: Number.NaN },
+    },
+  ])(
+    "returns durable terminal authority only for $label",
+    async ({ status, expected, overrides }) => {
+      const sessionKey = "agent:main:dashboard:target";
+      listTaskRecordsUnsortedMock.mockReturnValue([
+        {
+          taskId: "task-terminal",
+          runtime: "cli",
+          sourceId: "run-terminal",
+          requesterSessionKey: sessionKey,
+          ownerKey: sessionKey,
+          scopeKind: "session",
+          childSessionKey: sessionKey,
+          agentId: "MAIN",
+          runId: "run-terminal",
+          task: "sanitized terminal task",
+          status,
+          deliveryStatus: "not_applicable",
+          notifyPolicy: "silent",
+          createdAt: 1,
+          endedAt: 2_000,
+          ...overrides,
+        },
+      ]);
+
+      const respond = await callSessions(
+        "sessions.abort",
+        {
+          requireExactTarget: true,
+          runId: "run-terminal",
+          key: sessionKey,
+          agentId: "main",
+        },
+        { context: createContext(), reqId: `req-terminal-${String(status)}` },
+      );
+
+      if (expected) {
+        expect(respond).toHaveBeenCalledWith(true, {
+          ok: true,
+          abortedRunId: null,
+          status: "already-terminal",
+          terminalRunId: "run-terminal",
+          terminalStatus: status,
+          endedAt: 2_000,
+        });
+      } else {
+        expect(respond).toHaveBeenCalledWith(true, {
+          ok: true,
+          abortedRunId: null,
+          status: "no-active-run",
+        });
+      }
+    },
+  );
+
+  it.each([
+    ["duplicate rows", [{ runId: "run-terminal" }, { runId: "run-terminal" }]],
+    ["corrupt registry", null],
+  ] as const)("fails closed for %s", async (_label, records) => {
+    if (records === null) {
+      listTaskRecordsUnsortedMock.mockImplementationOnce(() => {
+        throw new Error("corrupt task registry");
+      });
+    } else {
+      listTaskRecordsUnsortedMock.mockReturnValue(records);
+    }
+    const respond = await callSessions(
+      "sessions.abort",
+      {
+        requireExactTarget: true,
+        runId: "run-terminal",
+        key: "agent:main:dashboard:target",
+        agentId: "main",
+      },
+      { context: createContext(), reqId: `req-terminal-${_label}` },
+    );
+    expect(respond).toHaveBeenCalledWith(true, {
+      ok: true,
+      abortedRunId: null,
+      status: "no-active-run",
     });
   });
 

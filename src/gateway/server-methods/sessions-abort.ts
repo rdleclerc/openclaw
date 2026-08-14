@@ -12,6 +12,7 @@ import {
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
+import { listTaskRecordsUnsorted, type TaskRecord } from "../../tasks/runtime-internal.js";
 import { abortChatRunById } from "../chat-abort.js";
 import { resolveSessionKeyForRun } from "../server-session-key.js";
 import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-create-service.js";
@@ -121,6 +122,53 @@ function resolveScopedAbortKey(params: {
 
 type StrictAbortIdentity = { canonicalKey: string; agentId: string };
 
+const DURABLE_TERMINAL_TASK_STATUSES = new Set<TaskRecord["status"]>([
+  "succeeded",
+  "failed",
+  "timed_out",
+  "cancelled",
+  "lost",
+]);
+
+function findExactDurableTerminalTask(params: {
+  runId: string;
+  canonicalKey: string;
+  agentId: string;
+}): TaskRecord | undefined {
+  try {
+    const records = listTaskRecordsUnsorted();
+    if (!Array.isArray(records)) {
+      return undefined;
+    }
+    const runRecords = records.filter((record) => record?.runId === params.runId);
+    if (runRecords.length !== 1) {
+      return undefined;
+    }
+    const [record] = runRecords;
+    const recordAgentId = normalizeOptionalString(record?.agentId);
+    if (
+      !record ||
+      typeof record !== "object" ||
+      record.runtime !== "cli" ||
+      record.sourceId !== params.runId ||
+      record.scopeKind !== "session" ||
+      record.ownerKey !== params.canonicalKey ||
+      record.childSessionKey !== params.canonicalKey ||
+      !recordAgentId ||
+      normalizeAgentId(recordAgentId) !== params.agentId ||
+      !DURABLE_TERMINAL_TASK_STATUSES.has(record.status) ||
+      typeof record.endedAt !== "number" ||
+      !Number.isFinite(record.endedAt) ||
+      record.endedAt <= 0
+    ) {
+      return undefined;
+    }
+    return record;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveStrictAbortIdentity(params: {
   cfg: OpenClawConfig;
   key: string | undefined;
@@ -176,6 +224,35 @@ async function handleStrictSessionAbort(params: {
   const runId = params.runId;
   const activeRun = runId ? params.context.chatAbortControllers.get(runId) : undefined;
   if (!activeRun) {
+    if (params.key && params.agentId) {
+      const requestedIdentity = resolveStrictAbortIdentity({
+        cfg: params.cfg,
+        key: params.key,
+        agentId: params.agentId,
+      });
+      if (!requestedIdentity) {
+        targetMismatch();
+        return;
+      }
+      const terminalTask = runId
+        ? findExactDurableTerminalTask({
+            runId,
+            canonicalKey: requestedIdentity.canonicalKey,
+            agentId: requestedIdentity.agentId,
+          })
+        : undefined;
+      if (terminalTask) {
+        params.respond(true, {
+          ok: true,
+          abortedRunId: null,
+          status: "already-terminal",
+          terminalRunId: runId,
+          terminalStatus: terminalTask.status,
+          endedAt: terminalTask.endedAt,
+        });
+        return;
+      }
+    }
     noActiveRun();
     return;
   }
