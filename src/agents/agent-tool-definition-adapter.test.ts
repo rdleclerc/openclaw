@@ -74,6 +74,30 @@ describe("agent tool definition adapter", () => {
     expect(definition?.executionMode).toBe("sequential");
   });
 
+  it("preserves structured denial fields in a normal agent tool result", async () => {
+    const result = await executeTool(
+      {
+        name: "denied_tool",
+        label: "Denied Tool",
+        description: "",
+        parameters: Type.Object({}),
+        execute: async () => ({
+          content: [{ type: "text", text: "denied" }],
+          details: {
+            errorCode: "delegated_channel_mismatch",
+            deniedBy: "openclaw_delegated_context",
+          },
+        }),
+      } satisfies AgentTool,
+      "call-denied",
+    );
+
+    expect(result).toEqual({
+      content: [{ type: "text", text: "denied" }],
+      details: { errorCode: "delegated_channel_mismatch", deniedBy: "openclaw_delegated_context" },
+    });
+  });
+
   it("wraps tool errors into a tool result", async () => {
     const result = await executeThrowingTool("boom", "call1");
 

@@ -6,9 +6,24 @@ import { handleSlackAction, slackActionRuntime } from "./action-runtime.js";
 import { parseSlackBlocksInput } from "./blocks-input.js";
 import { buildSlackThreadingToolContext } from "./threading-tool-context.js";
 
+const imageResultFromFile = vi.hoisted(() => vi.fn());
+vi.mock("./runtime-api.js", async () => ({
+  ...(await vi.importActual<typeof import("./runtime-api.js")>("./runtime-api.js")),
+  imageResultFromFile,
+}));
+
 const originalSlackActionRuntime = { ...slackActionRuntime };
 const deleteSlackMessage = vi.fn(async (..._args: unknown[]) => ({}));
 const downloadSlackFile = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
+const delegatedProvenanceDenied = {
+  ok: false,
+  error: "OpenClaw could not verify the file in the current Slack channel.",
+  errorCode: "file_channel_provenance_denied",
+  deniedBy: "openclaw_channel_provenance",
+} as const;
+const downloadSlackFileDecision = vi.fn(
+  async (..._args: unknown[]): Promise<unknown> => delegatedProvenanceDenied,
+);
 const editSlackMessage = vi.fn(async (..._args: unknown[]) => ({}));
 const getSlackMemberInfo = vi.fn(async (..._args: unknown[]) => ({}));
 const listSlackEmojis = vi.fn(async (..._args: unknown[]) => ({}));
@@ -178,6 +193,33 @@ describe("handleSlackAction", () => {
     return requireRecord(result.details, "action result details");
   }
 
+  function delegatedContext(overrides?: Partial<SlackActionContext>): SlackActionContext {
+    return {
+      conversationReadOrigin: "delegated",
+      currentChannelProvider: "slack",
+      requesterAccountId: "default",
+      currentChannelId: "C1",
+      ...overrides,
+    };
+  }
+
+  async function expectDelegatedDownloadDenied(params: {
+    action: Parameters<typeof handleSlackAction>[0];
+    cfg: OpenClawConfig;
+    context: SlackActionContext;
+    error: Record<string, unknown>;
+    throws?: boolean;
+  }) {
+    const result = handleSlackAction(params.action, params.cfg, params.context);
+    if (params.throws) {
+      await expect(result).rejects.toMatchObject(params.error);
+    } else {
+      expect(requireDetails(await result)).toEqual(params.error);
+    }
+    expect(downloadSlackFile).not.toHaveBeenCalled();
+    expect(downloadSlackFileDecision).not.toHaveBeenCalled();
+  }
+
   async function sendSecondMessageAndExpectNoThread(params: {
     cfg: OpenClawConfig;
     context: SlackActionContext;
@@ -270,6 +312,7 @@ describe("handleSlackAction", () => {
     Object.assign(slackActionRuntime, originalSlackActionRuntime, {
       deleteSlackMessage,
       downloadSlackFile,
+      downloadSlackFileDecision,
       editSlackMessage,
       getSlackMemberInfo,
       listSlackEmojis,
@@ -453,63 +496,73 @@ describe("handleSlackAction", () => {
     expect(downloadSlackFile).not.toHaveBeenCalled();
   });
 
-  it("uses current channel context to authorize downloadFile", async () => {
-    downloadSlackFile.mockResolvedValueOnce(null);
-    const cfg = slackConfig({
-      groupPolicy: "allowlist",
-      channels: {
-        C1: { enabled: true },
+  it.each([
+    {
+      name: "non-image",
+      media: {
+        path: "/tmp/openclaw-media/report.pdf",
+        contentType: "application/pdf",
+        placeholder: "[Slack file: report.pdf]",
       },
-    });
-
-    const result = await handleSlackAction({ action: "downloadFile", fileId: "F123" }, cfg, {
-      conversationReadOrigin: "delegated",
-      currentChannelProvider: "slack",
-      requesterAccountId: "default",
-      currentChannelId: "C1",
-      currentThreadTs: "111.222",
-    });
-
-    expectRecordFields(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1), {
-      channelId: "C1",
-      threadId: "111.222",
-      requireScopeEvidence: true,
-    });
-    expect(requireDetails(result).ok).toBe(false);
-  });
-
-  it("downloads only from the exact delegated Slack account, channel, and thread", async () => {
-    downloadSlackFile.mockResolvedValueOnce(null);
-
-    await handleSlackAction(
-      {
-        action: "downloadFile",
-        fileId: "F123",
-        channelId: "C1",
-        threadId: "111.222",
+    },
+    {
+      name: "image",
+      media: {
+        path: "/tmp/openclaw-media/report.png",
+        contentType: "image/png",
+        placeholder: "[Slack file: report.png]",
       },
+      expected: {
+        content: [
+          { type: "text", text: "[Slack file: report.png]" },
+          { type: "image", data: "base64", mimeType: "image/png" },
+        ],
+        details: {
+          path: "/tmp/openclaw-media/report.png",
+          fileId: "F123",
+          contentType: "image/png",
+          media: { outbound: false, mediaUrl: "/tmp/openclaw-media/report.png" },
+        },
+      },
+    },
+  ])("delegated $name result matches base", async ({ media, expected }) => {
+    downloadSlackFile.mockResolvedValueOnce(media);
+    downloadSlackFileDecision.mockResolvedValueOnce({
+      ok: true,
+      media,
+      provenance: { channelId: "C1", matchedBy: "share_map" },
+    });
+    imageResultFromFile.mockResolvedValue(expected);
+
+    const directResult = await handleSlackAction(
+      { action: "downloadFile", fileId: "F123", channelId: "C1", threadId: "111.222" },
       slackConfig(),
-      {
-        conversationReadOrigin: "delegated",
-        currentChannelProvider: "slack",
-        requesterAccountId: "default",
-        currentChannelId: "C1",
-        currentThreadTs: "111.222",
-      },
+      { conversationReadOrigin: "direct-operator" },
+    );
+    const delegatedResult = await handleSlackAction(
+      { action: "downloadFile", fileId: "F123", channelId: "C1", threadId: "111.222" },
+      slackConfig(),
+      delegatedContext({ currentThreadTs: "333.444" }),
     );
 
-    expect(downloadSlackFile).toHaveBeenCalledOnce();
-    expectRecordFields(requireRecordArg(downloadSlackFile, "downloadSlackFile", 0, 1), {
-      channelId: "C1",
-      threadId: "111.222",
-      requireScopeEvidence: true,
-    });
+    expect(delegatedResult).toEqual(directResult);
+    const decisionOptions = requireRecordArg(downloadSlackFileDecision, "decision", 0, 1);
+    expect([decisionOptions.channelId, decisionOptions.threadId]).toEqual(["C1", undefined]);
   });
 
   it.each([
-    { name: "missing trusted context", context: undefined },
+    {
+      name: "missing trusted context",
+      code: "delegated_context_missing",
+      message:
+        "OpenClaw denied delegated Slack file download: trusted Slack context is incomplete.",
+      context: undefined,
+    },
     {
       name: "another provider",
+      code: "delegated_provider_mismatch",
+      message:
+        "OpenClaw denied delegated Slack file download: the delegated provider is not Slack.",
       context: {
         currentChannelProvider: "discord",
         requesterAccountId: "default",
@@ -519,6 +572,9 @@ describe("handleSlackAction", () => {
     },
     {
       name: "another account",
+      code: "delegated_account_mismatch",
+      message:
+        "OpenClaw denied delegated Slack file download: the requester and acting Slack accounts do not match.",
       context: {
         currentChannelProvider: "slack",
         requesterAccountId: "other",
@@ -528,6 +584,9 @@ describe("handleSlackAction", () => {
     },
     {
       name: "another channel",
+      code: "delegated_channel_mismatch",
+      message:
+        "OpenClaw denied delegated Slack file download: the requested channel is not the exact current Slack channel.",
       context: {
         currentChannelProvider: "slack",
         requesterAccountId: "default",
@@ -535,55 +594,133 @@ describe("handleSlackAction", () => {
         currentThreadTs: "111.222",
       },
     },
-    {
-      name: "another thread",
-      context: {
-        currentChannelProvider: "slack",
-        requesterAccountId: "default",
-        currentChannelId: "C1",
-        currentThreadTs: "333.444",
+  ])("returns a structured denial for delegated file download from $name", async (testCase) => {
+    await expectDelegatedDownloadDenied({
+      action: { action: "downloadFile", fileId: "F123", channelId: "C1", threadId: "111.222" },
+      cfg: slackConfig(),
+      context: testCase.context
+        ? { conversationReadOrigin: "delegated", ...testCase.context }
+        : { conversationReadOrigin: "delegated" },
+      error: {
+        ok: false,
+        error: testCase.message,
+        errorCode: testCase.code,
+        deniedBy: "openclaw_delegated_context",
       },
-    },
-  ])("rejects delegated file download from $name before Slack is contacted", async (testCase) => {
-    await expect(
-      handleSlackAction(
-        {
-          action: "downloadFile",
-          fileId: "F123",
-          channelId: "C1",
-          threadId: "111.222",
-        },
-        slackConfig(),
-        testCase.context
-          ? { conversationReadOrigin: "delegated", ...testCase.context }
-          : { conversationReadOrigin: "delegated" },
-      ),
-    ).rejects.toThrow("requires the exact current conversation and account");
-    expect(downloadSlackFile).not.toHaveBeenCalled();
-    expect(resolveSlackConversationInfo).not.toHaveBeenCalled();
+    });
   });
 
-  it("rejects a thread-required delegated download when trusted thread context is missing", async () => {
-    await expect(
-      handleSlackAction(
+  it("maps delegated decision failures without exposing decision internals", async () => {
+    downloadSlackFileDecision.mockResolvedValueOnce({
+      ok: false,
+      error: "OpenClaw rejected the Slack file because it exceeds the configured size limit.",
+      errorCode: "file_too_large",
+      deniedBy: "openclaw_size_limit",
+      detail: { sizeBytes: 2048, maxBytes: 1024 },
+    });
+
+    const result = await handleSlackAction(
+      { action: "downloadFile", fileId: "F123", channelId: "C1" },
+      slackConfig(),
+      delegatedContext(),
+    );
+
+    expect(requireDetails(result)).toEqual({
+      ok: false,
+      error: "OpenClaw rejected the Slack file because it exceeds the configured size limit.",
+      errorCode: "file_too_large",
+      deniedBy: "openclaw_size_limit",
+      detail: { sizeBytes: 2048, maxBytes: 1024 },
+    });
+  });
+
+  it("keeps DM and group-DM thread equality on the legacy download path", async () => {
+    const cases = [
+      { channelId: "D123", cfg: slackConfig() },
+      { channelId: "G123", cfg: slackConfig({ dm: { groupEnabled: true } }) },
+    ];
+
+    for (const testCase of cases) {
+      downloadSlackFile.mockResolvedValueOnce(null);
+      const result = await handleSlackAction(
         {
           action: "downloadFile",
           fileId: "F123",
-          channelId: "C1",
+          channelId: testCase.channelId,
+          threadId: "111.222",
         },
-        slackConfig(),
-        {
-          conversationReadOrigin: "delegated",
-          currentChannelProvider: "slack",
-          requesterAccountId: "default",
-          currentChannelId: "C1",
-          sameChannelThreadRequired: true,
-        },
-      ),
-    ).rejects.toThrow("requires the exact current conversation and account");
-    expect(downloadSlackFile).not.toHaveBeenCalled();
-    expect(resolveSlackConversationInfo).not.toHaveBeenCalled();
+        testCase.cfg,
+        delegatedContext({
+          currentChannelId: testCase.channelId,
+          currentThreadTs: "111.222",
+        }),
+      );
+
+      expect(requireDetails(result).ok).toBe(false);
+    }
+
+    for (const [index, channelId] of ["D123", "G123"].entries()) {
+      expectRecordFields(requireRecordArg(downloadSlackFile, "downloadSlackFile", index, 1), {
+        channelId,
+        threadId: "111.222",
+        requireScopeEvidence: true,
+      });
+    }
   });
+
+  it.each([
+    { channelId: "D123", cfg: slackConfig() },
+    { channelId: "G123", cfg: slackConfig({ dm: { groupEnabled: true } }) },
+  ])(
+    "rejects a cross-thread delegated $channelId read before Slack file access",
+    async ({ channelId, cfg }) => {
+      await expectDelegatedDownloadDenied({
+        action: { action: "downloadFile", fileId: "F123", channelId, threadId: "222.333" },
+        cfg,
+        context: delegatedContext({ currentChannelId: channelId, currentThreadTs: "111.222" }),
+        error: {
+          ok: false,
+          error:
+            "OpenClaw denied delegated Slack file download: the requested Slack DM thread is not the current thread.",
+          errorCode: "delegated_channel_mismatch",
+          deniedBy: "openclaw_delegated_context",
+        },
+      });
+    },
+  );
+
+  it("denies delegated channel policy before file decision", async () => {
+    await expectDelegatedDownloadDenied({
+      action: { action: "downloadFile", fileId: "F123", channelId: "C1" },
+      cfg: slackConfig({
+        groupPolicy: "allowlist",
+        channels: { C1: { enabled: false }, C_ALLOWED: { enabled: true } },
+      }),
+      context: delegatedContext(),
+      error: { message: "Slack read target channel is not allowed." },
+      throws: true,
+    });
+  });
+
+  it.each([
+    { name: "DM policy", channelId: "D123", cfg: slackConfig({ dm: { enabled: false } }) },
+    {
+      name: "group-DM policy",
+      channelId: "G123",
+      cfg: slackConfig({ dm: { groupEnabled: false } }),
+    },
+  ])(
+    "denies delegated reads before file decision when $name denies",
+    async ({ channelId, cfg }) => {
+      await expectDelegatedDownloadDenied({
+        action: { action: "downloadFile", fileId: "F123", channelId },
+        cfg,
+        context: delegatedContext({ currentChannelId: channelId, currentThreadTs: "111.222" }),
+        error: { message: "Slack read target channel is not allowed." },
+        throws: true,
+      });
+    },
+  );
 
   it("passes download scope (channel/thread) to downloadSlackFile", async () => {
     downloadSlackFile.mockResolvedValueOnce(null);
@@ -1611,10 +1748,18 @@ describe("handleSlackAction", () => {
     ).rejects.toThrow("Slack read target channel is not allowed.");
     expect(listSlackReactions).not.toHaveBeenCalled();
 
-    await expect(
-      handleSlackAction({ action: "downloadFile", fileId: "F123", channelId: "C1" }, cfg),
-    ).rejects.toThrow("requires the exact current conversation and account");
-    expect(downloadSlackFile).not.toHaveBeenCalled();
+    await expectDelegatedDownloadDenied({
+      action: { action: "downloadFile", fileId: "F123", channelId: "C1" },
+      cfg,
+      context: { conversationReadOrigin: "delegated" },
+      error: {
+        ok: false,
+        error:
+          "OpenClaw denied delegated Slack file download: trusted Slack context is incomplete.",
+        errorCode: "delegated_context_missing",
+        deniedBy: "openclaw_delegated_context",
+      },
+    });
 
     await expect(handleSlackAction({ action: "listPins", channelId: "C1" }, cfg)).rejects.toThrow(
       "Slack read target channel is not allowed.",
@@ -1630,10 +1775,18 @@ describe("handleSlackAction", () => {
       },
     });
 
-    await expect(
-      handleSlackAction({ action: "downloadFile", fileId: "F123", channelId: "C_OTHER" }, cfg),
-    ).rejects.toThrow("requires the exact current conversation and account");
-    expect(downloadSlackFile).not.toHaveBeenCalled();
+    await expectDelegatedDownloadDenied({
+      action: { action: "downloadFile", fileId: "F123", channelId: "C_OTHER" },
+      cfg,
+      context: delegatedContext({ currentChannelId: "C_ALLOWED" }),
+      error: {
+        ok: false,
+        error:
+          "OpenClaw denied delegated Slack file download: the requested channel is not the exact current Slack channel.",
+        errorCode: "delegated_channel_mismatch",
+        deniedBy: "openclaw_delegated_context",
+      },
+    });
   });
 
   it("rejects Slack pin reads for non-allowlisted target channels", async () => {

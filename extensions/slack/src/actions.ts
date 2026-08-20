@@ -57,7 +57,7 @@ export type SlackPin = {
   file?: { id?: string; name?: string };
 };
 
-function resolveToken(explicit?: string, accountId?: string, cfg?: OpenClawConfig): string {
+export function resolveToken(explicit?: string, accountId?: string, cfg?: OpenClawConfig): string {
   if (explicit?.trim()) {
     const token = resolveSlackBotToken(explicit);
     if (token) {
@@ -196,7 +196,7 @@ function hasSlackPlatformError(err: unknown, code: string): boolean {
   return (data as { error?: unknown }).error === code;
 }
 
-async function getClient(opts: SlackActionClientOpts = {}, mode: "read" | "write" = "read") {
+export async function getClient(opts: SlackActionClientOpts = {}, mode: "read" | "write" = "read") {
   if (opts.client) {
     return opts.client;
   }
@@ -542,12 +542,13 @@ export async function listSlackPins(
   return (result.items ?? []) as SlackPin[];
 }
 
-type SlackFileInfoSummary = {
+export type SlackFileInfoSummary = {
   id?: string;
   name?: string;
   mimetype?: string;
   url_private?: string;
   url_private_download?: string;
+  size?: unknown;
   channels?: unknown;
   groups?: unknown;
   ims?: unknown;
@@ -560,12 +561,12 @@ type SlackFileThreadShare = {
   threadTs?: string;
 };
 
-function normalizeSlackScopeValue(value: string | undefined): string | undefined {
+export function normalizeSlackScopeValue(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
-function collectSlackDirectShareChannelIds(file: SlackFileInfoSummary): Set<string> {
+export function collectSlackDirectShareChannelIds(file: SlackFileInfoSummary): Set<string> {
   const ids = new Set<string>();
   for (const group of [file.channels, file.groups, file.ims]) {
     if (!Array.isArray(group)) {
@@ -595,13 +596,17 @@ function collectSlackShareMaps(file: SlackFileInfoSummary): Array<Record<string,
   );
 }
 
-function collectSlackSharedChannelIds(file: SlackFileInfoSummary): Set<string> {
+export function collectSlackSharedChannelIds(file: SlackFileInfoSummary): Set<string> {
   const ids = new Set<string>();
   for (const shareMap of collectSlackShareMaps(file)) {
-    for (const channelId of Object.keys(shareMap)) {
-      const normalized = normalizeSlackScopeValue(channelId);
-      if (normalized) {
-        ids.add(normalized);
+    for (const rawChannelId of Object.keys(shareMap)) {
+      const channelId = normalizeSlackScopeValue(rawChannelId);
+      if (!channelId) {
+        continue;
+      }
+      const threadShares = collectSlackThreadShares(file, rawChannelId);
+      if (threadShares.some((entry) => entry.ts || entry.threadTs)) {
+        ids.add(channelId);
       }
     }
   }

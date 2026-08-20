@@ -63,6 +63,7 @@ function createLazySlackAction<K extends keyof SlackActionsRuntimeModule>(
 export const slackActionRuntime = {
   deleteSlackMessage: createLazySlackAction("deleteSlackMessage"),
   downloadSlackFile: createLazySlackAction("downloadSlackFile"),
+  downloadSlackFileDecision: createLazySlackAction("downloadSlackFileDecision"),
   editSlackMessage: createLazySlackAction("editSlackMessage"),
   getSlackMemberInfo: createLazySlackAction("getSlackMemberInfo"),
   listSlackEmojis: createLazySlackAction("listSlackEmojis"),
@@ -252,6 +253,100 @@ function isCurrentSlackReadTarget(params: {
   );
 }
 
+type SlackDelegatedDownloadAdmissionCode =
+  | "delegated_context_missing"
+  | "delegated_provider_mismatch"
+  | "delegated_account_mismatch"
+  | "delegated_channel_mismatch";
+type SlackDelegatedDownloadAdmissionError = Error & {
+  errorCode: SlackDelegatedDownloadAdmissionCode;
+  deniedBy: "openclaw_delegated_context";
+};
+function delegatedDownloadAdmissionError(
+  errorCode: SlackDelegatedDownloadAdmissionCode,
+  message: string,
+) {
+  return Object.assign(new Error(`OpenClaw denied delegated Slack file download: ${message}`), {
+    errorCode,
+    deniedBy: "openclaw_delegated_context" as const,
+  });
+}
+
+function isSlackDelegatedDownloadAdmissionError(
+  error: unknown,
+): error is SlackDelegatedDownloadAdmissionError {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const candidate = error as { errorCode?: unknown; deniedBy?: unknown };
+  return (
+    candidate.deniedBy === "openclaw_delegated_context" &&
+    (candidate.errorCode === "delegated_context_missing" ||
+      candidate.errorCode === "delegated_provider_mismatch" ||
+      candidate.errorCode === "delegated_account_mismatch" ||
+      candidate.errorCode === "delegated_channel_mismatch")
+  );
+}
+
+function assertDelegatedSlackDownloadContext(params: {
+  account: ResolvedSlackAccount;
+  channelId: string;
+  requestedThreadId?: string;
+  context?: SlackActionContext;
+}) {
+  if (params.context?.conversationReadOrigin === "direct-operator") {
+    return;
+  }
+  const context = params.context;
+  if (
+    !context ||
+    !context.currentChannelProvider?.trim() ||
+    !context.requesterAccountId?.trim() ||
+    (!context.currentChannelId?.trim() && !context.currentMessagingTarget?.trim())
+  ) {
+    throw delegatedDownloadAdmissionError(
+      "delegated_context_missing",
+      "trusted Slack context is incomplete.",
+    );
+  }
+  if (normalizeOptionalLowercaseString(context.currentChannelProvider) !== "slack") {
+    throw delegatedDownloadAdmissionError(
+      "delegated_provider_mismatch",
+      "the delegated provider is not Slack.",
+    );
+  }
+  if (
+    normalizeAccountId(context.requesterAccountId) !== normalizeAccountId(params.account.accountId)
+  ) {
+    throw delegatedDownloadAdmissionError(
+      "delegated_account_mismatch",
+      "the requester and acting Slack accounts do not match.",
+    );
+  }
+  if (!slackContextTargetsMatch(params.channelId, context)) {
+    throw delegatedDownloadAdmissionError(
+      "delegated_channel_mismatch",
+      "the requested channel is not the exact current Slack channel.",
+    );
+  }
+  if (/^[DG]/i.test(params.channelId)) {
+    const currentThreadId = context.currentThreadTs?.trim();
+    if (!currentThreadId) {
+      throw delegatedDownloadAdmissionError(
+        "delegated_context_missing",
+        "the current Slack DM thread context is incomplete.",
+      );
+    }
+    const requestedThreadId = params.requestedThreadId?.trim();
+    if (requestedThreadId && requestedThreadId !== currentThreadId) {
+      throw delegatedDownloadAdmissionError(
+        "delegated_channel_mismatch",
+        "the requested Slack DM thread is not the current thread.",
+      );
+    }
+  }
+}
+
 function resolveDelegatedSlackDownloadThread(params: {
   account: ResolvedSlackAccount;
   channelId: string;
@@ -261,29 +356,12 @@ function resolveDelegatedSlackDownloadThread(params: {
   if (params.context?.conversationReadOrigin === "direct-operator") {
     return params.requestedThreadId;
   }
-  if (
-    !isCurrentSlackReadTarget({
-      account: params.account,
-      channelId: params.channelId,
-      context: params.context,
-    })
-  ) {
-    throw new Error(
-      "Delegated Slack file download requires the exact current conversation and account.",
-    );
+  assertDelegatedSlackDownloadContext(params);
+  if (!/^[DG]/i.test(params.channelId)) {
+    return undefined;
   }
   const currentThreadId = params.context?.currentThreadTs?.trim();
   const requestedThreadId = params.requestedThreadId?.trim();
-  if (params.context?.sameChannelThreadRequired && !currentThreadId) {
-    throw new Error(
-      "Delegated Slack file download requires the exact current conversation and account.",
-    );
-  }
-  if (requestedThreadId && requestedThreadId !== currentThreadId) {
-    throw new Error(
-      "Delegated Slack file download requires the exact current conversation and account.",
-    );
-  }
   return requestedThreadId || currentThreadId;
 }
 
@@ -850,26 +928,63 @@ export async function handleSlackAction(
           );
         }
         const channelId = resolveSlackChannelId(channelTarget);
-        const threadId = resolveDelegatedSlackDownloadThread({
-          account,
-          channelId,
-          requestedThreadId:
-            readStringParam(params, "threadId") ?? readStringParam(params, "replyTo"),
-          context,
-        });
+        const directOperator = context?.conversationReadOrigin === "direct-operator";
+        const legacyThreadScopedTarget = directOperator || /^[DG]/i.test(channelId);
+        let threadId: string | undefined;
+        try {
+          threadId = resolveDelegatedSlackDownloadThread({
+            account,
+            channelId,
+            requestedThreadId:
+              readStringParam(params, "threadId") ?? readStringParam(params, "replyTo"),
+            context,
+          });
+        } catch (error) {
+          if (!isSlackDelegatedDownloadAdmissionError(error)) {
+            throw error;
+          }
+          return jsonResult({
+            ok: false,
+            error: error.message,
+            errorCode: error.errorCode,
+            deniedBy: error.deniedBy,
+          });
+        }
         await assertReadTargetAllowed(channelId);
         const maxBytes = account.config?.mediaMaxMb
           ? account.config.mediaMaxMb * 1024 * 1024
           : 20 * 1024 * 1024;
         const readToken = getTokenForOperation("read");
-        const downloaded = await slackActionRuntime.downloadSlackFile(fileId, {
-          ...readOpts,
-          ...(readToken && !readOpts?.token ? { token: readToken } : {}),
-          maxBytes,
-          channelId,
-          threadId,
-          requireScopeEvidence: context?.conversationReadOrigin !== "direct-operator",
-        });
+        let downloaded: NonNullable<
+          Awaited<ReturnType<SlackActionsRuntimeModule["downloadSlackFile"]>>
+        > | null;
+        if (legacyThreadScopedTarget) {
+          downloaded = await slackActionRuntime.downloadSlackFile(fileId, {
+            ...readOpts,
+            ...(readToken && !readOpts?.token ? { token: readToken } : {}),
+            maxBytes,
+            channelId,
+            threadId,
+            requireScopeEvidence: !directOperator,
+          });
+        } else {
+          const decision = await slackActionRuntime.downloadSlackFileDecision(fileId, {
+            ...readOpts,
+            ...(readToken && !readOpts?.token ? { token: readToken } : {}),
+            maxBytes,
+            channelId,
+          });
+          if (!decision.ok) {
+            return jsonResult({
+              ok: false,
+              error: decision.error,
+              errorCode: decision.errorCode,
+              deniedBy: decision.deniedBy,
+              ...(decision.detail ? { detail: decision.detail } : {}),
+            });
+          }
+          downloaded = decision.media;
+        }
         if (!downloaded) {
           return jsonResult({
             ok: false,

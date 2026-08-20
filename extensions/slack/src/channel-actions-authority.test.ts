@@ -5,11 +5,21 @@ import { slackActionRuntime } from "./action-runtime.js";
 import { slackPlugin } from "./channel.js";
 
 const originalDownloadSlackFile = slackActionRuntime.downloadSlackFile;
+const originalDownloadSlackFileDecision = slackActionRuntime.downloadSlackFileDecision;
 const originalResolveSlackConversationInfo = slackActionRuntime.resolveSlackConversationInfo;
 const downloadSlackFile = vi.fn(async () => ({
   path: "/tmp/dossier.pdf",
   contentType: "application/pdf",
   placeholder: "[Slack file: dossier.pdf (fileId: F-DOSSIER)]",
+}));
+const downloadSlackFileDecision = vi.fn(async () => ({
+  ok: true as const,
+  media: {
+    path: "/tmp/dossier.pdf",
+    contentType: "application/pdf",
+    placeholder: "[Slack file: dossier.pdf (fileId: F-DOSSIER)]",
+  },
+  provenance: { channelId: "C12345678", matchedBy: "share_map" as const },
 }));
 const resolveSlackConversationInfo = vi.fn(async () => ({ type: "channel" as const }));
 
@@ -27,7 +37,13 @@ const cfg = {
 
 function createContext(
   toolContext: NonNullable<ChannelMessageActionContext["toolContext"]>,
+  overrides?: {
+    cfg?: OpenClawConfig;
+    channelId?: string;
+    threadId?: string;
+  },
 ): ChannelMessageActionContext {
+  const channelId = overrides?.channelId ?? "C12345678";
   return {
     action: "download-file",
     channel: "slack",
@@ -35,10 +51,10 @@ function createContext(
     requesterAccountId: "default",
     requesterSenderId: "U-DOSSIER",
     conversationReadOrigin: "delegated",
-    cfg,
+    cfg: overrides?.cfg ?? cfg,
     params: {
-      channelId: "C12345678",
-      threadId: "111.222",
+      channelId,
+      threadId: overrides?.threadId ?? "111.222",
       fileId: "F-DOSSIER",
     },
     toolContext,
@@ -61,13 +77,26 @@ describe("Slack message action authority composition", () => {
       contentType: "application/pdf",
       placeholder: "[Slack file: dossier.pdf (fileId: F-DOSSIER)]",
     });
+    downloadSlackFileDecision.mockReset();
+    downloadSlackFileDecision.mockResolvedValue({
+      ok: true,
+      media: {
+        path: "/tmp/dossier.pdf",
+        contentType: "application/pdf",
+        placeholder: "[Slack file: dossier.pdf (fileId: F-DOSSIER)]",
+      },
+      provenance: { channelId: "C12345678", matchedBy: "share_map" },
+    });
     slackActionRuntime.downloadSlackFile =
       downloadSlackFile as unknown as typeof slackActionRuntime.downloadSlackFile;
+    slackActionRuntime.downloadSlackFileDecision =
+      downloadSlackFileDecision as unknown as typeof slackActionRuntime.downloadSlackFileDecision;
     slackActionRuntime.resolveSlackConversationInfo = resolveSlackConversationInfo;
   });
 
   afterEach(() => {
     slackActionRuntime.downloadSlackFile = originalDownloadSlackFile;
+    slackActionRuntime.downloadSlackFileDecision = originalDownloadSlackFileDecision;
     slackActionRuntime.resolveSlackConversationInfo = originalResolveSlackConversationInfo;
   });
 
@@ -77,7 +106,7 @@ describe("Slack message action authority composition", () => {
         currentChannelProvider: "slack",
         currentChannelId: "C12345678",
         currentMessagingTarget: "C12345678",
-        currentThreadTs: "111.222",
+        currentThreadTs: "333.444",
         sameChannelThreadRequired: true,
       }),
     );
@@ -88,15 +117,15 @@ describe("Slack message action authority composition", () => {
       throw new Error("expected the Slack download result to be text content");
     }
     expect(firstContent.text).toContain("[Slack file: dossier.pdf (fileId: F-DOSSIER)]");
-    expect(downloadSlackFile).toHaveBeenCalledWith(
+    expect(downloadSlackFile).not.toHaveBeenCalled();
+    expect(downloadSlackFileDecision).toHaveBeenCalledWith(
       "F-DOSSIER",
       expect.objectContaining({
         cfg,
         channelId: "C12345678",
-        threadId: "111.222",
-        requireScopeEvidence: true,
       }),
     );
+    expect(downloadSlackFileDecision.mock.calls[0]?.[1]).not.toHaveProperty("threadId");
   });
 
   it.each([
@@ -121,28 +150,58 @@ describe("Slack message action authority composition", () => {
         sameChannelThreadRequired: true,
       },
     },
-    {
-      name: "another thread",
-      toolContext: {
-        currentChannelProvider: "slack",
-        currentChannelId: "C12345678",
-        currentMessagingTarget: "C12345678",
-        currentThreadTs: "333.444",
-        sameChannelThreadRequired: true,
-      },
-    },
   ])(
-    "rejects delegated downloads from $name before Slack file access",
+    "returns structured delegated download denials from $name before Slack file access",
     async ({ toolContext, requesterAccountId }) => {
       const context = createContext(toolContext);
       if (requesterAccountId) {
         context.requesterAccountId = requesterAccountId;
       }
 
-      await expect(requireSlackActionHandler()(context)).rejects.toThrow(
-        "requires the exact current conversation and account",
-      );
+      const result = await requireSlackActionHandler()(context);
+      expect(result.details).toEqual({
+        ok: false,
+        error: requesterAccountId
+          ? "OpenClaw denied delegated Slack file download: the requester and acting Slack accounts do not match."
+          : "OpenClaw denied delegated Slack file download: the requested channel is not the exact current Slack channel.",
+        errorCode: requesterAccountId ? "delegated_account_mismatch" : "delegated_channel_mismatch",
+        deniedBy: "openclaw_delegated_context",
+      });
       expect(downloadSlackFile).not.toHaveBeenCalled();
+      expect(downloadSlackFileDecision).not.toHaveBeenCalled();
     },
   );
+
+  it("keeps shipped DM and group-DM downloads on the thread-scoped path", async () => {
+    const groupCfg = {
+      ...cfg,
+      channels: {
+        slack: {
+          ...cfg.channels?.slack,
+          dm: { groupEnabled: true },
+        },
+      },
+    } as OpenClawConfig;
+
+    for (const testCase of [
+      { channelId: "D123", cfg },
+      { channelId: "G123", cfg: groupCfg },
+    ]) {
+      await requireSlackActionHandler()(
+        createContext(
+          {
+            currentChannelProvider: "slack",
+            currentChannelId: testCase.channelId,
+            currentMessagingTarget: testCase.channelId,
+            currentThreadTs: "111.222",
+            sameChannelThreadRequired: true,
+          },
+          testCase,
+        ),
+      );
+    }
+
+    expect(downloadSlackFile).toHaveBeenCalledTimes(2);
+    expect(downloadSlackFileDecision).not.toHaveBeenCalled();
+  });
 });
