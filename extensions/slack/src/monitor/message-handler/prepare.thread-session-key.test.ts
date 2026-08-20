@@ -342,6 +342,52 @@ describe("thread-level session keys", () => {
     }
   });
 
+  it("keeps addressed top-level room roots distinct when replyToMode=off", () => {
+    const ctx = buildCtx({ replyToMode: "off" });
+    const account = buildAccount("off");
+    const firstRootTs = "1770408532.000001";
+    const secondRootTs = "1770408533.000001";
+
+    const firstRoot = resolveSlackRoutingContext({
+      ctx,
+      account,
+      message: buildChannelMessage({ ts: firstRootTs, text: "<@B1> first request" }),
+      isDirectMessage: false,
+      isGroupDm: false,
+      isRoom: true,
+      isRoomish: true,
+      seedTopLevelRoomThread: true,
+    });
+    const secondRoot = resolveSlackRoutingContext({
+      ctx,
+      account,
+      message: buildChannelMessage({ ts: secondRootTs, text: "<@B1> second request" }),
+      isDirectMessage: false,
+      isGroupDm: false,
+      isRoom: true,
+      isRoomish: true,
+      seedTopLevelRoomThread: true,
+    });
+    const childReply = resolveSlackRoutingContext({
+      ctx,
+      account,
+      message: buildChannelMessage({
+        ts: "1770408534.000001",
+        thread_ts: firstRootTs,
+        text: "follow-up",
+      }),
+      isDirectMessage: false,
+      isGroupDm: false,
+      isRoom: true,
+      isRoomish: true,
+    });
+
+    expect(firstRoot.sessionKey).toBe(`agent:main:slack:channel:c123:thread:${firstRootTs}`);
+    expect(secondRoot.sessionKey).toBe(`agent:main:slack:channel:c123:thread:${secondRootTs}`);
+    expect(secondRoot.sessionKey).not.toBe(firstRoot.sessionKey);
+    expect(childReply.sessionKey).toBe(firstRoot.sessionKey);
+  });
+
   it("keeps unseeded top-level room messages with self thread_ts on the channel session", () => {
     const ctx = buildCtx({ replyToMode: "off" });
     const account = buildAccount("off");

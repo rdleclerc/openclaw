@@ -526,6 +526,51 @@ describe("command queue", () => {
     }
   });
 
+  it("starts a queued task timeout after dequeue", async () => {
+    const lane = `timeout-queued-lane-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setCommandLaneConcurrency(lane, 1);
+
+    vi.useFakeTimers();
+    try {
+      const firstBlocker = createDeferred();
+      const first = enqueueCommandInLane(lane, async () => {
+        await firstBlocker.promise;
+        return "first";
+      });
+      let secondStarted = false;
+      const second = enqueueCommandInLane(
+        lane,
+        async () => {
+          secondStarted = true;
+          return await new Promise<never>(() => {});
+        },
+        { taskTimeoutMs: 25 },
+      );
+      const secondRejected = expect(second).rejects.toMatchObject({
+        name: "CommandLaneTaskTimeoutError",
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+      expect(secondStarted).toBe(false);
+      expectLaneSnapshotFields(lane, {
+        activeCount: 1,
+        queuedCount: 1,
+      });
+
+      firstBlocker.resolve();
+      await expect(first).resolves.toBe("first");
+      await Promise.resolve();
+      expect(secondStarted).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(24);
+      expect(secondStarted).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      await secondRejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("clamps oversized task timeouts before arming lane timers", async () => {
     const lane = `timeout-clamp-lane-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     setCommandLaneConcurrency(lane, 1);
