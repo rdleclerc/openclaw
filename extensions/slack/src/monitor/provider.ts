@@ -414,7 +414,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     runtime.log?.(
       warn(
         `[${account.accountId}] slack auth.test failed at boot (${authTestError ?? "unknown error"}); ` +
-          "explicit bot-mention detection will be disabled until restart with a valid bot token; " +
+          "explicit bot-mention detection will be disabled until a valid bot token is re-established; " +
           "required-mention channels will fail closed without another trusted activation signal",
       ),
     );
@@ -423,7 +423,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     runtime.log?.(warn(authIdentityWarning));
   }
 
-  const identityHealth = resolveSlackIdentityHealth({
+  let identityHealth = resolveSlackIdentityHealth({
     installationIdentity,
     botUserId,
     authTestError,
@@ -475,6 +475,48 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     mediaMaxBytes,
     removeAckAfterReply,
   });
+
+  const refreshSlackIdentity = async () => {
+    if (!authTestFailed || identityHealth.healthState !== "degraded") {
+      return;
+    }
+    try {
+      const auth = await app.client.auth.test();
+      const nextBotId = normalizeOptionalString((auth as { bot_id?: string }).bot_id) ?? "";
+      const nextBotUserId = nextBotId ? (normalizeOptionalString(auth.user_id) ?? "") : "";
+      const nextAuthError =
+        !nextBotUserId && !enterpriseOrgInstall ? "auth.test returned no user_id" : undefined;
+      const nextWarning = formatSlackBotTokenIdentityWarning({
+        auth,
+        accountId: account.accountId,
+      });
+      const nextIdentity = resolveSlackInstallationIdentity({
+        enterpriseOrgInstall,
+        auth: nextAuthError ? undefined : auth,
+        authError: nextAuthError,
+        transportApiAppId: expectedApiAppIdFromAppToken,
+      });
+      const nextHealth = resolveSlackIdentityHealth({
+        installationIdentity: nextIdentity,
+        botUserId: nextBotUserId,
+        authTestError: nextAuthError,
+        authIdentityWarning: nextWarning,
+      });
+      if (nextHealth.healthState === "degraded") {
+        return;
+      }
+      identityHealth = nextHealth;
+      Object.assign(ctx, {
+        botUserId: nextBotUserId,
+        botId: nextBotId,
+        teamId: nextIdentity.kind === "workspace" ? nextIdentity.teamId : "",
+        apiAppId: nextIdentity.kind === "degraded" ? "" : (nextIdentity.apiAppId ?? ""),
+        installationIdentity: nextIdentity,
+      });
+    } catch {
+      // Keep the existing degraded state; the next socket connection can retry.
+    }
+  };
 
   // Slack's socket-mode client keeps ping/pong health private and closes on
   // missed pongs. App events are useful status activity, but not transport proof.
@@ -677,8 +719,9 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
           const disconnect = await startSlackSocketAndWaitForDisconnect({
             app,
             abortSignal: opts.abortSignal,
-            onStarted: () => {
+            onStarted: async () => {
               reconnectAttempts = 0;
+              await refreshSlackIdentity();
               publishSlackConnectedStatus(opts.setStatus, identityHealth);
               if (!hasLoggedSocketConnected) {
                 hasLoggedSocketConnected = true;

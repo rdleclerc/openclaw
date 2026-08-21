@@ -393,7 +393,7 @@ function createSlackSocketDisconnectWaiter(app: unknown, abortSignal?: AbortSign
 export async function startSlackSocketAndWaitForDisconnect(params: {
   app: { start: () => unknown };
   abortSignal?: AbortSignal;
-  onStarted?: () => void;
+  onStarted?: () => void | Promise<void>;
 }) {
   const disconnectWaiter = createSlackSocketDisconnectWaiter(params.app, params.abortSignal);
   try {
@@ -402,7 +402,7 @@ export async function startSlackSocketAndWaitForDisconnect(params: {
       disconnectWaiter.cancel();
       return null;
     }
-    params.onStarted?.();
+    await params.onStarted?.();
     const disconnect = await disconnectWaiter.promise;
     disconnectWaiter.complete();
     return disconnect;
