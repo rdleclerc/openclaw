@@ -236,7 +236,9 @@ describe("connected identity health", () => {
   });
 
   it("publishes auth.test failures as degraded", async () => {
-    getSlackClient().auth.test.mockRejectedValueOnce(new Error("request_timeout"));
+    getSlackClient()
+      .auth.test.mockRejectedValueOnce(new Error("request_timeout"))
+      .mockRejectedValueOnce(new Error("request_timeout"));
     const setStatus = vi.fn();
 
     const monitor = startSlackMonitor(monitorSlackProvider, { setStatus });
@@ -248,5 +250,26 @@ describe("connected identity health", () => {
       healthState: "degraded",
       lastError: "request_timeout",
     });
+  });
+
+  it("rechecks a degraded boot identity after Socket Mode connects", async () => {
+    getSlackClient()
+      .auth.test.mockRejectedValueOnce(new Error("ENOTFOUND slack.com"))
+      .mockResolvedValueOnce({
+        user_id: "UBOT",
+        bot_id: "BBOT",
+        app_id: "A_TEST",
+        team_id: "T_TEST",
+        is_enterprise_install: false,
+      });
+    const setStatus = vi.fn();
+
+    const monitor = startSlackMonitor(monitorSlackProvider, { setStatus });
+    await stopSlackMonitor(monitor);
+
+    expect(getSlackClient().auth.test).toHaveBeenCalledTimes(2);
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ healthState: "healthy", lastError: null }),
+    );
   });
 });
