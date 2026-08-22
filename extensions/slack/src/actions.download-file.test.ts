@@ -221,7 +221,7 @@ describe("downloadSlackFile", () => {
       file: makeSlackFileInfo({
         shares: {
           private: {
-            C123: [{ ts: "111.111", thread_ts: "111.111" }],
+            C123: [{ ts: "1787058054.361039", thread_ts: "1787058054.361039" }],
           },
         },
       }),
@@ -232,7 +232,7 @@ describe("downloadSlackFile", () => {
       token: "xoxb-test",
       maxBytes: 1024,
       channelId: "C123",
-      threadId: "222.222",
+      threadId: "1787058055.361039",
     });
 
     expectNoMediaDownload(result);
@@ -277,7 +277,7 @@ describe("downloadSlackFile", () => {
       file: makeSlackFileInfo({
         shares: {
           private: {
-            C123: [{ ts: "222.222", thread_ts: "222.222" }],
+            C123: [{ ts: "1787058054.361039", thread_ts: "1787058054.361039" }],
           },
         },
       }),
@@ -289,7 +289,7 @@ describe("downloadSlackFile", () => {
       token: "xoxb-test",
       maxBytes: 1024,
       channelId: "C123",
-      threadId: "222.222",
+      threadId: "1787058054.361039",
       requireScopeEvidence: true,
     });
 
@@ -382,6 +382,18 @@ describe("downloadSlackFile", () => {
       name: "share-map array without a valid timestamped object",
       file: makeShareMapFile([{}]),
     },
+    {
+      name: "malformed ts",
+      file: makeShareMapFile([{ ts: "not-a-slack-timestamp" }]),
+    },
+    {
+      name: "malformed thread_ts",
+      file: makeShareMapFile([{ thread_ts: "not-a-slack-timestamp" }]),
+    },
+    { name: "integer-only", file: makeShareMapFile([{ ts: "1787058054" }]) },
+    { name: "short fraction", file: makeShareMapFile([{ thread_ts: "1787058054.36103" }]) },
+    { name: "eleven seconds", file: makeShareMapFile([{ ts: "17870580540.361039" }]) },
+    { name: "seven-digit fraction", file: makeShareMapFile([{ thread_ts: "1787058054.3610390" }]) },
   ])("returns the same safe denial for $name", async ({ file }) => {
     const client = createClient();
     client.files.info.mockResolvedValueOnce({ file });
@@ -395,6 +407,32 @@ describe("downloadSlackFile", () => {
       deniedBy: "openclaw_channel_provenance",
     });
     expect(JSON.stringify(result)).not.toMatch(/C-FOREIGN|image\.png|files\.slack\.com/);
+  });
+
+  it("accepts an exact thread_ts when ts is malformed", async () => {
+    const client = createClient();
+    client.files.info.mockResolvedValueOnce({
+      file: makeReceiptSlackFileInfo({
+        channels: [],
+        shares: {
+          private: {
+            [RECEIPT_CHANNEL_ID]: [{ ts: "not-a-slack-timestamp", thread_ts: "1787058054.361039" }],
+          },
+        },
+      }),
+    });
+    resolveSlackMedia.mockResolvedValueOnce([makeResolvedSlackMedia()]);
+
+    const result = await downloadSlackFileDecision(
+      RECEIPT_FILE_ID,
+      decisionOptions(client, 136878),
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      media: makeResolvedSlackMedia(),
+      provenance: { channelId: RECEIPT_CHANNEL_ID, matchedBy: "share_map" },
+    });
   });
 
   it("denies foreign provenance before URL and size classification", async () => {

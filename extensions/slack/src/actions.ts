@@ -150,6 +150,7 @@ function normalizeSlackEmojiName(raw: string): string {
 }
 
 const SLACK_TIMESTAMP_RE = /^\d+(?:\.\d+)?$/;
+const SLACK_FILE_SHARE_TIMESTAMP_RE = /^[0-9]{10}\.[0-9]{6}$/;
 const ISO_8601_TIMESTAMP_SCHEMA = z.iso.datetime({ offset: true });
 
 function formatEpochSeconds(milliseconds: number): string {
@@ -631,7 +632,11 @@ function collectSlackThreadShares(
       const ts = typeof entry.ts === "string" ? normalizeSlackScopeValue(entry.ts) : undefined;
       const threadTs =
         typeof entry.thread_ts === "string" ? normalizeSlackScopeValue(entry.thread_ts) : undefined;
-      matches.push({ channelId, ts, threadTs });
+      matches.push({
+        channelId,
+        ts: ts && SLACK_FILE_SHARE_TIMESTAMP_RE.test(ts) ? ts : undefined,
+        threadTs: threadTs && SLACK_FILE_SHARE_TIMESTAMP_RE.test(threadTs) ? threadTs : undefined,
+      });
     }
   }
   return matches;
