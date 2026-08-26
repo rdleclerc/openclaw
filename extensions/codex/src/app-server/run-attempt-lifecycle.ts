@@ -109,6 +109,15 @@ export async function runCodexAgentEndHook(
     ...hookParams,
     ctx: { ...hookParams.ctx, config: params.config },
   };
+  if (params.externalContentSource === "gmail") {
+    await awaitAgentEndSideEffects({
+      ...sideEffectParams,
+      requiredForExternalContentSource: "gmail",
+      awaitOnlyRequired: true,
+      requireMessageId: true,
+    });
+    return;
+  }
   if (!params.messageChannel && !params.messageProvider) {
     await awaitAgentEndSideEffects(sideEffectParams);
     return;

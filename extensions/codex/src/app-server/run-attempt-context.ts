@@ -89,6 +89,7 @@ export async function prepareCodexAttemptContext(
     agentId: sessionAgentId,
     accountId: params.agentAccountId,
     messageId: params.currentMessageId,
+    externalContentSource: params.externalContentSource,
     senderId: params.senderId ?? undefined,
     threadId: params.currentThreadTs,
     sessionKey: sandboxSessionKey,

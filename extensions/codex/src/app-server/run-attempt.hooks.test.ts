@@ -860,6 +860,52 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     releaseAgentEnd();
   });
 
+  it("waits for Gmail agent_end hooks and forwards source and message identity", async () => {
+    let releaseAgentEnd: () => void = () => undefined;
+    const agentEndSettled = new Promise<void>((resolve) => {
+      releaseAgentEnd = resolve;
+    });
+    const agentEnd = vi.fn(() => agentEndSettled);
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-session.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-workspace");
+    const harness = createStartedThreadHarness();
+    const params = createParams(sessionFile, workspaceDir);
+    params.messageChannel = "discord";
+    params.messageProvider = "discord";
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-message-123";
+    const run = runCodexAppServerAttempt(params);
+    let settled = false;
+    void run.then(() => {
+      settled = true;
+    });
+
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await vi.waitFor(() => expect(agentEnd).toHaveBeenCalledTimes(1), fastWait);
+    expect(settled).toBe(false);
+    const [, agentEndContext] = mockCall(agentEnd, "agent_end") as [
+      unknown,
+      { externalContentSource?: string; messageId?: string | number },
+    ];
+    expect(agentEndContext).toMatchObject({
+      externalContentSource: "gmail",
+      messageId: "gmail-message-123",
+    });
+
+    releaseAgentEnd();
+    await expect(run).resolves.toMatchObject({ promptError: null });
+  });
+
   it("waits for agent_end hooks before rejecting local codex turn-start failures", async () => {
     let releaseAgentEnd: () => void = () => undefined;
     const agentEndSettled = new Promise<void>((resolve) => {
@@ -888,6 +934,53 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     releaseAgentEnd();
     await expect(run).rejects.toThrow("turn start exploded");
     expect(settled).toBe(true);
+  });
+
+  it("runs startup cleanup before rethrowing Gmail agent_end failure", async () => {
+    const order: string[] = [];
+    const agentEnd = vi.fn(() => {
+      order.push("agent_end");
+      throw new Error("Gmail finalizer failed");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    vi.stubEnv("OPENCLAW_TRAJECTORY", "1");
+    const sessionFile = path.join(tempDir, "gmail-start-failure.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-start-failure-workspace");
+    const trajectoryFlush = vi.fn(async () => {
+      order.push("trajectory_flush");
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    params.messageChannel = "discord";
+    params.messageProvider = "discord";
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-message-123";
+    params.trajectorySessionFile = `sqlite:main:session-1:${path.join(tempDir, "trajectory.sqlite")}`;
+    params.trajectoryRecorder = {
+      recordEvent: vi.fn(),
+      flush: trajectoryFlush,
+    };
+    createStartedThreadHarness(async (method) => {
+      if (method === "turn/start") {
+        throw new Error("turn start exploded");
+      }
+      return undefined;
+    });
+
+    const run = runCodexAppServerAttempt(params);
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      message: "Gmail finalizer failed",
+    });
+    expect(order).toEqual(["agent_end", "trajectory_flush"]);
+    expect(trajectoryFlush).toHaveBeenCalledTimes(1);
   });
 
   it("fires agent_end with failure metadata when the codex turn fails", async () => {

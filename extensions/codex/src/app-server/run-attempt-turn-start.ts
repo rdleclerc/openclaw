@@ -224,7 +224,7 @@ export async function startCodexAttemptTurn(
         ...historyState.messages,
         buildCodexUserPromptMessage({ ...runtimeParams, prompt: turnState.codexTurnPromptText }),
       ];
-      await runCodexAgentEndHook(params, {
+      const agentEndFinalizationPromise = runCodexAgentEndHook(params, {
         event: {
           messages: messagesSnapshot,
           success: false,
@@ -234,6 +234,12 @@ export async function startCodexAttemptTurn(
         ctx: hookContext,
         hookRunner,
       });
+      let agentEndFinalizationError: unknown;
+      try {
+        await agentEndFinalizationPromise;
+      } catch (error) {
+        agentEndFinalizationError = error;
+      }
       if (!state.timedOut) {
         await unsubscribeCodexThreadBestEffort(resourceState.client, {
           threadId: resourceState.thread.threadId,
@@ -253,6 +259,9 @@ export async function startCodexAttemptTurn(
       });
       params.abortSignal?.removeEventListener("abort", abortFromUpstream);
       await releaseSharedClientLeaseAndRetireOneShotClient();
+      if (agentEndFinalizationError !== undefined) {
+        throw agentEndFinalizationError;
+      }
       if (usageLimitError) {
         await markCodexAuthProfileBlockedFromRateLimits({
           params,
