@@ -292,8 +292,8 @@ export function shouldRetainRestartRecoveryClaimAfterRun(params: {
       : undefined;
   return (
     params.claimedRunId === params.runId &&
-    params.sourceRunId === undefined &&
     abortReason?.name === "TimeoutError" &&
+    (params.sourceRunId === undefined || params.sourceRunId !== params.runId) &&
     params.terminalDeliveryEvidence?.restartUnsafeSideEffectsDetected !== true
   );
 }

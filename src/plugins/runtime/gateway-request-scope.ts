@@ -20,6 +20,7 @@ type PluginRuntimeGatewayRequestScope = {
 
 type GaiaAcceptedEnvelopeStore = {
   value?: GaiaHostAcceptedEnvelope;
+  recoveredValue?: GaiaHostAcceptedEnvelope;
 };
 
 export type GaiaHostAcceptedEnvelope = Readonly<{
@@ -126,11 +127,56 @@ export function bindGaiaAcceptedEnvelope(envelope: GaiaHostAcceptedEnvelope): vo
   if (!scope?.context) {
     throw new Error("Gaia host acceptance requires a gateway request scope.");
   }
-  if (scope.pluginId && scope.pluginId !== "gaia-workflow-preflight") {
+  if (scope.pluginId !== "gaia-workflow-preflight") {
     throw new Error(
       "Gaia host acceptance requires the exact gaia-workflow-preflight plugin scope.",
     );
   }
+  const normalized = normalizeGaiaAcceptedEnvelope(envelope);
+  const stored = gaiaAcceptedEnvelopeStore.getStore();
+  if (!stored) {
+    throw new Error("Gaia host acceptance requires a gateway request scope.");
+  }
+  const current = stored.value;
+  if (current) {
+    if (!sameGaiaAcceptedEnvelope(current, normalized)) {
+      throw new Error("Gaia host acceptance envelope cannot be replaced.");
+    }
+    return;
+  }
+  stored.value = normalized;
+}
+
+/**
+ * Binds the original accepted owner for a host recovery request. Recovery is
+ * a host boundary, so plugin-scoped callers cannot mint this authority.
+ */
+export function bindGaiaRecoveredAcceptedEnvelope(envelope: GaiaHostAcceptedEnvelope): void {
+  const scope = getPluginRuntimeGatewayRequestScope();
+  if (!scope?.context) {
+    throw new Error("Gaia recovered acceptance requires a gateway request scope.");
+  }
+  if (scope.pluginId !== undefined || scope.client?.internal?.pluginRuntimeOwnerId !== undefined) {
+    throw new Error("Gaia recovered acceptance requires a host gateway request scope.");
+  }
+  const normalized = normalizeGaiaAcceptedEnvelope(envelope);
+  const stored = gaiaAcceptedEnvelopeStore.getStore();
+  if (!stored) {
+    throw new Error("Gaia recovered acceptance requires a gateway request scope.");
+  }
+  if (stored.value && !sameGaiaAcceptedEnvelope(stored.value, normalized)) {
+    throw new Error("Gaia recovered acceptance cannot replace normal acceptance.");
+  }
+  const current = stored.recoveredValue;
+  if (current && !sameGaiaAcceptedEnvelope(current, normalized)) {
+    throw new Error("Gaia recovered acceptance envelope cannot be replaced.");
+  }
+  stored.recoveredValue = normalized;
+}
+
+function normalizeGaiaAcceptedEnvelope(
+  envelope: GaiaHostAcceptedEnvelope,
+): GaiaHostAcceptedEnvelope {
   if (
     !envelope.runId.trim() ||
     !envelope.sessionKey.trim() ||
@@ -141,36 +187,36 @@ export function bindGaiaAcceptedEnvelope(envelope: GaiaHostAcceptedEnvelope): vo
   ) {
     throw new Error("Gaia host acceptance envelope is invalid.");
   }
-  const normalized: GaiaHostAcceptedEnvelope = Object.freeze({
+  return Object.freeze({
     runId: envelope.runId.trim(),
     sessionKey: envelope.sessionKey.trim(),
     agentId: envelope.agentId.trim().toLowerCase(),
     acceptedAt: envelope.acceptedAt,
     receiptPluginId: "gaia-workflow-preflight",
   });
-  const stored = gaiaAcceptedEnvelopeStore.getStore();
-  if (!stored) {
-    throw new Error("Gaia host acceptance requires a gateway request scope.");
-  }
-  const current = stored.value;
-  if (current) {
-    if (
-      current.runId !== normalized.runId ||
-      current.sessionKey !== normalized.sessionKey ||
-      current.agentId !== normalized.agentId ||
-      current.acceptedAt !== normalized.acceptedAt ||
-      current.receiptPluginId !== normalized.receiptPluginId
-    ) {
-      throw new Error("Gaia host acceptance envelope cannot be replaced.");
-    }
-    return;
-  }
-  stored.value = normalized;
+}
+
+function sameGaiaAcceptedEnvelope(
+  left: GaiaHostAcceptedEnvelope,
+  right: GaiaHostAcceptedEnvelope,
+): boolean {
+  return (
+    left.runId === right.runId &&
+    left.sessionKey === right.sessionKey &&
+    left.agentId === right.agentId &&
+    left.acceptedAt === right.acceptedAt &&
+    left.receiptPluginId === right.receiptPluginId
+  );
 }
 
 /** Read the exact host-accepted Gaia envelope from the current Gaia request. */
 export function readGaiaAcceptedEnvelope(): GaiaHostAcceptedEnvelope | undefined {
   return gaiaAcceptedEnvelopeStore.getStore()?.value;
+}
+
+/** Read the exact original owner bound by the host recovery path. */
+export function readGaiaRecoveredAcceptedEnvelope(): GaiaHostAcceptedEnvelope | undefined {
+  return gaiaAcceptedEnvelopeStore.getStore()?.recoveredValue;
 }
 
 /**

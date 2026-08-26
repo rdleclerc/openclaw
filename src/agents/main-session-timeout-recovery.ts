@@ -43,7 +43,7 @@ function matchesDirectGatewayTimeoutClaim(
   return (
     entry.sessionId === target.expectedSessionId &&
     normalizeOptionalString(entry.restartRecoveryDeliveryRunId) === target.expectedRunId &&
-    normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) === undefined
+    normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) !== target.expectedRunId
   );
 }
 
@@ -69,6 +69,7 @@ async function prepareTimedOutMainSessionRecovery(
       const claimFor = (claimSessionKey: string): ExpectedRestartRecoveryClaim => ({
         canonicalSessionKey: target.canonicalSessionKey,
         recoveryRunId,
+        recoverySourceRunId: normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId),
         sessionId: target.expectedSessionId,
         sessionKey: claimSessionKey,
       });
@@ -82,6 +83,12 @@ async function prepareTimedOutMainSessionRecovery(
       }
       entry.restartRecoveryInterruptionReason = "gateway_timeout";
       const timeoutAttemptCount = entry.restartRecoveryTimeoutAttemptCount ?? 0;
+      const existingSourceRunId = normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId);
+      // The first timeout adopts the accepted run as the immutable output owner.
+      // Later timeout rotations keep this source while changing only execution id.
+      if (existingSourceRunId === undefined) {
+        entry.restartRecoveryDeliverySourceRunId = target.expectedRunId;
+      }
       if (timeoutAttemptCount >= MAX_GATEWAY_TIMEOUT_RECOVERY_ATTEMPTS) {
         entry.restartRecoveryTimeoutExhausted = true;
       } else {
@@ -141,7 +148,8 @@ async function recoverTimedOutMainSession(params: {
     current.status === "running" &&
     current.abortedLastRun === true &&
     current.restartRecoveryInterruptionReason === "gateway_timeout" &&
-    normalizeOptionalString(current.restartRecoveryDeliverySourceRunId) === undefined &&
+    normalizeOptionalString(current.restartRecoveryDeliverySourceRunId) ===
+      prepared.claim.recoverySourceRunId &&
     currentRunId
   ) {
     params.target.expectedRunId = currentRunId;

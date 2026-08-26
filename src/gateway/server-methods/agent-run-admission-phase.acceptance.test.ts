@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { clearAgentRunContext, getAgentRunContext } from "../../infra/agent-events.js";
 import {
   admitGaiaAcceptance,
+  deriveGaiaAcceptanceId,
   recoverGaiaAcceptance,
 } from "../../infra/outbound/delivery-queue-storage.js";
 import {
+  readGaiaRecoveredAcceptedEnvelope,
   withPluginRuntimeGatewayRequestScope,
   withPluginRuntimePluginScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
@@ -13,6 +15,7 @@ import {
   isSessionWorkAdmissionActive,
   type SessionWorkAdmissionLease,
 } from "../../sessions/session-lifecycle-admission.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { withTempDir } from "../../test-helpers/temp-dir.js";
 import { createChatRunRegistry } from "../server-chat-state.js";
 import type { AgentDeliveryPhaseResult } from "./agent-delivery-phase.js";
@@ -41,9 +44,9 @@ type PhaseHarness = {
   markAccepted: ReturnType<typeof vi.fn>;
   respond: ReturnType<typeof vi.fn>;
   registerPluginSubagentRun: ReturnType<typeof vi.fn>;
-  buildParams: (overrides?: {
-    admitGaiaAcceptance?: typeof admitGaiaAcceptance;
-  }) => Parameters<typeof prepareAgentRunDispatch>[0];
+  buildParams: (
+    overrides?: Partial<Parameters<typeof prepareAgentRunDispatch>[0]>,
+  ) => Parameters<typeof prepareAgentRunDispatch>[0];
 };
 
 function makeClient(pluginRuntimeOwnerId: string, trackSubagent: boolean): GatewayClient {
@@ -174,6 +177,27 @@ async function runInPluginRequest<T>(
     },
     () => withPluginRuntimePluginScope({ pluginId }, run),
   );
+}
+
+async function runInHostRequest<T>(harness: PhaseHarness, run: () => Promise<T>): Promise<T> {
+  return await withPluginRuntimeGatewayRequestScope(
+    {
+      context: harness.context,
+      client: { connect: {} } as GatewayClient,
+      isWebchatConnect: () => false,
+    },
+    run,
+  );
+}
+
+function recoverySessionEntry(runId: string, sourceRunId: string): SessionEntry {
+  return {
+    sessionId: SESSION_ID,
+    status: "running",
+    abortedLastRun: true,
+    restartRecoveryDeliveryRunId: runId,
+    restartRecoveryDeliverySourceRunId: sourceRunId,
+  } as SessionEntry;
 }
 
 async function cleanupHarness(harness: PhaseHarness, prepared?: PreparedAgentRunDispatch) {
@@ -441,6 +465,212 @@ describe("gateway agent durable Gaia acceptance", () => {
         ),
       ).toEqual({ status: "absent" });
       await cleanupHarness(harness, prepared);
+    });
+  });
+
+  it("binds the exact durable Gaia owner for a host recovery request", async () => {
+    await withStateDir(async (stateDir) => {
+      const sourceRunId = "gaia-original-owner";
+      expect(
+        admitGaiaAcceptance(
+          {
+            runId: sourceRunId,
+            sessionKey: SESSION_KEY,
+            agentId: "gaia",
+            acceptedAt: 1_700_000_000_001,
+            receiptPluginId: GAIA_PLUGIN_ID,
+          },
+          stateDir,
+        ).status,
+      ).toBe("accepted");
+      const harness = makeHarness("gaia-recovery-execution", stateDir);
+      const hostClient = { connect: {} } as GatewayClient;
+      const result = await runInHostRequest(harness, async () => {
+        const prepared = await prepareAgentRunDispatch(
+          harness.buildParams({
+            client: hostClient,
+            request: {
+              ...harness.buildParams().request,
+              expectedExistingSessionId: SESSION_ID,
+            },
+            sessionEntry: recoverySessionEntry(harness.runId, sourceRunId),
+          }),
+        );
+        return { prepared, owner: readGaiaRecoveredAcceptedEnvelope() };
+      });
+
+      expect(result.prepared).toBeDefined();
+      expect(result.owner).toMatchObject({
+        runId: sourceRunId,
+        sessionKey: SESSION_KEY,
+        agentId: "gaia",
+        receiptPluginId: GAIA_PLUGIN_ID,
+      });
+      expect(result.owner?.runId).not.toBe(harness.runId);
+      await cleanupHarness(harness, result.prepared);
+    });
+  });
+
+  it("keeps ordinary non-Gaia recovery unchanged when acceptance is absent", async () => {
+    await withStateDir(async (stateDir) => {
+      const harness = makeHarness("ordinary-recovery-execution", stateDir);
+      const hostClient = { connect: {} } as GatewayClient;
+      const result = await runInHostRequest(harness, async () => {
+        const prepared = await prepareAgentRunDispatch(
+          harness.buildParams({
+            client: hostClient,
+            request: {
+              ...harness.buildParams().request,
+              expectedExistingSessionId: SESSION_ID,
+            },
+            sessionEntry: recoverySessionEntry(harness.runId, "ordinary-source-run"),
+          }),
+        );
+        return { prepared, owner: readGaiaRecoveredAcceptedEnvelope() };
+      });
+
+      expect(result.prepared).toBeDefined();
+      expect(result.owner).toBeUndefined();
+      await cleanupHarness(harness, result.prepared);
+    });
+  });
+
+  it.each(["execution", "session"] as const)(
+    "rejects a durable Gaia source claim with an invalid recovery %s before dispatch",
+    async (invalidPart) => {
+      await withStateDir(async (stateDir) => {
+        const sourceRunId = `gaia-invalid-${invalidPart}-source`;
+        expect(
+          admitGaiaAcceptance(
+            {
+              runId: sourceRunId,
+              sessionKey: SESSION_KEY,
+              agentId: "gaia",
+              acceptedAt: 1_700_000_000_004,
+              receiptPluginId: GAIA_PLUGIN_ID,
+            },
+            stateDir,
+          ).status,
+        ).toBe("accepted");
+        const harness = makeHarness(`gaia-invalid-${invalidPart}-recovery`, stateDir);
+        const hostClient = { connect: {} } as GatewayClient;
+        const prepared = await runInHostRequest(harness, () =>
+          prepareAgentRunDispatch(
+            harness.buildParams({
+              client: hostClient,
+              request: {
+                ...harness.buildParams().request,
+                expectedExistingSessionId:
+                  invalidPart === "session" ? "different-session" : SESSION_ID,
+              },
+              sessionEntry: recoverySessionEntry(
+                invalidPart === "execution" ? "different-execution" : harness.runId,
+                sourceRunId,
+              ),
+            }),
+          ),
+        );
+
+        expect(prepared).toBeUndefined();
+        expect(harness.respond).toHaveBeenCalledWith(
+          false,
+          undefined,
+          expect.objectContaining({
+            message: expect.stringContaining("does not match the durable recovery state"),
+          }),
+        );
+        expect(harness.context.chatAbortControllers.has(harness.runId)).toBe(false);
+      });
+    },
+  );
+
+  it.each(["corrupt", "mismatch"] as const)(
+    "fails closed before dispatch for %s recovery acceptance evidence",
+    async (evidence) => {
+      await withStateDir(async (stateDir) => {
+        const sourceRunId = `gaia-${evidence}-owner`;
+        const accepted = {
+          runId: sourceRunId,
+          sessionKey: evidence === "mismatch" ? "agent:gaia:slack:channel:OTHER" : SESSION_KEY,
+          agentId: "gaia",
+          acceptedAt: 1_700_000_000_002,
+          receiptPluginId: GAIA_PLUGIN_ID as typeof GAIA_PLUGIN_ID,
+        };
+        expect(admitGaiaAcceptance(accepted, stateDir).status).toBe("accepted");
+        if (evidence === "corrupt") {
+          const { db } = openOpenClawStateDatabase({
+            env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+          });
+          db.prepare(
+            "UPDATE delivery_queue_entries SET entry_json = ? WHERE queue_name = 'gaia-acceptance' AND id = ?",
+          ).run("{", deriveGaiaAcceptanceId(sourceRunId));
+          db.close();
+        }
+        const harness = makeHarness(`gaia-${evidence}-recovery`, stateDir);
+        const hostClient = { connect: {} } as GatewayClient;
+        const prepared = await runInHostRequest(harness, () =>
+          prepareAgentRunDispatch(
+            harness.buildParams({
+              client: hostClient,
+              request: {
+                ...harness.buildParams().request,
+                expectedExistingSessionId: SESSION_ID,
+              },
+              sessionEntry: recoverySessionEntry(harness.runId, sourceRunId),
+            }),
+          ),
+        );
+
+        expect(prepared).toBeUndefined();
+        expect(harness.respond).toHaveBeenCalledWith(
+          false,
+          undefined,
+          expect.objectContaining({
+            message: expect.stringContaining(
+              evidence === "corrupt" ? "corrupt durable acceptance" : "does not match",
+            ),
+          }),
+        );
+        expect(harness.context.chatAbortControllers.has(harness.runId)).toBe(false);
+      });
+    },
+  );
+
+  it("rejects a plugin caller that tries to adopt a recovered owner", async () => {
+    await withStateDir(async (stateDir) => {
+      const sourceRunId = "gaia-spoofed-owner";
+      expect(
+        admitGaiaAcceptance(
+          {
+            runId: sourceRunId,
+            sessionKey: SESSION_KEY,
+            agentId: "gaia",
+            acceptedAt: 1_700_000_000_003,
+            receiptPluginId: GAIA_PLUGIN_ID,
+          },
+          stateDir,
+        ).status,
+      ).toBe("accepted");
+      const harness = makeHarness("gaia-spoofed-recovery", stateDir);
+      const prepared = await runInPluginRequest(harness, GAIA_PLUGIN_ID, () =>
+        prepareAgentRunDispatch(
+          harness.buildParams({
+            request: {
+              ...harness.buildParams().request,
+              expectedExistingSessionId: SESSION_ID,
+            },
+            sessionEntry: recoverySessionEntry(harness.runId, sourceRunId),
+          }),
+        ),
+      );
+
+      expect(prepared).toBeUndefined();
+      expect(harness.respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({ message: expect.stringContaining("host gateway request") }),
+      );
+      expect(harness.context.chatAbortControllers.has(harness.runId)).toBe(false);
     });
   });
 });

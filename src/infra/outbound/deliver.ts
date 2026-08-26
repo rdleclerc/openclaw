@@ -46,6 +46,7 @@ import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import {
   getPluginRuntimeGatewayRequestScope,
   readGaiaAcceptedEnvelope,
+  readGaiaRecoveredAcceptedEnvelope,
   type GaiaHostAcceptedEnvelope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
@@ -865,7 +866,39 @@ function resolveGaiaOutputMode(
   params: DeliverOutboundPayloadsParams,
   requestScope: ReturnType<typeof getPluginRuntimeGatewayRequestScope>,
   hostAcceptedEnvelope: GaiaHostAcceptedEnvelope | undefined,
+  recoveredAcceptedEnvelope: GaiaHostAcceptedEnvelope | undefined,
 ): GaiaOutputMode | undefined {
+  if (recoveredAcceptedEnvelope) {
+    const reject = (reason: string): never => {
+      throw new Error(`Gaia recovered output rejected: ${reason}.`);
+    };
+    if (!requestScope?.context || requestScope.pluginId !== undefined) {
+      reject("a host gateway request scope is required");
+    }
+    if (params.channel !== "slack") {
+      reject("the accepted envelope is valid only for Slack output");
+    }
+    const hook = params.replyPayloadSendingHook;
+    if (!hook) {
+      return reject("the exact receipt hook is missing");
+    }
+    if (hook.runId !== recoveredAcceptedEnvelope.runId) {
+      reject("the receipt hook run does not match the accepted run");
+    }
+    if (hook.sessionKey !== recoveredAcceptedEnvelope.sessionKey) {
+      reject("the receipt hook session does not match the accepted session");
+    }
+    if (hook.messageSentReceiptPluginId !== recoveredAcceptedEnvelope.receiptPluginId) {
+      reject("the receipt hook owner does not match the accepted receipt plugin");
+    }
+    if (params.deliveryQueueId !== undefined && !params.skipQueue) {
+      reject("a caller-supplied queue owner is not permitted");
+    }
+    if (params.skipQueue && !matchesGaiaRecoveryOwner(params, recoveredAcceptedEnvelope)) {
+      reject("skipQueue is reserved for the exact persisted recovery owner");
+    }
+    return params.skipQueue ? "recovery" : "live";
+  }
   if (!hostAcceptedEnvelope) {
     if (params.gaiaKeyedOutput) {
       if (!params.skipQueue || !matchesGaiaRecoveryOwner(params)) {
@@ -887,7 +920,7 @@ function resolveGaiaOutputMode(
   }
   const hook = params.replyPayloadSendingHook;
   if (!hook) {
-    reject("the exact receipt hook is missing");
+    return reject("the exact receipt hook is missing");
   }
   if (hook.runId !== hostAcceptedEnvelope.runId) {
     reject("the receipt hook run does not match the accepted run");
@@ -1499,7 +1532,13 @@ export async function deliverOutboundPayloadsInternal(
   const { channel, to, payloads } = params;
   const requestScope = getPluginRuntimeGatewayRequestScope();
   const hostAcceptedEnvelope = readGaiaAcceptedEnvelope();
-  const gaiaOutputMode = resolveGaiaOutputMode(params, requestScope, hostAcceptedEnvelope);
+  const recoveredAcceptedEnvelope = readGaiaRecoveredAcceptedEnvelope();
+  const gaiaOutputMode = resolveGaiaOutputMode(
+    params,
+    requestScope,
+    hostAcceptedEnvelope,
+    recoveredAcceptedEnvelope,
+  );
   const emitPreQueueFailure = (): void => {
     // Recovery owns the stable queue terminal for replayed intents.
     if (params.deliveryQueueId !== undefined) {
@@ -1542,11 +1581,12 @@ export async function deliverOutboundPayloadsInternal(
   const queueRenderedBatchPlan = queuePayloadsChanged
     ? createRenderedMessageBatchPlan(queuePayloads)
     : renderedBatchPlan;
+  const acceptedEnvelope = recoveredAcceptedEnvelope ?? hostAcceptedEnvelope;
 
   const gaiaKeyedOutputAdmission =
     gaiaOutputMode === "live"
       ? await admitGaiaKeyedOutput({
-          accepted: hostAcceptedEnvelope!,
+          accepted: acceptedEnvelope!,
           channel,
           to,
           accountId: params.accountId,
@@ -1577,7 +1617,7 @@ export async function deliverOutboundPayloadsInternal(
       : undefined;
   if (gaiaKeyedOutputAdmission?.status === "conflict") {
     throw new Error(
-      `Gaia keyed output owner conflict for accepted run ${hostAcceptedEnvelope?.runId ?? ""}.`,
+      `Gaia keyed output owner conflict for accepted run ${acceptedEnvelope?.runId ?? ""}.`,
     );
   }
   if (gaiaKeyedOutputAdmission?.status === "duplicate") {

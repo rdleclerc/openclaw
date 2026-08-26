@@ -20,6 +20,17 @@ describe("shouldRetainRestartRecoveryClaimAfterRun", () => {
     ).toBe(true);
   });
 
+  it("retains a continuation claim with a distinct source owner", () => {
+    expect(
+      shouldRetainRestartRecoveryClaimAfterRun({
+        abortReason: Object.assign(new Error("timed out"), { name: "TimeoutError" }),
+        claimedRunId: "continuation-run",
+        runId: "continuation-run",
+        sourceRunId: "accepted-run",
+      }),
+    ).toBe(true);
+  });
+
   it("does not retain claims for operator aborts or another run", () => {
     expect(
       shouldRetainRestartRecoveryClaimAfterRun({

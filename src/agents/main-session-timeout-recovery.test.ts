@@ -123,6 +123,7 @@ describe("scheduleTimedOutMainSessionRecovery", () => {
     expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
       abortedLastRun: false,
       restartRecoveryDeliveryRunId: recoveryRunId,
+      restartRecoveryDeliverySourceRunId: runId,
       restartRecoveryInterruptionReason: "gateway_timeout",
       restartRecoveryTimeoutAttemptCount: 1,
       sessionId,
@@ -215,6 +216,10 @@ describe("scheduleTimedOutMainSessionRecovery", () => {
     expect(calls[0]?.params.idempotencyKey).not.toBe(runId);
     expect(calls[1]?.params.idempotencyKey).toBe(calls[0]?.params.idempotencyKey);
     expect(calls[2]?.params.runId).toBe(calls[0]?.params.idempotencyKey);
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
+      restartRecoveryDeliveryRunId: calls[0]?.params.idempotencyKey,
+      restartRecoveryDeliverySourceRunId: runId,
+    });
   });
 
   it("reuses the durably rotated id after a failure before dispatch", async () => {
@@ -359,6 +364,7 @@ describe("scheduleTimedOutMainSessionRecovery", () => {
       ).resolves.toBe(true);
       const entry = loadSessionEntry({ sessionKey, storePath });
       expect(entry?.restartRecoveryTimeoutAttemptCount).toBe(attempt);
+      expect(entry?.restartRecoveryDeliverySourceRunId).toBe(runId);
       timedOutRunId = entry?.restartRecoveryDeliveryRunId ?? "";
       expect(timedOutRunId).not.toBe(runId);
       await replaceSessionEntry(

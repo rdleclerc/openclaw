@@ -7,6 +7,14 @@ const TEST_SCOPE: PluginRuntimeGatewayRequestScope = {
   isWebchatConnect: (() => false) as PluginRuntimeGatewayRequestScope["isWebchatConnect"],
 };
 
+const ACCEPTED = {
+  runId: "accepted-run",
+  sessionKey: "agent:gaia:slack:channel:C123",
+  agentId: "Gaia",
+  acceptedAt: 1_700_000_000_000,
+  receiptPluginId: "gaia-workflow-preflight" as const,
+};
+
 describe("gateway request scope", () => {
   async function importGatewayRequestScopeModule() {
     return await import("./gateway-request-scope.js");
@@ -63,4 +71,54 @@ describe("gateway request scope", () => {
   it("attaches plugin id to the active scope", async () => {
     await expectPluginIdScopedGatewayScope("voice-call");
   });
+
+  it("keeps normal acceptance binding behind the exact Gaia plugin scope", async () => {
+    await withTestGatewayScope(async (runtimeScope) => {
+      expect(() => runtimeScope.bindGaiaAcceptedEnvelope(ACCEPTED)).toThrow(
+        "exact gaia-workflow-preflight plugin scope",
+      );
+      await runtimeScope.withPluginRuntimePluginIdScope("gaia-workflow-preflight", async () =>
+        runtimeScope.bindGaiaAcceptedEnvelope(ACCEPTED),
+      );
+      expect(runtimeScope.readGaiaAcceptedEnvelope()).toMatchObject({
+        runId: ACCEPTED.runId,
+        agentId: "gaia",
+      });
+    });
+  });
+
+  it("allows recovered acceptance only from the unowned host scope", async () => {
+    await withTestGatewayScope(async (runtimeScope) => {
+      expect(() => runtimeScope.bindGaiaRecoveredAcceptedEnvelope(ACCEPTED)).not.toThrow();
+      expect(runtimeScope.readGaiaRecoveredAcceptedEnvelope()).toMatchObject({
+        runId: ACCEPTED.runId,
+        agentId: "gaia",
+      });
+    });
+
+    await withTestGatewayScope(async (runtimeScope) => {
+      await runtimeScope.withPluginRuntimePluginIdScope("gaia-workflow-preflight", async () => {
+        expect(() => runtimeScope.bindGaiaRecoveredAcceptedEnvelope(ACCEPTED)).toThrow(
+          "host gateway request scope",
+        );
+      });
+    });
+
+    await runtimeScopeForHostClient("other-plugin");
+  });
+
+  async function runtimeScopeForHostClient(pluginRuntimeOwnerId: string) {
+    const runtimeScope = await importGatewayRequestScopeModule();
+    await runtimeScope.withPluginRuntimeGatewayRequestScope(
+      {
+        ...TEST_SCOPE,
+        client: { internal: { pluginRuntimeOwnerId } } as never,
+      },
+      async () => {
+        expect(() => runtimeScope.bindGaiaRecoveredAcceptedEnvelope(ACCEPTED)).toThrow(
+          "host gateway request scope",
+        );
+      },
+    );
+  }
 });

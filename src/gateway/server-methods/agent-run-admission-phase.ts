@@ -13,10 +13,12 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { claimAgentRunContext, clearAgentRunContext } from "../../infra/agent-events.js";
 import {
   admitGaiaAcceptance as admitGaiaAcceptanceToStore,
+  recoverGaiaAcceptance,
   type GaiaAcceptedEnvelope,
 } from "../../infra/outbound/delivery-queue-storage.js";
 import {
   bindGaiaAcceptedEnvelope,
+  bindGaiaRecoveredAcceptedEnvelope,
   getPluginRuntimeGatewayRequestScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
@@ -92,6 +94,61 @@ export function buildAgentRunAcceptedResponse(params: {
     };
   }
   return accepted;
+}
+
+function resolveGaiaRecoveryAcceptedEnvelope(params: {
+  request: AgentRunRequest;
+  sessionEntry?: SessionEntry;
+  resolvedSessionKey?: string;
+  activeSessionAgentId: string;
+  admissionAgentId?: string;
+  client: GatewayRequestHandlerOptions["client"];
+  stateDir?: string;
+}): GaiaAcceptedEnvelope | undefined {
+  const sessionEntry = params.sessionEntry;
+  const recoveryRunId = normalizeOptionalString(sessionEntry?.restartRecoveryDeliveryRunId);
+  const sourceRunId = normalizeOptionalString(sessionEntry?.restartRecoveryDeliverySourceRunId);
+  const expectedSessionId = normalizeOptionalString(params.request.expectedExistingSessionId);
+  const sessionKey = normalizeOptionalString(params.resolvedSessionKey);
+  if (!sourceRunId || !sessionKey) {
+    return undefined;
+  }
+
+  const selector = {
+    runId: sourceRunId,
+    sessionKey,
+    agentId: normalizeAgentId(params.admissionAgentId ?? params.activeSessionAgentId),
+    receiptPluginId: "gaia-workflow-preflight" as const,
+  };
+  const recovered = recoverGaiaAcceptance(selector, params.stateDir ?? resolveStateDir());
+  if (recovered.status === "absent") {
+    return undefined;
+  }
+  if (recovered.status === "corrupt") {
+    throw new Error("Gaia recovery found corrupt durable acceptance evidence.");
+  }
+  if (recovered.status === "mismatch") {
+    throw new Error("Gaia recovery owner does not match durable acceptance evidence.");
+  }
+
+  if (
+    !sessionEntry ||
+    !recoveryRunId ||
+    recoveryRunId !== params.request.idempotencyKey.trim() ||
+    !expectedSessionId ||
+    expectedSessionId !== sessionEntry.sessionId ||
+    sessionEntry.status !== "running" ||
+    sessionEntry.abortedLastRun !== true
+  ) {
+    throw new Error("Gaia recovery claim does not match the durable recovery state.");
+  }
+
+  const scope = getPluginRuntimeGatewayRequestScope();
+  const clientPluginId = normalizeOptionalString(params.client?.internal?.pluginRuntimeOwnerId);
+  if (scope?.pluginId !== undefined || clientPluginId !== undefined) {
+    throw new Error("Gaia recovered acceptance requires a host gateway request scope.");
+  }
+  return recovered.accepted;
 }
 
 function compensateGaiaAdmission(params: {
@@ -342,6 +399,34 @@ export async function prepareAgentRunDispatch(params: {
           receiptPluginId: "gaia-workflow-preflight",
         }
       : undefined;
+  try {
+    const recoveredAcceptedEnvelope = resolveGaiaRecoveryAcceptedEnvelope({
+      request: params.request,
+      sessionEntry: params.sessionEntry,
+      resolvedSessionKey: params.resolvedSessionKey,
+      activeSessionAgentId: params.activeSessionAgentId,
+      admissionAgentId,
+      client: params.client,
+      stateDir: params.gaiaAcceptanceStateDir,
+    });
+    if (recoveredAcceptedEnvelope) {
+      bindGaiaRecoveredAcceptedEnvelope(recoveredAcceptedEnvelope);
+    }
+  } catch (err) {
+    compensateGaiaAdmission({
+      context: params.context,
+      runId: params.runId,
+      sessionKey: params.resolvedSessionKey ?? params.request.sessionKey ?? "",
+      lifecycleGeneration: params.lifecycleGeneration,
+      activeGatewayWorkAdmission,
+      activeRunAbort,
+      chatRunRegistered,
+      runContextClaimed,
+      dedupeKeys: params.agentDedupeKeys,
+    });
+    params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+    return undefined;
+  }
   const taskTrackingMode = resolveGatewayAgentTaskTrackingMode({
     client: params.client,
     sessionKey: params.resolvedSessionKey,

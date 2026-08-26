@@ -365,10 +365,14 @@ export async function markStartupOrphanedMainSessionsForRecovery(params: {
         const counts = { marked: 0, skipped: 0 };
         for (const { sessionKey, entry } of entries) {
           const isStartupOrphan = entry.status === "running" && entry.abortedLastRun !== true;
+          const recoveryRunId = normalizeOptionalString(entry.restartRecoveryDeliveryRunId);
+          const recoverySourceRunId = normalizeOptionalString(
+            entry.restartRecoveryDeliverySourceRunId,
+          );
           const isGatewayTimeoutWithDurableClaim =
             entry.status === "timeout" &&
-            normalizeOptionalString(entry.restartRecoveryDeliveryRunId) !== undefined &&
-            normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) === undefined;
+            recoveryRunId !== undefined &&
+            recoverySourceRunId !== recoveryRunId;
           if (!isStartupOrphan && !isGatewayTimeoutWithDurableClaim) {
             continue;
           }
@@ -398,6 +402,11 @@ export async function markStartupOrphanedMainSessionsForRecovery(params: {
           entry.abortedLastRun = true;
           if (isGatewayTimeoutWithDurableClaim) {
             entry.restartRecoveryInterruptionReason = "gateway_timeout";
+            // Preserve the timed-out run as the output owner before rotating
+            // execution; the source must remain stable across recovery retries.
+            if (recoverySourceRunId === undefined) {
+              entry.restartRecoveryDeliverySourceRunId = recoveryRunId;
+            }
             const timeoutAttemptCount = entry.restartRecoveryTimeoutAttemptCount ?? 0;
             if (timeoutAttemptCount >= MAX_GATEWAY_TIMEOUT_RECOVERY_ATTEMPTS) {
               entry.restartRecoveryTimeoutExhausted = true;

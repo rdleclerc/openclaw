@@ -44,6 +44,10 @@ import {
 } from "../../infra/outbound/payloads.js";
 import type { OutboundSessionContext } from "../../infra/outbound/session-context.js";
 import { hasReplyPayloadContent } from "../../interactive/payload.js";
+import {
+  readGaiaAcceptedEnvelope,
+  readGaiaRecoveredAcceptedEnvelope,
+} from "../../plugins/runtime/gateway-request-scope.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import type { MessagingToolSend } from "../embedded-agent-messaging.types.js";
@@ -928,7 +932,11 @@ export async function deliverAgentCommandResult(
     if (deliveryTarget && !deliveryStatus) {
       params.assertDeliveryCurrent?.();
       const restartAbort = createRestartOnlyAbortSignal(opts.abortSignal);
-      const receiptPluginId = opts.inputProvenance?.messageSentReceiptPluginId;
+      const acceptedOwner = readGaiaRecoveredAcceptedEnvelope() ?? readGaiaAcceptedEnvelope();
+      const receiptPluginId =
+        acceptedOwner?.receiptPluginId ?? opts.inputProvenance?.messageSentReceiptPluginId;
+      const receiptRunId = acceptedOwner?.runId ?? opts.runId;
+      const receiptSessionKey = acceptedOwner?.sessionKey ?? effectiveSessionKey;
       let send: DurableSendResult;
       try {
         send = await sendDurableMessageBatch({
@@ -941,15 +949,15 @@ export async function deliverAgentCommandResult(
           replyPayloadSendingHook: {
             kind: "final",
             channel: deliveryChannel,
-            ...(effectiveSessionKey ? { sessionKey: effectiveSessionKey } : {}),
-            ...(opts.runId ? { runId: opts.runId } : {}),
+            ...(receiptSessionKey ? { sessionKey: receiptSessionKey } : {}),
+            ...(receiptRunId ? { runId: receiptRunId } : {}),
             ...(receiptPluginId ? { messageSentReceiptPluginId: receiptPluginId } : {}),
             context: {
               channelId: deliveryChannel,
               ...(resolvedAccountId ? { accountId: resolvedAccountId } : {}),
               conversationId: deliveryTarget,
-              ...(effectiveSessionKey ? { sessionKey: effectiveSessionKey } : {}),
-              ...(opts.runId ? { runId: opts.runId } : {}),
+              ...(receiptSessionKey ? { sessionKey: receiptSessionKey } : {}),
+              ...(receiptRunId ? { runId: receiptRunId } : {}),
               ...(opts.requestMessageId ? { messageId: opts.requestMessageId } : {}),
             },
           },

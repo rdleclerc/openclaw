@@ -27,6 +27,7 @@ import {
 } from "../../plugins/runtime.js";
 import {
   bindGaiaAcceptedEnvelope,
+  bindGaiaRecoveredAcceptedEnvelope,
   withPluginRuntimeGatewayRequestScope,
   withPluginRuntimePluginScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
@@ -214,6 +215,16 @@ function withGaiaHostAcceptance<T>(run: () => T): T {
         bindGaiaAcceptedEnvelope(GAIA_ACCEPTED_ENVELOPE);
         return run();
       }),
+  );
+}
+
+function withGaiaRecoveredHostAcceptance<T>(run: () => T): T {
+  return withPluginRuntimeGatewayRequestScope(
+    { context: {} as never, isWebchatConnect: () => false },
+    () => {
+      bindGaiaRecoveredAcceptedEnvelope(GAIA_ACCEPTED_ENVELOPE);
+      return run();
+    },
   );
 }
 
@@ -576,6 +587,43 @@ describe("deliverOutboundPayloads", () => {
       deliverOutboundPayloads(createGaiaRecoveryParams(stateDir, admitted)),
     );
     expect(sendSlack).toHaveBeenCalledTimes(1);
+  });
+
+  it("admits the first recovered Gaia send into the existing keyed-output fence", async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-gaia-recovered-first-send-"));
+    gaiaRecoveryStateDirs.push(stateDir);
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    try {
+      admitGaiaAcceptance(GAIA_ACCEPTED_ENVELOPE, stateDir);
+      const sendSlack = vi.fn().mockResolvedValue({ channel: "slack", messageId: "recovered" });
+      setActivePluginRegistry(
+        createTestRegistry([
+          {
+            pluginId: "slack",
+            source: "test",
+            plugin: createOutboundTestPlugin({
+              id: "slack",
+              outbound: { deliveryMode: "direct", sendText: async () => sendSlack() },
+            }),
+          },
+        ]),
+      );
+
+      const params = createGaiaDeliveryParams({
+        deliveryQueueStateDir: stateDir,
+      });
+      await withGaiaRecoveredHostAcceptance(() => deliverOutboundPayloads(params));
+      await withGaiaRecoveredHostAcceptance(() => deliverOutboundPayloads(params));
+
+      expect(sendSlack).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
   });
 
   it("allows only the durable Gaia Slack fence winner to enter the adapter", async () => {

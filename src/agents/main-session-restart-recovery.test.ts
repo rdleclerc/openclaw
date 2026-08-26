@@ -835,8 +835,10 @@ describe("main-session-restart-recovery", () => {
 
   it("resumes a gateway-timed-out session with its durable delivery claim on startup", async () => {
     const sessionsDir = await makeSessionsDir();
+    const timedOutRunId = "req_27a0924bb52678eefb17de80c8816ede";
+    const sessionKey = "agent:main:slack:channel:c0bly1apgh5";
     await writeStore(sessionsDir, {
-      "agent:main:slack:channel:c0bly1apgh5": {
+      [sessionKey]: {
         sessionId: "main-session",
         updatedAt: Date.now() - 10_000,
         status: "timeout",
@@ -850,7 +852,7 @@ describe("main-session-restart-recovery", () => {
           threadId: "1785613439.266819",
         },
         restartRecoveryDeliveryRequestMessageId: "1785613439.266819",
-        restartRecoveryDeliveryRunId: "req_27a0924bb52678eefb17de80c8816ede",
+        restartRecoveryDeliveryRunId: timedOutRunId,
       },
     });
     await writeTranscript(sessionsDir, "main-session", [
@@ -858,6 +860,18 @@ describe("main-session-restart-recovery", () => {
       { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "ceto" }] },
       { role: "toolResult", content: '{"job_id":"dr_rUN3w1Jh","status":"running"}' },
     ]);
+
+    const storePath = path.join(sessionsDir, "sessions.json");
+    let sourceOwnerAtDispatch: string | undefined;
+    vi.mocked(callGateway).mockImplementation(async ({ method, params }) => {
+      if (method === "agent") {
+        sourceOwnerAtDispatch = loadSessionEntry({
+          sessionKey,
+          storePath,
+        })?.restartRecoveryDeliverySourceRunId;
+      }
+      return { runId: String((params as { idempotencyKey?: unknown }).idempotencyKey) };
+    });
 
     const result = await recoverStartupOrphanedMainSessions({ stateDir: tmpDir });
 
@@ -899,15 +913,70 @@ describe("main-session-restart-recovery", () => {
     const recoveryRunId = String(
       (gatewayCall("agent")?.params as { idempotencyKey?: unknown } | undefined)?.idempotencyKey,
     );
+    expect(recoveryRunId).not.toBe(timedOutRunId);
+    expect(sourceOwnerAtDispatch).toBe(timedOutRunId);
     expect(noticeCall?.params).toMatchObject({
-      idempotencyKey: `main-session-restart-recovery:${recoveryRunId}:resuming-notice`,
+      idempotencyKey: `main-session-restart-recovery:${timedOutRunId}:resuming-notice`,
     });
-    expect(
-      loadSessionEntry({
-        sessionKey: "agent:main:slack:channel:c0bly1apgh5",
-        storePath: path.join(sessionsDir, "sessions.json"),
-      })?.restartRecoveryResumingNoticeRunId,
-    ).toBe(recoveryRunId);
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
+      restartRecoveryDeliveryRunId: recoveryRunId,
+      restartRecoveryDeliverySourceRunId: timedOutRunId,
+      restartRecoveryResumingNoticeRunId: timedOutRunId,
+    });
+  });
+
+  it("adopts a timeout claim with a distinct source owner on startup", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const storePath = path.join(sessionsDir, "sessions.json");
+    const sessionKey = "agent:main:slack:channel:c0distinct";
+    const executionRunId = "rotated-execution-run";
+    const sourceRunId = "original-accepted-run";
+    await writeStore(sessionsDir, {
+      [sessionKey]: {
+        sessionId: "main-session",
+        updatedAt: Date.now() - 10_000,
+        status: "timeout",
+        abortedLastRun: false,
+        restartRecoveryDeliveryContext: {
+          channel: "slack",
+          to: "C0DISTINCT",
+        },
+        restartRecoveryDeliveryRunId: executionRunId,
+        restartRecoveryDeliverySourceRunId: sourceRunId,
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "finish the Slack answer" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "exec" }] },
+      { role: "toolResult", content: "done" },
+    ]);
+
+    let sourceAtDispatch: string | undefined;
+    vi.mocked(callGateway).mockImplementation(async ({ method, params }) => {
+      if (method === "agent") {
+        sourceAtDispatch = loadSessionEntry({
+          sessionKey,
+          storePath,
+        })?.restartRecoveryDeliverySourceRunId;
+      }
+      return { runId: String((params as { idempotencyKey?: unknown }).idempotencyKey) };
+    });
+
+    await expect(recoverStartupOrphanedMainSessions({ stateDir: tmpDir })).resolves.toEqual({
+      marked: 1,
+      recovered: 1,
+      failed: 0,
+      skipped: 0,
+    });
+
+    const recoveryRunId = loadSessionEntry({ sessionKey, storePath })?.restartRecoveryDeliveryRunId;
+    expect(recoveryRunId).toEqual(expect.any(String));
+    expect(recoveryRunId).not.toBe(executionRunId);
+    expect(sourceAtDispatch).toBe(sourceRunId);
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
+      restartRecoveryDeliveryRunId: recoveryRunId,
+      restartRecoveryDeliverySourceRunId: sourceRunId,
+    });
   });
 
   it("reuses one durably minted timeout continuation id across startup retries", async () => {
@@ -1101,6 +1170,57 @@ describe("main-session-restart-recovery", () => {
     expect(claimAtDispatch).toBe(resumeParams.idempotencyKey);
     expect(claimAtDispatch).not.toBe("control-ui-run");
     expect(sourceClaimAtDispatch).toBe("control-ui-run");
+  });
+
+  it("keeps the accepted source owner when restart resumes an adopted execution claim", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const storePath = path.join(sessionsDir, "sessions.json");
+    const sessionKey = "agent:main:slack:channel:c0alpha";
+    await writeStore(sessionsDir, {
+      [sessionKey]: {
+        sessionId: "main-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        abortedLastRun: true,
+        restartRecoveryDeliveryContext: {
+          channel: "slack",
+          to: "C0ALPHA",
+        },
+        restartRecoveryDeliveryRunId: "rotated-execution-run",
+        restartRecoveryDeliverySourceRunId: "original-accepted-run",
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "finish the Slack answer" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "exec" }] },
+      { role: "toolResult", content: "done" },
+    ]);
+
+    let sourceAtDispatch: string | undefined;
+    vi.mocked(callGateway).mockImplementation(async ({ method, params }) => {
+      if (method === "agent") {
+        sourceAtDispatch = loadSessionEntry({
+          sessionKey,
+          storePath,
+        })?.restartRecoveryDeliverySourceRunId;
+      }
+      return { runId: String((params as { idempotencyKey?: unknown }).idempotencyKey) };
+    });
+
+    await expect(recoverRestartAbortedMainSessions({ stateDir: tmpDir })).resolves.toEqual({
+      recovered: 1,
+      failed: 0,
+      skipped: 0,
+    });
+    expect(gatewayCall("agent")?.params).toMatchObject({
+      idempotencyKey: "rotated-execution-run",
+    });
+    expect(sourceAtDispatch).toBe("original-accepted-run");
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
+      abortedLastRun: false,
+      restartRecoveryDeliveryRunId: "rotated-execution-run",
+      restartRecoveryDeliverySourceRunId: "original-accepted-run",
+    });
   });
 
   it("retains one stable transcript-only claim across ambiguous dispatch rejection", async () => {

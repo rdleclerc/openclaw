@@ -8,6 +8,10 @@ import type {
 import type { CliDeps } from "../../cli/outbound-send-deps.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  bindGaiaRecoveredAcceptedEnvelope,
+  withPluginRuntimeGatewayRequestScope,
+} from "../../plugins/runtime/gateway-request-scope.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { createAgentRunRestartAbortError } from "../run-termination.js";
 import { deliverAgentCommandResult } from "./delivery.js";
@@ -467,6 +471,53 @@ describe("deliverAgentCommandResult payload normalization", () => {
           runId: "recovery-run",
           sessionKey: outboundSession.key,
         },
+      },
+    });
+  });
+
+  it("uses the recovered accepted owner for the receipt hook after execution rotates", async () => {
+    const recoveredOwner = {
+      runId: "original-accepted-run",
+      sessionKey: "agent:main:slack:channel:c0alpha:thread:100.001",
+      agentId: "main",
+      acceptedAt: 1_700_000_000_000,
+      receiptPluginId: "gaia-workflow-preflight" as const,
+    };
+    await withPluginRuntimeGatewayRequestScope(
+      { context: {} as never, isWebchatConnect: () => false },
+      async () => {
+        bindGaiaRecoveredAcceptedEnvelope(recoveredOwner);
+        await deliverAgentCommandResult({
+          cfg: {} as OpenClawConfig,
+          deps: {} as CliDeps,
+          runtime: { log: vi.fn(), error: vi.fn() } as never,
+          opts: {
+            message: "resume",
+            deliver: true,
+            channel: "slack",
+            to: "C0ALPHA",
+            threadId: "100.001",
+            runId: "rotated-execution-run",
+            requestMessageId: "100.002",
+          } as AgentCommandOpts,
+          outboundSession: {
+            key: recoveredOwner.sessionKey,
+            agentId: recoveredOwner.agentId,
+          } as never,
+          sessionEntry: undefined,
+          payloads: [{ text: "recovered" }],
+          result: createResult(),
+        });
+      },
+    );
+
+    expect(latestOutboundDeliveryArgs().replyPayloadSendingHook).toMatchObject({
+      runId: recoveredOwner.runId,
+      sessionKey: recoveredOwner.sessionKey,
+      messageSentReceiptPluginId: recoveredOwner.receiptPluginId,
+      context: {
+        runId: recoveredOwner.runId,
+        sessionKey: recoveredOwner.sessionKey,
       },
     });
   });
