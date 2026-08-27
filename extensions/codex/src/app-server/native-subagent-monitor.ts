@@ -52,6 +52,11 @@ type ParentState = {
   mirror?: CodexNativeSubagentTaskMirror;
 };
 
+type ModelRerouteEvidence = {
+  fromModel: string;
+  toModel: string;
+};
+
 type ChildState = {
   childThreadId: string;
   parentThreadId: string;
@@ -59,7 +64,10 @@ type ChildState = {
   taskToken?: string;
   requestedModel?: string;
   requestedReasoningEffort?: string;
+  reviewerCandidate?: boolean;
+  reviewerMessageSha256?: string;
   launchConfigMismatch?: boolean;
+  modelReroutesByTurn: Map<string, ModelRerouteEvidence>;
   reviewerLineage?: CodexNativeReviewerLineage;
   lineageCapture?: Promise<CodexNativeReviewerLineage | undefined>;
   assistantMessagesByTurn: Map<string, ChildAssistantMessages>;
@@ -86,9 +94,7 @@ export type CodexNativeReviewerLineage = {
   taskToken: string;
   turnId: string;
   itemIds: string[];
-  acceptedTask: string;
   terminalItemId: string;
-  terminalResult: string;
   taskSha256: string;
   terminalResultSha256: string;
   transcriptSha256: string;
@@ -150,11 +156,15 @@ const DEFAULT_COMPLETION_DELIVERY_RETRY_DELAYS_MS = [
 ];
 const RECENT_TERMINAL_TASK_RECONCILE_GRACE_MS = 60_000;
 const THREAD_READ_TIMEOUT_MS = 30_000;
+const NATIVE_REVIEWER_MESSAGE_PREFIX = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\n";
+const NATIVE_REVIEWER_MODEL = "gpt-5.6-sol";
+const NATIVE_REVIEWER_REASONING_EFFORT = "ultra";
 const NATIVE_SUBAGENT_NOTIFICATION_METHODS = new Set([
   "thread/started",
   "thread/status/changed",
   "turn/started",
   "turn/completed",
+  "model/rerouted",
   "item/agentMessage/delta",
   "item/started",
   "item/completed",
@@ -167,6 +177,7 @@ const RECOVERY_REVISION_NOTIFICATION_METHODS = new Set([
   "thread/status/changed",
   "turn/started",
   "turn/completed",
+  "model/rerouted",
 ]);
 
 const defaultRuntime: NativeSubagentMonitorRuntime = {
@@ -395,6 +406,9 @@ class Monitor {
       }
     }
     const childState = threadId ? this.childStates.get(threadId) : undefined;
+    if (notification.method === "model/rerouted" && childState) {
+      this.captureModelRerouteEvidence(notification, childState);
+    }
     if (notification.method === "turn/started" && childState) {
       this.resumeChild(childState);
     }
@@ -427,6 +441,20 @@ class Monitor {
       }
     }
     await this.handleCompletionNotification(notification);
+  }
+
+  private captureModelRerouteEvidence(
+    notification: CodexServerNotification,
+    childState: ChildState,
+  ): void {
+    const params = isJsonObject(notification.params) ? notification.params : undefined;
+    const turnId = readString(params, "turnId")?.trim();
+    const fromModel = readString(params, "fromModel")?.trim();
+    const toModel = readString(params, "toModel")?.trim();
+    if (!turnId || !fromModel || !toModel) {
+      return;
+    }
+    childState.modelReroutesByTurn.set(turnId, { fromModel, toModel });
   }
 
   private resumeChild(childState: ChildState, options: { scheduleRecovery?: boolean } = {}): void {
@@ -629,6 +657,7 @@ class Monitor {
       notification.method === "thread/status/changed" ||
       notification.method === "turn/started" ||
       notification.method === "turn/completed" ||
+      notification.method === "model/rerouted" ||
       notification.method === "item/agentMessage/delta"
     ) {
       const childThreadId = readString(params, "threadId")?.trim();
@@ -673,6 +702,8 @@ class Monitor {
               requestedModel: readString(item, "model"),
               requestedReasoningEffort:
                 readString(item, "reasoningEffort") ?? readString(item, "reasoning_effort"),
+              reviewerCandidate: isNativeReviewerMessage(readString(item, "prompt")),
+              reviewerMessage: readString(item, "prompt"),
             }
           : {};
         let accepted = true;
@@ -940,9 +971,13 @@ class Monitor {
     }
     if (
       childState.launchConfigMismatch ||
+      !childState.reviewerCandidate ||
       !childState.taskToken ||
       !childState.requestedModel ||
-      !childState.requestedReasoningEffort
+      !childState.requestedReasoningEffort ||
+      !childState.reviewerMessageSha256 ||
+      !modelsMatch(childState.requestedModel, NATIVE_REVIEWER_MODEL) ||
+      childState.requestedReasoningEffort !== NATIVE_REVIEWER_REASONING_EFFORT
     ) {
       return undefined;
     }
@@ -974,7 +1009,16 @@ class Monitor {
     const taskToken = childState.taskToken;
     const requestedModel = childState.requestedModel;
     const requestedReasoningEffort = childState.requestedReasoningEffort;
-    if (!taskToken || !requestedModel || !requestedReasoningEffort) {
+    const reviewerMessageSha256 = childState.reviewerMessageSha256;
+    if (
+      !taskToken ||
+      !requestedModel ||
+      !requestedReasoningEffort ||
+      !childState.reviewerCandidate ||
+      !reviewerMessageSha256 ||
+      !modelsMatch(requestedModel, NATIVE_REVIEWER_MODEL) ||
+      requestedReasoningEffort !== NATIVE_REVIEWER_REASONING_EFFORT
+    ) {
       return undefined;
     }
     const runId = codexNativeSubagentRunId(childState.childThreadId);
@@ -995,25 +1039,22 @@ class Monitor {
       return undefined;
     }
     const firstCapture = readReviewerThreadCapture(firstThread, childState, completion.result);
-    if (!firstCapture) {
+    if (!firstCapture || sha256Utf8(firstCapture.acceptedTask) !== reviewerMessageSha256) {
       return undefined;
     }
-    const resumeResponse = await this.client.request(
-      "thread/resume",
-      { threadId: childState.childThreadId },
-      { timeoutMs: THREAD_READ_TIMEOUT_MS },
-    );
-    const resumed = isJsonObject(resumeResponse) ? resumeResponse : undefined;
-    const actualModel = readActualThreadModel(resumed);
-    const actualReasoningEffort = readActualReasoningEffort(resumed);
+    // Codex 0.150.1 emits model/rerouted before turn/completed. A matching
+    // event is trusted execution evidence. Without one, the requested model
+    // remains valid because the protocol emitted no reroute for this turn.
+    const reroute = childState.modelReroutesByTurn.get(firstCapture.turnId);
     if (
-      !actualModel ||
-      !actualReasoningEffort ||
-      !modelsMatch(actualModel, requestedModel) ||
-      actualReasoningEffort !== requestedReasoningEffort
+      reroute &&
+      (!modelsMatch(reroute.fromModel, requestedModel) ||
+        !modelsMatch(reroute.toModel, requestedModel))
     ) {
       return undefined;
     }
+    const actualModel = reroute?.toModel ?? requestedModel;
+    const actualReasoningEffort = requestedReasoningEffort;
     const secondResponse = await this.requestThreadRead(childState.childThreadId, true);
     const secondThread = isJsonObject(secondResponse.thread) ? secondResponse.thread : undefined;
     if (!secondThread) {
@@ -1043,9 +1084,7 @@ class Monitor {
       taskToken,
       turnId: firstCapture.turnId,
       itemIds: firstCapture.itemIds,
-      acceptedTask: firstCapture.acceptedTask,
       terminalItemId: firstCapture.terminalItemId,
-      terminalResult: firstCapture.terminalResult,
       taskSha256: sha256Utf8(firstCapture.acceptedTask),
       terminalResultSha256: sha256Utf8(firstCapture.terminalResult),
       transcriptSha256,
@@ -1161,6 +1200,8 @@ class Monitor {
       taskToken?: string;
       requestedModel?: string;
       requestedReasoningEffort?: string;
+      reviewerCandidate?: boolean;
+      reviewerMessage?: string;
     } = {},
   ): ChildState | undefined {
     const parentThreadId = parentThreadIdInput.trim();
@@ -1183,6 +1224,7 @@ class Monitor {
         childThreadId,
         parentThreadId,
         agentPathKeys: new Set<string>(),
+        modelReroutesByTurn: new Map<string, ModelRerouteEvidence>(),
         assistantMessagesByTurn: new Map<string, ChildAssistantMessages>(),
         recoveryAttempt: 0,
         terminal: false,
@@ -1216,6 +1258,8 @@ class Monitor {
       taskToken?: string;
       requestedModel?: string;
       requestedReasoningEffort?: string;
+      reviewerCandidate?: boolean;
+      reviewerMessage?: string;
     },
   ): void {
     const taskToken = options.taskToken ?? options.agentPath;
@@ -1244,6 +1288,20 @@ class Monitor {
         childState.launchConfigMismatch = true;
       } else {
         childState.requestedReasoningEffort ??= options.requestedReasoningEffort;
+      }
+    }
+    if (options.reviewerCandidate) {
+      childState.reviewerCandidate = true;
+    }
+    if (options.reviewerMessage !== undefined && isNativeReviewerMessage(options.reviewerMessage)) {
+      const reviewerMessageSha256 = sha256Utf8(options.reviewerMessage);
+      if (
+        childState.reviewerMessageSha256 !== undefined &&
+        childState.reviewerMessageSha256 !== reviewerMessageSha256
+      ) {
+        childState.launchConfigMismatch = true;
+      } else {
+        childState.reviewerMessageSha256 ??= reviewerMessageSha256;
       }
     }
   }
@@ -1666,6 +1724,10 @@ function readReviewerThreadCapture(
   childState: ChildState,
   terminalResult: string,
 ): ReviewerThreadCapture | undefined {
+  const canonicalTerminalResult = canonicalizeReviewerReceipt(terminalResult);
+  if (canonicalTerminalResult === undefined) {
+    return undefined;
+  }
   if (readString(thread, "id") !== childState.childThreadId) {
     return undefined;
   }
@@ -1741,7 +1803,7 @@ function readReviewerThreadCapture(
     itemIds,
     acceptedTask,
     terminalItemId,
-    terminalResult,
+    terminalResult: canonicalTerminalResult,
     ...(completedAtSeconds === undefined
       ? {}
       : { completedAt: Math.round(completedAtSeconds * 1_000) }),
@@ -1760,6 +1822,52 @@ function readRawUserMessageText(item: JsonObject): string | undefined {
   return text === undefined ? undefined : text;
 }
 
+function canonicalizeReviewerReceipt(value: string): string | undefined {
+  try {
+    const parsed = JSON.parse(value) as JsonValue;
+    return isJsonObject(parsed) ? canonicalizeJson(parsed) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalizeJson(value: JsonValue): string | undefined {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? JSON.stringify(value) : undefined;
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(canonicalizeJson);
+    return parts.every((part): part is string => part !== undefined)
+      ? `[${parts.join(",")}]`
+      : undefined;
+  }
+  if (isJsonObject(value)) {
+    const parts: string[] = [];
+    for (const key of Object.keys(value).toSorted()) {
+      const nestedValue = value[key];
+      if (nestedValue === undefined) {
+        return undefined;
+      }
+      const part = canonicalizeJson(nestedValue);
+      if (part === undefined) {
+        return undefined;
+      }
+      parts.push(`${JSON.stringify(key)}:${part}`);
+    }
+    return `{${parts.join(",")}}`;
+  }
+  return undefined;
+}
+
 function readThreadForkSource(thread: JsonObject): string | null | undefined {
   const value =
     thread.forkedFromId ?? thread.forked_from_id ?? thread.forkSource ?? thread.fork_source;
@@ -1767,28 +1875,6 @@ function readThreadForkSource(thread: JsonObject): string | null | undefined {
     return null;
   }
   return typeof value === "string" ? value : undefined;
-}
-
-function readActualThreadModel(response: JsonObject | undefined): string | undefined {
-  const thread = isJsonObject(response?.thread) ? response.thread : undefined;
-  return (
-    readString(response, "model") ??
-    readString(thread, "model") ??
-    (isJsonObject(thread?.extra) ? readString(thread.extra, "model") : undefined)
-  );
-}
-
-function readActualReasoningEffort(response: JsonObject | undefined): string | undefined {
-  const thread = isJsonObject(response?.thread) ? response.thread : undefined;
-  const config = isJsonObject(thread?.extra) ? thread.extra : undefined;
-  return (
-    readString(response, "reasoningEffort") ??
-    readString(response, "reasoning_effort") ??
-    readString(thread, "reasoningEffort") ??
-    readString(thread, "reasoning_effort") ??
-    readString(config, "reasoningEffort") ??
-    readString(config, "reasoning_effort")
-  );
 }
 
 function modelsMatch(actual: string, expected: string): boolean {
@@ -1802,6 +1888,10 @@ function modelsMatch(actual: string, expected: string): boolean {
 
 function sha256Utf8(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isNativeReviewerMessage(value: string | undefined): value is string {
+  return value !== undefined && value.startsWith(NATIVE_REVIEWER_MESSAGE_PREFIX);
 }
 
 function readThreadTurnRecovery(

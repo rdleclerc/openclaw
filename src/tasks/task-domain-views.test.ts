@@ -141,6 +141,30 @@ describe("task domain view mappers", () => {
     expect(mapTaskRunDetail(task)).toEqual(mapTaskRunView(task));
   });
 
+  it("keeps populated runtime detail private from task and flow summaries", () => {
+    const privateDetail = {
+      lineage: {
+        schema: "openclaw.codex_native_reviewer_lineage.v1",
+        taskSha256: "a".repeat(64),
+        terminalResultSha256: "b".repeat(64),
+      },
+    };
+    const task = makeTask({
+      taskId: "task-private-detail",
+      taskKind: "codex-native",
+      detail: privateDetail,
+    });
+
+    expect(mapTaskRunDetail(task)).toEqual(
+      expect.objectContaining({ taskKind: "codex-native", detail: privateDetail }),
+    );
+    expect(mapTaskRunView(task)).not.toHaveProperty("taskKind");
+    expect(mapTaskRunView(task)).not.toHaveProperty("detail");
+    expect(mapTaskFlowDetail({ flow: makeFlow(), tasks: [task] }).tasks[0]).not.toHaveProperty(
+      "detail",
+    );
+  });
+
   it("maps task flow records to public flow views without sharing requester origins", () => {
     const requesterOrigin = {
       channel: "telegram",
