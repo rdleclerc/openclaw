@@ -3248,6 +3248,31 @@ describe("scripts/crabbox-wrapper", () => {
     );
   });
 
+  it.each([
+    [
+      "default",
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare (default: aws)",
+    ],
+    [
+      "defaults",
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare (defaults to configured selection)",
+    ],
+  ])("accepts providers with the Crabbox %s help phrase", (_label, helpLine) => {
+    const result = runWrapper(`${helpLine}\n`, [
+      "run",
+      "--provider",
+      "blacksmith-testbox",
+      "--",
+      "echo ok",
+    ]);
+
+    expect(result.status).toBe(0);
+    expect(parseFakeCrabboxOutput(result).args).toContain("blacksmith-testbox");
+    expect(result.stderr).toContain(
+      "providers=hetzner,aws,local-container,blacksmith-testbox,cloudflare",
+    );
+  });
+
   if (process.platform === "win32") {
     it("preserves shell metacharacters through Windows Crabbox command shims", () => {
       const remoteCommand = "pnpm build && pnpm test | more < in.txt > out.txt %PATH%";
