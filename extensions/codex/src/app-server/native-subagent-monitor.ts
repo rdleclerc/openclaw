@@ -166,6 +166,7 @@ const THREAD_READ_TIMEOUT_MS = 30_000;
 const NATIVE_REVIEWER_MESSAGE_PREFIX = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\n";
 const NATIVE_REVIEWER_MODEL = "gpt-5.6-sol";
 const NATIVE_REVIEWER_REASONING_EFFORT = "ultra";
+const NATIVE_REVIEWER_PUBLIC_COMPLETION_SUMMARY = "Native independent fact-check completed.";
 const NATIVE_SUBAGENT_NOTIFICATION_METHODS = new Set([
   "thread/started",
   "thread/status/changed",
@@ -965,6 +966,10 @@ class Monitor {
       completion.status === "succeeded"
         ? await this.captureReviewerLineageOnce(state, childState, completion, eventAt)
         : undefined;
+    const publicCompletionSummary =
+      completion.status === "succeeded" && isNativeFactCheckReceipt(completion.result)
+        ? NATIVE_REVIEWER_PUBLIC_COMPLETION_SUMMARY
+        : completion.result;
     childState.terminal = true;
     this.clearRecoveryTimers(childState);
     state.mirror?.markAuthoritativeCompletion(completion.childThreadId);
@@ -974,8 +979,8 @@ class Monitor {
       endedAt: eventAt,
       lastEventAt: eventAt,
       ...(completion.status === "succeeded" ? {} : { error: completion.result }),
-      progressSummary: completion.result,
-      terminalSummary: completion.result,
+      progressSummary: publicCompletionSummary,
+      terminalSummary: publicCompletionSummary,
       ...(reviewerLineage ? { detail: { lineage: reviewerLineage } } : {}),
     });
     if (!state.requesterSessionKey || !state.taskRuntimeScope) {

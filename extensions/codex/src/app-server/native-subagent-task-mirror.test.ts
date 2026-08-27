@@ -344,6 +344,43 @@ describe("CodexNativeSubagentTaskMirror", () => {
     expect(runtime.finalizeTaskRunByRunId).not.toHaveBeenCalled();
   });
 
+  it("labels native reviewer prompts instead of exposing them in task views", () => {
+    const runtime = createRuntime();
+    const mirror = new CodexNativeSubagentTaskMirror(
+      {
+        parentThreadId: "parent-thread",
+        requesterSessionKey: "agent:main:main",
+        now: () => 40_000,
+      },
+      runtime,
+    );
+    const prompt = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.";
+
+    mirror.handleNotification({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          senderThreadId: "parent-thread",
+          receiverThreadIds: ["child-reviewer"],
+          prompt,
+          agentsStates: {},
+        },
+      },
+    });
+
+    expect(runtime.tryCreateRunningTaskRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task: "Native independent fact-check",
+      }),
+    );
+    expect(
+      JSON.stringify(vi.mocked(runtime.tryCreateRunningTaskRun).mock.calls[0]?.[0]),
+    ).not.toContain(prompt);
+  });
+
   it("mirrors Codex multi-agent V2 activity lifecycle", () => {
     const runtime = createRuntime();
     const mirror = new CodexNativeSubagentTaskMirror(

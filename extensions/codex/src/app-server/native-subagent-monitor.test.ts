@@ -32,7 +32,10 @@ function createClient() {
     | ((params: ThreadReadParams) => CodexThreadReadResponse | Promise<CodexThreadReadResponse>)
   >();
   const threadTurns = new Map<string, JsonValue | Error>();
-  const transcripts = new Map<string, string | Error>();
+  const transcripts = new Map<
+    string,
+    string | Error | ((path: string) => string | Promise<string>)
+  >();
   const request = vi.fn(async (method: string, params?: unknown) => {
     if (method === "thread/turns/list") {
       const childThreadId = ((params as ThreadTurnsParams | undefined) ?? {}).threadId ?? "";
@@ -67,7 +70,7 @@ function createClient() {
     if (response === undefined) {
       throw new Error(`transcript not loaded: ${path}`);
     }
-    return response;
+    return typeof response === "function" ? await response(path) : response;
   });
   return {
     request,
@@ -87,6 +90,9 @@ function createClient() {
       threadTurns.set(childThreadId, response);
     },
     setTranscript(path: string, response: string | Error) {
+      transcripts.set(path, response);
+    },
+    setTranscriptFactory(path: string, response: (path: string) => string | Promise<string>) {
       transcripts.set(path, response);
     },
     addNotificationHandler(handler: NotificationHandler) {
@@ -374,6 +380,9 @@ function taskRecord(params: {
   };
 }
 
+const REVIEWER_MESSAGE = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.";
+const REVIEWER_TRANSCRIPT_PATH = "/tmp/codex-reviewer.jsonl";
+
 function validReviewerReceipt(acceptedTask: string): Record<string, unknown> {
   return {
     status: "pass",
@@ -403,42 +412,35 @@ function firstFinalizedTask(runtime: ReturnType<typeof createRuntime>):
   return calls[0]?.[0];
 }
 
-async function configureReviewerCapture(
-  client: ReturnType<typeof createClient>,
-  runtime: ReturnType<typeof createRuntime>,
-  options: {
-    reroutedModel?: string;
-    requestedReasoningEffort?: string;
-    earlierCompletedTurn?: boolean;
-    driftOnSecondRead?: boolean;
-    terminalResult?: string;
-    v2?: boolean;
-  } = {},
-) {
-  await notifyChildStarted(client, "parent-thread", "child-reviewer", "review-task");
-  if (!options.v2) {
-    await client.notify({
-      method: "item/completed",
-      params: {
-        threadId: "parent-thread",
-        item: {
-          type: "collabAgentToolCall",
-          tool: "spawnAgent",
-          senderThreadId: "parent-thread",
-          receiverThreadIds: ["child-reviewer"],
-          model: "gpt-5.6-sol",
-          reasoningEffort: options.requestedReasoningEffort ?? "ultra",
-          prompt: "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.",
-          agentsStates: {},
-        },
-      },
-    });
-  }
-  const acceptedTask = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.";
+type ReviewerCaptureOptions = {
+  reroutedModel?: string;
+  requestedReasoningEffort?: string;
+  earlierCompletedTurn?: boolean;
+  driftOnSecondRead?: boolean;
+  driftThreadPathOnSecondRead?: boolean;
+  driftTranscriptOnSecondRead?: boolean;
+  terminalResult?: string;
+  v2?: boolean;
+  missingObservedTurnStart?: boolean;
+  omitThreadPath?: boolean;
+  sessionMeta?: {
+    id?: string;
+    parentThreadId?: string;
+    agentPath?: string;
+  };
+  missingTurnContext?: boolean;
+  conflictingTurnContextModel?: string;
+  conflictingTurnContextEffort?: string;
+  transcriptModel?: string;
+  transcriptEffort?: string;
+};
+
+function createReviewerHistory(options: ReviewerCaptureOptions = {}) {
+  const acceptedTask = REVIEWER_MESSAGE;
   const terminalResult =
     options.terminalResult ?? JSON.stringify(validReviewerReceipt(acceptedTask));
-  const transcriptPath = "/tmp/codex-reviewer.jsonl";
-  const thread = {
+  const transcriptPath = REVIEWER_TRANSCRIPT_PATH;
+  const thread: Record<string, unknown> = {
     id: "child-reviewer",
     parentThreadId: "parent-thread",
     source: {
@@ -451,7 +453,7 @@ async function configureReviewerCapture(
       },
     },
     status: { type: "idle" },
-    path: transcriptPath,
+    ...(options.omitThreadPath ? {} : { path: transcriptPath }),
     turns: [
       ...(options.earlierCompletedTurn
         ? [
@@ -490,28 +492,98 @@ async function configureReviewerCapture(
       },
     ],
   };
-  client.setTranscript(
-    transcriptPath,
-    reviewerTranscript({
-      terminalResult,
-      childThreadId: "child-reviewer",
-      parentThreadId: "parent-thread",
-      taskToken: "review-task",
-      turnId: "review-turn-1",
-    }),
-  );
-  if (options.driftOnSecondRead) {
+  const transcript = reviewerTranscript({
+    terminalResult,
+    childThreadId: "child-reviewer",
+    parentThreadId: "parent-thread",
+    taskToken: "review-task",
+    turnId: "review-turn-1",
+    sessionMeta: options.sessionMeta,
+    missingTurnContext: options.missingTurnContext,
+    conflictingTurnContextModel: options.conflictingTurnContextModel,
+    conflictingTurnContextEffort: options.conflictingTurnContextEffort,
+    transcriptModel: options.transcriptModel,
+    transcriptEffort: options.transcriptEffort,
+  });
+  return { acceptedTask, terminalResult, transcriptPath, thread, transcript };
+}
+
+async function configureReviewerCapture(
+  client: ReturnType<typeof createClient>,
+  runtime: ReturnType<typeof createRuntime>,
+  options: ReviewerCaptureOptions = {},
+) {
+  const history = createReviewerHistory(options);
+  if (options.v2) {
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "review-activity-started",
+          kind: "started",
+          agentThreadId: "child-reviewer",
+          agentPath: "review-task",
+        },
+      },
+    });
+  } else {
+    await notifyChildStarted(client, "parent-thread", "child-reviewer", "review-task");
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          senderThreadId: "parent-thread",
+          receiverThreadIds: ["child-reviewer"],
+          model: "gpt-5.6-sol",
+          reasoningEffort: options.requestedReasoningEffort ?? "ultra",
+          prompt: REVIEWER_MESSAGE,
+          agentsStates: {},
+        },
+      },
+    });
+  }
+  client.setTranscript(history.transcriptPath, history.transcript);
+  if (options.driftTranscriptOnSecondRead) {
+    client.setTranscriptFactory(
+      history.transcriptPath,
+      (() => {
+        let readCount = 0;
+        return () => {
+          readCount += 1;
+          return readCount === 1 ? history.transcript : `${history.transcript}{"drift":true}\n`;
+        };
+      })(),
+    );
+  }
+  if (options.driftOnSecondRead || options.driftThreadPathOnSecondRead) {
     let readCount = 0;
     client.setThreadReadFactory("child-reviewer", () => {
       readCount += 1;
+      const nextThread =
+        readCount === 1
+          ? history.thread
+          : {
+              ...history.thread,
+              ...(options.driftThreadPathOnSecondRead
+                ? { path: "/tmp/codex-reviewer-drift.jsonl" }
+                : {}),
+            };
+      if (!options.driftOnSecondRead) {
+        return { thread: nextThread } as never;
+      }
       return {
         thread:
           readCount === 1
-            ? thread
+            ? nextThread
             : {
-                ...thread,
+                ...nextThread,
                 turns: [
-                  ...thread.turns,
+                  ...(Array.isArray(nextThread.turns) ? nextThread.turns : []),
                   {
                     id: "review-follow-up",
                     status: "completed",
@@ -535,16 +607,18 @@ async function configureReviewerCapture(
       } as never;
     });
   } else {
-    client.setThreadRead("child-reviewer", { thread } as never);
+    client.setThreadRead("child-reviewer", { thread: history.thread } as never);
   }
   runtime.listTaskRecords.mockReturnValue([taskRecord({ childThreadId: "child-reviewer" })]);
-  await client.notify({
-    method: "turn/started",
-    params: {
-      threadId: "child-reviewer",
-      turn: { id: "review-turn-1", status: "inProgress", items: [] },
-    },
-  });
+  if (!options.missingObservedTurnStart) {
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-reviewer",
+        turn: { id: "review-turn-1", status: "inProgress", items: [] },
+      },
+    });
+  }
   if (options.reroutedModel && options.reroutedModel !== "gpt-5.6-sol") {
     await client.notify({
       method: "model/rerouted",
@@ -569,7 +643,7 @@ async function configureReviewerCapture(
             id: "review-final-1",
             type: "agentMessage",
             phase: "finalAnswer",
-            text: terminalResult,
+            text: history.terminalResult,
           },
         ],
         completedAt: 1_779_063_288,
@@ -579,7 +653,7 @@ async function configureReviewerCapture(
   await client.notify(
     nativeCompletionNotification({
       agentPath: "review-task",
-      result: terminalResult,
+      result: history.terminalResult,
     }),
   );
 }
@@ -590,14 +664,26 @@ function reviewerTranscript(params: {
   parentThreadId: string;
   taskToken: string;
   turnId: string;
+  sessionMeta?: {
+    id?: string;
+    parentThreadId?: string;
+    agentPath?: string;
+  };
+  missingTurnContext?: boolean;
+  conflictingTurnContextModel?: string;
+  conflictingTurnContextEffort?: string;
+  transcriptModel?: string;
+  transcriptEffort?: string;
 }): string {
+  const transcriptModel = params.transcriptModel ?? "gpt-5.6-sol";
+  const transcriptEffort = params.transcriptEffort ?? "ultra";
   const records: JsonValue[] = [
     {
       type: "session_meta",
       payload: {
-        id: params.childThreadId,
-        parent_thread_id: params.parentThreadId,
-        agent_path: params.taskToken,
+        id: params.sessionMeta?.id ?? params.childThreadId,
+        parent_thread_id: params.sessionMeta?.parentThreadId ?? params.parentThreadId,
+        agent_path: params.sessionMeta?.agentPath ?? params.taskToken,
         source: {
           subagent: {
             thread_spawn: {
@@ -612,14 +698,22 @@ function reviewerTranscript(params: {
       type: "event_msg",
       payload: { type: "task_started", turn_id: params.turnId },
     },
-    {
-      type: "turn_context",
-      payload: { turn_id: params.turnId, model: "gpt-5.6-sol", effort: "ultra" },
-    },
-    {
-      type: "turn_context",
-      payload: { turn_id: params.turnId, model: "gpt-5.6-sol", effort: "ultra" },
-    },
+    ...(params.missingTurnContext
+      ? []
+      : [
+          {
+            type: "turn_context",
+            payload: { turn_id: params.turnId, model: transcriptModel, effort: transcriptEffort },
+          },
+          {
+            type: "turn_context",
+            payload: {
+              turn_id: params.turnId,
+              model: params.conflictingTurnContextModel ?? transcriptModel,
+              effort: params.conflictingTurnContextEffort ?? transcriptEffort,
+            },
+          },
+        ]),
     {
       type: "event_msg",
       payload: {
@@ -731,6 +825,42 @@ describe("CodexNativeSubagentMonitor", () => {
     expect(client.readTranscript).toHaveBeenCalledWith("/tmp/codex-reviewer.jsonl");
     monitor.dispose();
   });
+
+  it.each([
+    ["trusted lineage", {} as ReviewerCaptureOptions, true],
+    ["rejected lineage", { missingObservedTurnStart: true } as ReviewerCaptureOptions, false],
+  ])(
+    "keeps the typed reviewer receipt out of public summaries when lineage is %s",
+    async (_name, options, hasLineage) => {
+      const client = createClient();
+      const runtime = createRuntime();
+      const monitor = createReviewerMonitor(client, runtime);
+      registerParent(monitor, "parent-thread", "agent:main:main");
+
+      await configureReviewerCapture(client, runtime, { ...options, v2: true });
+
+      const finalize = firstFinalizedTask(runtime);
+      expect(finalize).toEqual(
+        expect.objectContaining({
+          progressSummary: "Native independent fact-check completed.",
+          terminalSummary: "Native independent fact-check completed.",
+        }),
+      );
+      const publicSummaryText = JSON.stringify({
+        progressSummary: finalize?.progressSummary,
+        terminalSummary: finalize?.terminalSummary,
+      });
+      expect(publicSummaryText).not.toContain(REVIEWER_MESSAGE);
+      expect(publicSummaryText).not.toContain("reviewer-context");
+      expect(publicSummaryText).not.toContain("findings");
+      if (hasLineage) {
+        expect(finalize?.detail?.lineage).toEqual(expect.anything());
+      } else {
+        expect(finalize?.detail).toBeUndefined();
+      }
+      monitor.dispose();
+    },
+  );
 
   it("keeps collab completion as progress while app-server recovery is authoritative", async () => {
     const client = createClient();
@@ -982,6 +1112,128 @@ describe("CodexNativeSubagentMonitor", () => {
 
     expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
     expect(client.readTranscript).not.toHaveBeenCalled();
+    monitor.dispose();
+  });
+
+  it.each([
+    ["child", { sessionMeta: { id: "foreign-child" } }],
+    ["parent", { sessionMeta: { parentThreadId: "foreign-parent" } }],
+    ["agent path", { sessionMeta: { agentPath: "foreign-agent-path" } }],
+  ] as const)("rejects reviewer lineage for wrong session_meta %s", async (_name, options) => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, { ...options, v2: true });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.readTranscript).toHaveBeenCalledTimes(1);
+    monitor.dispose();
+  });
+
+  it.each([
+    ["missing thread path", { omitThreadPath: true }, 1, 0],
+    ["thread path drift", { driftThreadPathOnSecondRead: true }, 2, 1],
+  ] as const)(
+    "rejects reviewer lineage for %s",
+    async (_name, options, expectedRequests, expectedTranscriptReads) => {
+      const client = createClient();
+      const runtime = createRuntime();
+      const monitor = createReviewerMonitor(client, runtime);
+      registerParent(monitor, "parent-thread", "agent:main:main");
+
+      await configureReviewerCapture(client, runtime, { ...options, v2: true });
+
+      expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+      expect(client.request).toHaveBeenCalledTimes(expectedRequests);
+      expect(client.readTranscript).toHaveBeenCalledTimes(expectedTranscriptReads);
+      monitor.dispose();
+    },
+  );
+
+  it.each([
+    ["missing turn_context", { missingTurnContext: true }],
+    ["conflicting turn_context model", { conflictingTurnContextModel: "gpt-5.6-luna" }],
+    ["conflicting turn_context effort", { conflictingTurnContextEffort: "high" }],
+    ["wrong transcript model", { transcriptModel: "gpt-5.6-luna" }],
+    ["wrong transcript effort", { transcriptEffort: "high" }],
+  ] as const)("rejects reviewer lineage for %s", async (_name, options) => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, { ...options, v2: true });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.request).toHaveBeenCalledTimes(1);
+    expect(client.readTranscript).toHaveBeenCalledTimes(1);
+    monitor.dispose();
+  });
+
+  it("does not capture reviewer lineage without an observed turn start", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, {
+      missingObservedTurnStart: true,
+      v2: true,
+    });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.request).toHaveBeenCalledTimes(1);
+    expect(client.readTranscript).not.toHaveBeenCalled();
+    monitor.dispose();
+  });
+
+  it("does not trust a recovered mid-turn completion without an observed turn start", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+    const history = createReviewerHistory();
+    client.setThreadRead("child-reviewer", { thread: history.thread } as never);
+    client.setTranscript(history.transcriptPath, history.transcript);
+    runtime.listTaskRecords.mockReturnValue([taskRecord({ childThreadId: "child-reviewer" })]);
+
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "review-activity-started",
+          kind: "started",
+          agentThreadId: "child-reviewer",
+          agentPath: "review-task",
+        },
+      },
+    });
+    await expect(monitor.reconcileChildThread("child-reviewer")).resolves.toBe(true);
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.readTranscript).not.toHaveBeenCalled();
+    monitor.dispose();
+  });
+
+  it("rejects reviewer lineage when transcript bytes drift between exact-path reads", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, {
+      driftTranscriptOnSecondRead: true,
+      v2: true,
+    });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.readTranscript).toHaveBeenCalledTimes(2);
+    expect(client.readTranscript).toHaveBeenNthCalledWith(1, REVIEWER_TRANSCRIPT_PATH);
+    expect(client.readTranscript).toHaveBeenNthCalledWith(2, REVIEWER_TRANSCRIPT_PATH);
     monitor.dispose();
   });
 

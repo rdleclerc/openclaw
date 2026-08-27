@@ -17,6 +17,9 @@ import type {
 } from "./protocol.js";
 import { isJsonObject } from "./protocol.js";
 
+const NATIVE_REVIEWER_MESSAGE_PREFIX = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\n";
+const NATIVE_REVIEWER_TASK_LABEL = "Native independent fact-check";
+
 /** Minimal task-runtime surface needed to mirror native subagent lifecycle. */
 type TaskLifecycleRuntime = Pick<
   AgentHarnessTaskRuntime,
@@ -297,7 +300,10 @@ export class CodexNativeSubagentTaskMirror {
     this.createRunningTask({
       threadId,
       label: "Codex subagent",
-      task: prompt ?? "Codex native subagent",
+      task:
+        prompt?.startsWith(NATIVE_REVIEWER_MESSAGE_PREFIX) === true
+          ? NATIVE_REVIEWER_TASK_LABEL
+          : (prompt ?? "Codex native subagent"),
       startedAt: createdAt,
       progressSummary: "Codex native subagent spawned.",
     });

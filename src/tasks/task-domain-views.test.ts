@@ -142,16 +142,28 @@ describe("task domain view mappers", () => {
   });
 
   it("keeps populated runtime detail private from task and flow summaries", () => {
+    const reviewerPrompt = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.";
+    const reviewerReceipt = JSON.stringify({
+      status: "pass",
+      reviewer_context_id: "reviewer-context-internal",
+      findings: [{ claim_id: "claim-internal", correction: "raw finding" }],
+    });
     const privateDetail = {
       lineage: {
         schema: "openclaw.codex_native_reviewer_lineage.v1",
         taskSha256: "a".repeat(64),
         terminalResultSha256: "b".repeat(64),
       },
+      prompt: reviewerPrompt,
+      receipt: reviewerReceipt,
+      findings: [{ claimId: "claim-internal", text: "raw finding" }],
     };
     const task = makeTask({
       taskId: "task-private-detail",
       taskKind: "codex-native",
+      task: "Native independent fact-check",
+      progressSummary: "Native independent fact-check completed.",
+      terminalSummary: "Native independent fact-check completed.",
       detail: privateDetail,
     });
 
@@ -163,6 +175,22 @@ describe("task domain view mappers", () => {
     expect(mapTaskFlowDetail({ flow: makeFlow(), tasks: [task] }).tasks[0]).not.toHaveProperty(
       "detail",
     );
+
+    const publicText = JSON.stringify({
+      task: mapTaskRunView(task),
+      flow: mapTaskFlowDetail({ flow: makeFlow(), tasks: [task] }),
+    });
+    expect(publicText).toContain("Native independent fact-check completed.");
+    for (const forbidden of [
+      reviewerPrompt,
+      reviewerReceipt,
+      "reviewer-context-internal",
+      "child-reviewer",
+      "claim-internal",
+      "raw finding",
+    ]) {
+      expect(publicText).not.toContain(forbidden);
+    }
   });
 
   it("maps task flow records to public flow views without sharing requester origins", () => {
