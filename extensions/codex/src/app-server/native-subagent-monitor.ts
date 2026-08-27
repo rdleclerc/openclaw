@@ -1124,7 +1124,7 @@ class Monitor {
         childState.childThreadId,
         firstCapture.turnId,
         firstCapture.itemIds,
-        firstCapture.acceptedTask,
+        firstCapture.reviewMessageSha256,
         firstCapture.terminalItemId,
         firstCapture.terminalResult,
       ]),
@@ -1139,7 +1139,7 @@ class Monitor {
       turnId: firstCapture.turnId,
       itemIds: firstCapture.itemIds,
       terminalItemId: firstCapture.terminalItemId,
-      taskSha256: sha256Utf8(firstCapture.acceptedTask),
+      taskSha256: firstCapture.reviewMessageSha256,
       taskBinding: "reviewer_attested",
       reviewMessageSha256: firstCapture.reviewMessageSha256,
       terminalResultSha256: sha256Utf8(firstCapture.terminalResult),
@@ -1772,7 +1772,6 @@ export const codexNativeSubagentMonitorRuntime = { Monitor, register: registerMo
 type ReviewerThreadCapture = {
   turnId: string;
   itemIds: string[];
-  acceptedTask: string;
   taskBinding: "reviewer_attested";
   reviewMessageSha256: string;
   terminalItemId: string;
@@ -1833,24 +1832,7 @@ function readReviewerThreadCapture(
   if (!turnId || !Array.isArray(turnItems)) {
     return undefined;
   }
-  const userMessages = turnItems.filter(
-    (item): item is JsonObject => isJsonObject(item) && readString(item, "type") === "userMessage",
-  );
-  if (userMessages.length !== 1) {
-    return undefined;
-  }
-  const userMessage = userMessages[0];
-  if (!userMessage) {
-    return undefined;
-  }
-  const acceptedTask = readRawUserMessageText(userMessage);
-  if (acceptedTask === undefined || !isNativeReviewerMessage(acceptedTask)) {
-    return undefined;
-  }
-  if (
-    reviewerReceipt.taskBinding !== "reviewer_attested" ||
-    reviewerReceipt.reviewMessageSha256 !== sha256Utf8(acceptedTask)
-  ) {
+  if (reviewerReceipt.taskBinding !== "reviewer_attested") {
     return undefined;
   }
   const itemIds: string[] = [];
@@ -1880,7 +1862,6 @@ function readReviewerThreadCapture(
   return {
     turnId,
     itemIds,
-    acceptedTask,
     taskBinding: reviewerReceipt.taskBinding,
     reviewMessageSha256: reviewerReceipt.reviewMessageSha256,
     terminalItemId,
@@ -2077,18 +2058,6 @@ async function readReviewerTranscript(
     actualModel: actualModel!,
     actualReasoningEffort: actualReasoningEffort!,
   };
-}
-
-function readRawUserMessageText(item: JsonObject): string | undefined {
-  if (Array.isArray(item.content)) {
-    if (item.content.length !== 1 || !isJsonObject(item.content[0])) {
-      return undefined;
-    }
-    const input = item.content[0];
-    return readString(input, "type") === "text" ? readString(input, "text") : undefined;
-  }
-  const text = readString(item, "text");
-  return text === undefined ? undefined : text;
 }
 
 function canonicalizeReviewerReceipt(value: string): string | undefined {

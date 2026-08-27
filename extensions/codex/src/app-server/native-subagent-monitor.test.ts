@@ -480,11 +480,6 @@ async function configureReviewerCapture(
         status: "completed",
         items: [
           {
-            id: "review-user-1",
-            type: "userMessage",
-            content: [{ type: "text", text: acceptedTask }],
-          },
-          {
             id: "review-final-1",
             type: "agentMessage",
             phase: "finalAnswer",
@@ -570,11 +565,6 @@ async function configureReviewerCapture(
         id: "review-turn-1",
         status: "completed",
         items: [
-          {
-            id: "review-user-1",
-            type: "userMessage",
-            content: [{ type: "text", text: acceptedTask }],
-          },
           {
             id: "review-final-1",
             type: "agentMessage",
@@ -719,7 +709,7 @@ describe("CodexNativeSubagentMonitor", () => {
     monitor.dispose();
   });
 
-  it("captures reviewer lineage from V2 activity and the persisted transcript", async () => {
+  it("captures reviewer lineage from V2 activity without a spawn-task userMessage", async () => {
     const client = createClient();
     const runtime = createRuntime();
     const monitor = createReviewerMonitor(client, runtime);
@@ -922,6 +912,7 @@ describe("CodexNativeSubagentMonitor", () => {
     expect(lineage).not.toHaveProperty("terminalResult");
     expect(lineage?.taskBinding).toBe("reviewer_attested");
     expect(lineage?.reviewMessageSha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    expect(lineage?.taskSha256).toBe(lineage?.reviewMessageSha256);
     expect(lineage?.taskSha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
     expect(lineage?.terminalResultSha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
     expect(client.request).toHaveBeenCalledTimes(2);
@@ -973,6 +964,24 @@ describe("CodexNativeSubagentMonitor", () => {
       createHash("sha256").update(canonicalReceipt, "utf8").digest("hex"),
     );
     expect(lineage?.transcriptSha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    monitor.dispose();
+  });
+
+  it("rejects a reviewer-attested task-hash mismatch", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+    const acceptedTask = "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nFact-check this exact packet.";
+    const receipt = validReviewerReceipt(acceptedTask);
+    receipt.review_message_sha256 = "0".repeat(64);
+
+    await configureReviewerCapture(client, runtime, {
+      terminalResult: JSON.stringify(receipt),
+    });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.readTranscript).not.toHaveBeenCalled();
     monitor.dispose();
   });
 
