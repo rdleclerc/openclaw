@@ -154,6 +154,7 @@ export type CodexThreadStartResponse = {
   thread: CodexThread;
   model: string;
   modelProvider?: string | null;
+  reasoningEffort?: string | null;
 };
 
 export type CodexThreadForkParams = JsonObject & {
@@ -253,6 +254,7 @@ export type CodexThreadResumeResponse = {
   thread: CodexThread;
   model: string;
   modelProvider?: string | null;
+  reasoningEffort?: string | null;
 };
 
 type CodexThreadInjectItemsParams = JsonObject & {
@@ -329,6 +331,8 @@ export type CodexThread = {
   updatedAt?: number | null;
   status?: CodexThreadStatus | null;
   modelProvider?: string | null;
+  forkedFromId?: string | null;
+  projectId?: string | null;
   cwd?: string | null;
   source?: CodexSessionSource | null;
   threadSource?: string | null;
@@ -698,6 +702,7 @@ type CodexAppServerRequestParamsOverride = {
   "thread/turns/list": CodexThreadTurnsListParams;
   "thread/name/set": CodexThreadSetNameParams;
   "thread/read": CodexThreadReadParams;
+  "thread/resume": CodexThreadResumeParams;
   "thread/start": CodexThreadStartParams;
   "thread/unarchive": CodexThreadArchiveParams;
   "thread/unsubscribe": CodexThreadUnsubscribeParams;

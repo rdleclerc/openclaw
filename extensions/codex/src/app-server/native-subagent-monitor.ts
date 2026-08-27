@@ -2,6 +2,7 @@
  * Mirrors Codex native subagent lifecycle and completion into OpenClaw task
  * runtime records, with app-server history as the recovery source.
  */
+import { createHash } from "node:crypto";
 import { embeddedAgentLog, formatErrorMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   createAgentHarnessTaskRuntime,
@@ -55,6 +56,12 @@ type ChildState = {
   childThreadId: string;
   parentThreadId: string;
   agentPathKeys: Set<string>;
+  taskToken?: string;
+  requestedModel?: string;
+  requestedReasoningEffort?: string;
+  launchConfigMismatch?: boolean;
+  reviewerLineage?: CodexNativeReviewerLineage;
+  lineageCapture?: Promise<CodexNativeReviewerLineage | undefined>;
   assistantMessagesByTurn: Map<string, ChildAssistantMessages>;
   recoveryAttempt: number;
   recoveryTimer?: ReturnType<typeof setTimeout>;
@@ -68,6 +75,31 @@ type ChildState = {
   deliveryOwnerKey?: string;
   settledWithoutCompletion: boolean;
 };
+
+/** Immutable runtime evidence for one completed native reviewer turn. */
+export type CodexNativeReviewerLineage = {
+  schema: "openclaw.codex_native_reviewer_lineage.v1";
+  childThreadId: string;
+  parentThreadId: string;
+  taskId: string;
+  runId: string;
+  taskToken: string;
+  turnId: string;
+  itemIds: string[];
+  acceptedTask: string;
+  terminalItemId: string;
+  terminalResult: string;
+  taskSha256: string;
+  terminalResultSha256: string;
+  transcriptSha256: string;
+  actualModel: string;
+  actualReasoningEffort: string;
+  freshContext: true;
+  forkSource: null;
+  completedAt: number;
+};
+
+const CODEX_NATIVE_REVIEWER_LINEAGE_SCHEMA = "openclaw.codex_native_reviewer_lineage.v1" as const;
 
 type ChildAssistantMessages = {
   texts: Map<string, string>;
@@ -579,13 +611,14 @@ class Monitor {
       const thread = isJsonObject(params.thread) ? params.thread : undefined;
       const parentThreadId = readThreadParentThreadId(thread);
       const childThreadId = thread ? readString(thread, "id")?.trim() : undefined;
-      const agentPath = readString(readThreadSpawnSource(thread), "agent_path")?.trim();
+      const rawAgentPath = readString(readThreadSpawnSource(thread), "agent_path");
+      const agentPath = rawAgentPath?.trim();
       const state = parentThreadId ? this.parentStates.get(parentThreadId) : undefined;
       if (state && childThreadId && parentThreadId) {
         return this.registerChildThread(
           parentThreadId,
           childThreadId,
-          agentPath === undefined ? {} : { agentPath },
+          agentPath === undefined ? {} : { agentPath, taskToken: rawAgentPath },
         )
           ? state
           : undefined;
@@ -635,9 +668,18 @@ class Monitor {
               ...readObjectStringKeys(item?.agentsStates),
             ])
           : new Set(readStringArray(item?.receiverThreadIds));
+        const launchOptions = isSpawnAgentTool
+          ? {
+              requestedModel: readString(item, "model"),
+              requestedReasoningEffort:
+                readString(item, "reasoningEffort") ?? readString(item, "reasoning_effort"),
+            }
+          : {};
         let accepted = true;
         for (const childThreadId of childThreadIds) {
-          accepted = Boolean(this.registerChildThread(parentThreadId, childThreadId)) && accepted;
+          accepted =
+            Boolean(this.registerChildThread(parentThreadId, childThreadId, launchOptions)) &&
+            accepted;
         }
         if (!accepted) {
           return undefined;
@@ -857,6 +899,10 @@ class Monitor {
       this.unregisterChild(childState);
       return;
     }
+    const reviewerLineage =
+      completion.status === "succeeded"
+        ? await this.captureReviewerLineageOnce(state, childState, completion, eventAt)
+        : undefined;
     childState.terminal = true;
     this.clearRecoveryTimers(childState);
     state.mirror?.markAuthoritativeCompletion(completion.childThreadId);
@@ -868,6 +914,7 @@ class Monitor {
       ...(completion.status === "succeeded" ? {} : { error: completion.result }),
       progressSummary: completion.result,
       terminalSummary: completion.result,
+      ...(reviewerLineage ? { detail: { lineage: reviewerLineage } } : {}),
     });
     if (!state.requesterSessionKey || !state.taskRuntimeScope) {
       this.unregisterChild(childState);
@@ -880,6 +927,134 @@ class Monitor {
     });
     this.releaseClientRetentionIfIdle();
     await this.deliverPendingCompletion(state, childState);
+  }
+
+  private async captureReviewerLineageOnce(
+    state: ParentState,
+    childState: ChildState,
+    completion: CodexNativeSubagentCompletion,
+    eventAt: number,
+  ): Promise<CodexNativeReviewerLineage | undefined> {
+    if (childState.reviewerLineage) {
+      return childState.reviewerLineage;
+    }
+    if (
+      childState.launchConfigMismatch ||
+      !childState.taskToken ||
+      !childState.requestedModel ||
+      !childState.requestedReasoningEffort
+    ) {
+      return undefined;
+    }
+    childState.lineageCapture ??= this.captureReviewerLineage(
+      state,
+      childState,
+      completion,
+      eventAt,
+    ).catch((error: unknown) => {
+      embeddedAgentLog.warn("Failed to capture Codex native reviewer lineage", {
+        childThreadId: childState.childThreadId,
+        error: formatErrorMessage(error),
+      });
+      return undefined;
+    });
+    const lineage = await childState.lineageCapture;
+    if (lineage) {
+      childState.reviewerLineage = lineage;
+    }
+    return lineage;
+  }
+
+  private async captureReviewerLineage(
+    state: ParentState,
+    childState: ChildState,
+    completion: CodexNativeSubagentCompletion,
+    eventAt: number,
+  ): Promise<CodexNativeReviewerLineage | undefined> {
+    const taskToken = childState.taskToken;
+    const requestedModel = childState.requestedModel;
+    const requestedReasoningEffort = childState.requestedReasoningEffort;
+    if (!taskToken || !requestedModel || !requestedReasoningEffort) {
+      return undefined;
+    }
+    const runId = codexNativeSubagentRunId(childState.childThreadId);
+    const task = state.taskRuntime
+      ?.listTaskRecords()
+      .find(
+        (record) =>
+          record.taskId.trim() !== "" &&
+          record.runId === runId &&
+          record.taskKind === CODEX_NATIVE_SUBAGENT_TASK_KIND,
+      );
+    if (!task) {
+      return undefined;
+    }
+    const firstResponse = await this.requestThreadRead(childState.childThreadId, true);
+    const firstThread = isJsonObject(firstResponse.thread) ? firstResponse.thread : undefined;
+    if (!firstThread) {
+      return undefined;
+    }
+    const firstCapture = readReviewerThreadCapture(firstThread, childState, completion.result);
+    if (!firstCapture) {
+      return undefined;
+    }
+    const resumeResponse = await this.client.request(
+      "thread/resume",
+      { threadId: childState.childThreadId },
+      { timeoutMs: THREAD_READ_TIMEOUT_MS },
+    );
+    const resumed = isJsonObject(resumeResponse) ? resumeResponse : undefined;
+    const actualModel = readActualThreadModel(resumed);
+    const actualReasoningEffort = readActualReasoningEffort(resumed);
+    if (
+      !actualModel ||
+      !actualReasoningEffort ||
+      !modelsMatch(actualModel, requestedModel) ||
+      actualReasoningEffort !== requestedReasoningEffort
+    ) {
+      return undefined;
+    }
+    const secondResponse = await this.requestThreadRead(childState.childThreadId, true);
+    const secondThread = isJsonObject(secondResponse.thread) ? secondResponse.thread : undefined;
+    if (!secondThread) {
+      return undefined;
+    }
+    const secondCapture = readReviewerThreadCapture(secondThread, childState, completion.result);
+    if (!secondCapture || JSON.stringify(firstCapture) !== JSON.stringify(secondCapture)) {
+      return undefined;
+    }
+    const transcriptSha256 = sha256Utf8(
+      JSON.stringify([
+        CODEX_NATIVE_REVIEWER_LINEAGE_SCHEMA,
+        childState.childThreadId,
+        firstCapture.turnId,
+        firstCapture.itemIds,
+        firstCapture.acceptedTask,
+        firstCapture.terminalItemId,
+        firstCapture.terminalResult,
+      ]),
+    );
+    return {
+      schema: CODEX_NATIVE_REVIEWER_LINEAGE_SCHEMA,
+      childThreadId: childState.childThreadId,
+      parentThreadId: childState.parentThreadId,
+      taskId: task.taskId,
+      runId,
+      taskToken,
+      turnId: firstCapture.turnId,
+      itemIds: firstCapture.itemIds,
+      acceptedTask: firstCapture.acceptedTask,
+      terminalItemId: firstCapture.terminalItemId,
+      terminalResult: firstCapture.terminalResult,
+      taskSha256: sha256Utf8(firstCapture.acceptedTask),
+      terminalResultSha256: sha256Utf8(firstCapture.terminalResult),
+      transcriptSha256,
+      actualModel,
+      actualReasoningEffort,
+      freshContext: true,
+      forkSource: null,
+      completedAt: firstCapture.completedAt ?? eventAt,
+    };
   }
 
   private async deliverPendingCompletion(
@@ -981,7 +1156,12 @@ class Monitor {
   private registerChildThread(
     parentThreadIdInput: string,
     childThreadIdInput: string,
-    options: { agentPath?: string } = {},
+    options: {
+      agentPath?: string;
+      taskToken?: string;
+      requestedModel?: string;
+      requestedReasoningEffort?: string;
+    } = {},
   ): ChildState | undefined {
     const parentThreadId = parentThreadIdInput.trim();
     const childThreadId = childThreadIdInput.trim();
@@ -1024,8 +1204,48 @@ class Monitor {
     if (agentPath) {
       this.registerAgentPath(childState, agentPath);
     }
+    this.rememberLaunchConfig(childState, options);
     this.scheduleRecoveryPoll(childState);
     return childState;
+  }
+
+  private rememberLaunchConfig(
+    childState: ChildState,
+    options: {
+      agentPath?: string;
+      taskToken?: string;
+      requestedModel?: string;
+      requestedReasoningEffort?: string;
+    },
+  ): void {
+    const taskToken = options.taskToken ?? options.agentPath;
+    if (taskToken !== undefined) {
+      if (childState.taskToken !== undefined && childState.taskToken !== taskToken) {
+        childState.launchConfigMismatch = true;
+      } else {
+        childState.taskToken ??= taskToken;
+      }
+    }
+    if (options.requestedModel !== undefined) {
+      if (
+        childState.requestedModel !== undefined &&
+        childState.requestedModel !== options.requestedModel
+      ) {
+        childState.launchConfigMismatch = true;
+      } else {
+        childState.requestedModel ??= options.requestedModel;
+      }
+    }
+    if (options.requestedReasoningEffort !== undefined) {
+      if (
+        childState.requestedReasoningEffort !== undefined &&
+        childState.requestedReasoningEffort !== options.requestedReasoningEffort
+      ) {
+        childState.launchConfigMismatch = true;
+      } else {
+        childState.requestedReasoningEffort ??= options.requestedReasoningEffort;
+      }
+    }
   }
 
   private registerAgentPath(childState: ChildState, agentPath: string): void {
@@ -1431,6 +1651,158 @@ class Monitor {
 }
 
 export const codexNativeSubagentMonitorRuntime = { Monitor, register: registerMonitor };
+
+type ReviewerThreadCapture = {
+  turnId: string;
+  itemIds: string[];
+  acceptedTask: string;
+  terminalItemId: string;
+  terminalResult: string;
+  completedAt?: number;
+};
+
+function readReviewerThreadCapture(
+  thread: JsonObject,
+  childState: ChildState,
+  terminalResult: string,
+): ReviewerThreadCapture | undefined {
+  if (readString(thread, "id") !== childState.childThreadId) {
+    return undefined;
+  }
+  const spawnSource = readThreadSpawnSource(thread);
+  if (
+    !spawnSource ||
+    readString(spawnSource, "parent_thread_id") !== childState.parentThreadId ||
+    readString(spawnSource, "agent_path") !== childState.taskToken
+  ) {
+    return undefined;
+  }
+  if (readThreadForkSource(thread) !== null) {
+    return undefined;
+  }
+  const turns = Array.isArray(thread.turns) ? thread.turns.filter(isJsonObject) : [];
+  const completedTurns = turns.filter(
+    (turn) => normalizeIdentifier(readString(turn, "status")) === "completed",
+  );
+  // The receipt binds the first completed turn. A later follow-up that is
+  // already present at capture time makes this child ineligible.
+  if (completedTurns.length !== 1) {
+    return undefined;
+  }
+  const turn = completedTurns[0];
+  if (!turn) {
+    return undefined;
+  }
+  const turnId = readString(turn, "id");
+  const turnItems = turn.items;
+  if (!turnId || !Array.isArray(turnItems)) {
+    return undefined;
+  }
+  const userMessages = turnItems.filter(
+    (item): item is JsonObject => isJsonObject(item) && readString(item, "type") === "userMessage",
+  );
+  if (userMessages.length !== 1) {
+    return undefined;
+  }
+  const userMessage = userMessages[0];
+  if (!userMessage) {
+    return undefined;
+  }
+  const acceptedTask = readRawUserMessageText(userMessage);
+  if (acceptedTask === undefined) {
+    return undefined;
+  }
+  const itemIds: string[] = [];
+  let terminalItemId: string | undefined;
+  for (const item of turnItems) {
+    if (!isJsonObject(item)) {
+      return undefined;
+    }
+    const itemId = readString(item, "id");
+    if (!itemId) {
+      return undefined;
+    }
+    itemIds.push(itemId);
+    if (
+      readString(item, "type") === "agentMessage" &&
+      (normalizeIdentifier(readString(item, "phase")) === "finalanswer" ||
+        !readString(item, "phase")) &&
+      readString(item, "text") === terminalResult
+    ) {
+      terminalItemId = itemId;
+    }
+  }
+  if (!terminalItemId) {
+    return undefined;
+  }
+  const completedAtSeconds = asFiniteNumber(turn.completedAt);
+  return {
+    turnId,
+    itemIds,
+    acceptedTask,
+    terminalItemId,
+    terminalResult,
+    ...(completedAtSeconds === undefined
+      ? {}
+      : { completedAt: Math.round(completedAtSeconds * 1_000) }),
+  };
+}
+
+function readRawUserMessageText(item: JsonObject): string | undefined {
+  if (Array.isArray(item.content)) {
+    if (item.content.length !== 1 || !isJsonObject(item.content[0])) {
+      return undefined;
+    }
+    const input = item.content[0];
+    return readString(input, "type") === "text" ? readString(input, "text") : undefined;
+  }
+  const text = readString(item, "text");
+  return text === undefined ? undefined : text;
+}
+
+function readThreadForkSource(thread: JsonObject): string | null | undefined {
+  const value =
+    thread.forkedFromId ?? thread.forked_from_id ?? thread.forkSource ?? thread.fork_source;
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return typeof value === "string" ? value : undefined;
+}
+
+function readActualThreadModel(response: JsonObject | undefined): string | undefined {
+  const thread = isJsonObject(response?.thread) ? response.thread : undefined;
+  return (
+    readString(response, "model") ??
+    readString(thread, "model") ??
+    (isJsonObject(thread?.extra) ? readString(thread.extra, "model") : undefined)
+  );
+}
+
+function readActualReasoningEffort(response: JsonObject | undefined): string | undefined {
+  const thread = isJsonObject(response?.thread) ? response.thread : undefined;
+  const config = isJsonObject(thread?.extra) ? thread.extra : undefined;
+  return (
+    readString(response, "reasoningEffort") ??
+    readString(response, "reasoning_effort") ??
+    readString(thread, "reasoningEffort") ??
+    readString(thread, "reasoning_effort") ??
+    readString(config, "reasoningEffort") ??
+    readString(config, "reasoning_effort")
+  );
+}
+
+function modelsMatch(actual: string, expected: string): boolean {
+  const normalizeModel = (value: string) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/^openai\//u, "");
+  return normalizeModel(actual) === normalizeModel(expected);
+}
+
+function sha256Utf8(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 function readThreadTurnRecovery(
   thread: JsonObject,

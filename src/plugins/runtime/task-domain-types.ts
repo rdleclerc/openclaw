@@ -51,8 +51,11 @@ export type TaskRunView = {
   terminalOutcome?: TaskTerminalOutcome;
 };
 
-/** Detailed task run view; currently equal to the summary view. */
-export type TaskRunDetail = TaskRunView;
+/** Detailed task run view; private runtime metadata is available only here. */
+export type TaskRunDetail = TaskRunView & {
+  taskKind?: string;
+  detail?: JsonValue;
+};
 
 /** Result returned when cancelling a task run. */
 export type TaskRunCancelResult = {

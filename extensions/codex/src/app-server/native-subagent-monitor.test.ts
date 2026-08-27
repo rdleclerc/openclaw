@@ -13,6 +13,7 @@ import type {
 } from "./protocol.js";
 
 type CodexThreadReadResponse = CodexAppServerRequestResult<"thread/read">;
+type CodexThreadResumeResponse = CodexAppServerRequestResult<"thread/resume">;
 
 const CodexNativeSubagentMonitor = codexNativeSubagentMonitorRuntime.Monitor;
 const registerCodexNativeSubagentMonitor = codexNativeSubagentMonitorRuntime.register;
@@ -31,6 +32,7 @@ function createClient() {
     | ((params: ThreadReadParams) => CodexThreadReadResponse | Promise<CodexThreadReadResponse>)
   >();
   const threadTurns = new Map<string, JsonValue | Error>();
+  const threadResumes = new Map<string, CodexThreadResumeResponse | Error>();
   const request = vi.fn(async (method: string, params?: unknown) => {
     if (method === "thread/turns/list") {
       const childThreadId = ((params as ThreadTurnsParams | undefined) ?? {}).threadId ?? "";
@@ -40,6 +42,17 @@ function createClient() {
       }
       if (response === undefined) {
         throw new Error(`thread turns not loaded: ${childThreadId}`);
+      }
+      return response;
+    }
+    if (method === "thread/resume") {
+      const childThreadId = ((params as ThreadTurnsParams | undefined) ?? {}).threadId ?? "";
+      const response = threadResumes.get(childThreadId);
+      if (response instanceof Error) {
+        throw response;
+      }
+      if (response === undefined) {
+        throw new Error(`thread resume not loaded: ${childThreadId}`);
       }
       return response;
     }
@@ -72,6 +85,9 @@ function createClient() {
     },
     setThreadTurns(childThreadId: string, response: JsonValue | Error) {
       threadTurns.set(childThreadId, response);
+    },
+    setThreadResume(childThreadId: string, response: CodexThreadResumeResponse | Error) {
+      threadResumes.set(childThreadId, response);
     },
     addNotificationHandler(handler: NotificationHandler) {
       notificationHandlers.add(handler);
@@ -349,6 +365,104 @@ function taskRecord(params: {
   };
 }
 
+async function configureReviewerCapture(
+  client: ReturnType<typeof createClient>,
+  runtime: ReturnType<typeof createRuntime>,
+  options: {
+    actualModel?: string;
+    actualReasoningEffort?: string;
+    earlierCompletedTurn?: boolean;
+  } = {},
+) {
+  await notifyChildStarted(client, "parent-thread", "child-reviewer", "review-task");
+  await client.notify({
+    method: "item/completed",
+    params: {
+      threadId: "parent-thread",
+      item: {
+        type: "collabAgentToolCall",
+        tool: "spawnAgent",
+        senderThreadId: "parent-thread",
+        receiverThreadIds: ["child-reviewer"],
+        model: "gpt-5.6-sol",
+        reasoningEffort: "ultra",
+        agentsStates: {},
+      },
+    },
+  });
+  const acceptedTask = "Fact-check this exact packet.";
+  const terminalResult = '{"status":"pass","summary":"checked"}';
+  const thread = {
+    id: "child-reviewer",
+    parentThreadId: "parent-thread",
+    source: {
+      subAgent: {
+        thread_spawn: {
+          parent_thread_id: "parent-thread",
+          depth: 1,
+          agent_path: "review-task",
+        },
+      },
+    },
+    status: { type: "idle" },
+    turns: [
+      ...(options.earlierCompletedTurn
+        ? [
+            {
+              id: "review-turn-0",
+              status: "completed",
+              items: [
+                {
+                  id: "review-user-0",
+                  type: "userMessage",
+                  content: [{ type: "text", text: "Earlier task." }],
+                },
+                {
+                  id: "review-final-0",
+                  type: "agentMessage",
+                  phase: "finalAnswer",
+                  text: "Earlier result.",
+                },
+              ],
+              completedAt: 1_779_063_287,
+            },
+          ]
+        : []),
+      {
+        id: "review-turn-1",
+        status: "completed",
+        items: [
+          {
+            id: "review-user-1",
+            type: "userMessage",
+            content: [{ type: "text", text: acceptedTask }],
+          },
+          {
+            id: "review-final-1",
+            type: "agentMessage",
+            phase: "finalAnswer",
+            text: terminalResult,
+          },
+        ],
+        completedAt: 1_779_063_288,
+      },
+    ],
+  };
+  client.setThreadRead("child-reviewer", { thread } as never);
+  client.setThreadResume("child-reviewer", {
+    thread: { id: "child-reviewer" },
+    model: options.actualModel ?? "gpt-5.6-sol",
+    reasoningEffort: options.actualReasoningEffort ?? "ultra",
+  } as never);
+  runtime.listTaskRecords.mockReturnValue([taskRecord({ childThreadId: "child-reviewer" })]);
+  await client.notify(
+    nativeCompletionNotification({
+      agentPath: "review-task",
+      result: terminalResult,
+    }),
+  );
+}
+
 describe("CodexNativeSubagentMonitor", () => {
   it("keeps native subagent task mirroring on the shared client", async () => {
     const client = createClient();
@@ -573,6 +687,148 @@ describe("CodexNativeSubagentMonitor", () => {
     );
     expect(client.request).not.toHaveBeenCalled();
     client.close();
+  });
+
+  it("captures the exact first reviewer turn and keeps it after a later follow-up", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client as never, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+    await notifyChildStarted(client, "parent-thread", "child-reviewer", "review-task");
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          senderThreadId: "parent-thread",
+          receiverThreadIds: ["child-reviewer"],
+          model: "gpt-5.6-sol",
+          reasoningEffort: "ultra",
+          agentsStates: {},
+        },
+      },
+    });
+    const acceptedTask = "Fact-check this exact packet.";
+    const terminalResult = '{"status":"pass","summary":"checked"}';
+    const thread = {
+      id: "child-reviewer",
+      parentThreadId: "parent-thread",
+      source: {
+        subAgent: {
+          thread_spawn: {
+            parent_thread_id: "parent-thread",
+            depth: 1,
+            agent_path: "review-task",
+          },
+        },
+      },
+      status: { type: "idle" },
+      turns: [
+        {
+          id: "review-turn-1",
+          status: "completed",
+          items: [
+            {
+              id: "review-user-1",
+              type: "userMessage",
+              content: [{ type: "text", text: acceptedTask }],
+            },
+            {
+              id: "review-final-1",
+              type: "agentMessage",
+              phase: "finalAnswer",
+              text: terminalResult,
+            },
+          ],
+          completedAt: 1_779_063_288,
+        },
+      ],
+    };
+    client.setThreadRead("child-reviewer", { thread } as never);
+    client.setThreadResume("child-reviewer", {
+      thread: { id: "child-reviewer" },
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+    } as never);
+    runtime.listTaskRecords.mockReturnValue([taskRecord({ childThreadId: "child-reviewer" })]);
+
+    await client.notify(
+      nativeCompletionNotification({
+        agentPath: "review-task",
+        result: terminalResult,
+      }),
+    );
+
+    const finalize = runtime.finalizeTaskRunByRunId.mock.calls[0]?.[0];
+    expect(finalize).toEqual(
+      expect.objectContaining({
+        runId: "codex-thread:child-reviewer",
+        detail: {
+          lineage: expect.objectContaining({
+            taskToken: "review-task",
+            acceptedTask,
+            turnId: "review-turn-1",
+            terminalItemId: "review-final-1",
+            terminalResult,
+            actualModel: "gpt-5.6-sol",
+            actualReasoningEffort: "ultra",
+            freshContext: true,
+            forkSource: null,
+          }),
+        },
+      }),
+    );
+    expect(client.request).toHaveBeenCalledWith(
+      "thread/resume",
+      { threadId: "child-reviewer" },
+      { timeoutMs: 30_000 },
+    );
+
+    await client.notify({
+      method: "thread/status/changed",
+      params: { threadId: "child-reviewer", status: { type: "active" } },
+    });
+    expect(runtime.finalizeTaskRunByRunId).toHaveBeenCalledTimes(1);
+    monitor.dispose();
+  });
+
+  it.each([
+    ["wrong actual model", "gpt-5.6-luna", "ultra"],
+    ["wrong actual effort", "gpt-5.6-sol", "high"],
+  ] as const)(
+    "does not store reviewer lineage for %s",
+    async (_name, actualModel, actualReasoningEffort) => {
+      const client = createClient();
+      const runtime = createRuntime();
+      const monitor = new CodexNativeSubagentMonitor(client as never, runtime);
+      registerParent(monitor, "parent-thread", "agent:main:main");
+
+      await configureReviewerCapture(client, runtime, { actualModel, actualReasoningEffort });
+
+      const finalize = runtime.finalizeTaskRunByRunId.mock.calls[0]?.[0];
+      expect(finalize?.detail).toBeUndefined();
+      monitor.dispose();
+    },
+  );
+
+  it("does not store reviewer lineage when an earlier completed turn exists", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client as never, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, { earlierCompletedTurn: true });
+
+    const finalize = runtime.finalizeTaskRunByRunId.mock.calls[0]?.[0];
+    expect(finalize?.detail).toBeUndefined();
+    expect(client.request).not.toHaveBeenCalledWith(
+      "thread/resume",
+      expect.anything(),
+      expect.anything(),
+    );
+    monitor.dispose();
   });
 
   it("recovers missing terminal text through app-server history", async () => {
