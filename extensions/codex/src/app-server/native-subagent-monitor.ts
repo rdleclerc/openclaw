@@ -1820,15 +1820,12 @@ function readReviewerThreadCapture(
     return undefined;
   }
   const turns = Array.isArray(thread.turns) ? thread.turns.filter(isJsonObject) : [];
-  const completedTurns = turns.filter(
-    (turn) => normalizeIdentifier(readString(turn, "status")) === "completed",
-  );
-  // The receipt binds the first completed turn. A later follow-up that is
-  // already present at capture time makes this child ineligible.
-  if (completedTurns.length !== 1) {
+  // The receipt must bind the thread's sole original turn. Any earlier turn,
+  // including an interrupted turn, means this is not a fresh reviewer context.
+  if (turns.length !== 1 || normalizeIdentifier(readString(turns[0], "status")) !== "completed") {
     return undefined;
   }
-  const turn = completedTurns[0];
+  const turn = turns[0];
   if (!turn) {
     return undefined;
   }

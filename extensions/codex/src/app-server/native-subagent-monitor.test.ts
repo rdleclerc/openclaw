@@ -416,6 +416,7 @@ type ReviewerCaptureOptions = {
   reroutedModel?: string;
   requestedReasoningEffort?: string;
   earlierCompletedTurn?: boolean;
+  earlierInterruptedTurn?: boolean;
   driftOnSecondRead?: boolean;
   driftThreadPathOnSecondRead?: boolean;
   driftTranscriptOnSecondRead?: boolean;
@@ -473,6 +474,23 @@ function createReviewerHistory(options: ReviewerCaptureOptions = {}) {
                   text: "Earlier result.",
                 },
               ],
+              completedAt: 1_779_063_287,
+            },
+          ]
+        : []),
+      ...(options.earlierInterruptedTurn
+        ? [
+            {
+              id: "review-turn-0",
+              status: "interrupted",
+              items: [
+                {
+                  id: "review-user-0",
+                  type: "userMessage",
+                  content: [{ type: "text", text: "Interrupted task." }],
+                },
+              ],
+              error: { message: "turn interrupted" },
               completedAt: 1_779_063_287,
             },
           ]
@@ -1274,6 +1292,19 @@ describe("CodexNativeSubagentMonitor", () => {
       expect.anything(),
       expect.anything(),
     );
+    monitor.dispose();
+  });
+
+  it("does not store reviewer lineage when an interrupted first turn precedes the receipt turn", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+
+    await configureReviewerCapture(client, runtime, { earlierInterruptedTurn: true });
+
+    const finalize = firstFinalizedTask(runtime);
+    expect(finalize?.detail).toBeUndefined();
     monitor.dispose();
   });
 
