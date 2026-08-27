@@ -3,6 +3,7 @@
  * runtime records, with app-server history as the recovery source.
  */
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { embeddedAgentLog, formatErrorMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   createAgentHarnessTaskRuntime,
@@ -67,7 +68,10 @@ type ChildState = {
   reviewerCandidate?: boolean;
   reviewerMessageSha256?: string;
   launchConfigMismatch?: boolean;
-  modelReroutesByTurn: Map<string, ModelRerouteEvidence>;
+  modelReroutesByTurn: Map<string, ModelRerouteEvidence[]>;
+  invalidModelRerouteTurns: Set<string>;
+  observedTurnStarts: Set<string>;
+  observedTurnCompletions: Set<string>;
   reviewerLineage?: CodexNativeReviewerLineage;
   lineageCapture?: Promise<CodexNativeReviewerLineage | undefined>;
   assistantMessagesByTurn: Map<string, ChildAssistantMessages>;
@@ -96,6 +100,8 @@ export type CodexNativeReviewerLineage = {
   itemIds: string[];
   terminalItemId: string;
   taskSha256: string;
+  taskBinding: "reviewer_attested";
+  reviewMessageSha256: string;
   terminalResultSha256: string;
   transcriptSha256: string;
   actualModel: string;
@@ -146,6 +152,7 @@ type MonitorOptions = {
   completionDeliveryMaxRetries?: number;
   now?: () => number;
   retainClient?: () => (() => void) | undefined;
+  readTranscript?: (path: string) => Promise<string>;
 };
 
 const DEFAULT_RECOVERY_POLL_DELAYS_MS = [
@@ -226,6 +233,7 @@ class Monitor {
   private readonly removeNotificationHandler: () => void;
   private readonly removeCloseHandler: () => void;
   private readonly retainClient?: () => (() => void) | undefined;
+  private readonly readTranscript: (path: string) => Promise<string>;
   private releaseClientRetention?: () => void;
   private disposed = false;
 
@@ -241,6 +249,7 @@ class Monitor {
       options.completionDeliveryMaxRetries ?? this.completionDeliveryRetryDelaysMs.length;
     this.now = options.now ?? Date.now;
     this.retainClient = options.retainClient;
+    this.readTranscript = options.readTranscript ?? ((path) => readFile(path, "utf8"));
     this.removeNotificationHandler = client.addNotificationHandler(async (notification) => {
       if (!NATIVE_SUBAGENT_NOTIFICATION_METHODS.has(notification.method)) {
         return;
@@ -410,6 +419,7 @@ class Monitor {
       this.captureModelRerouteEvidence(notification, childState);
     }
     if (notification.method === "turn/started" && childState) {
+      this.observeChildTurnStarted(notification, childState);
       this.resumeChild(childState);
     }
     this.captureChildAssistantMessage(notification);
@@ -451,10 +461,28 @@ class Monitor {
     const turnId = readString(params, "turnId")?.trim();
     const fromModel = readString(params, "fromModel")?.trim();
     const toModel = readString(params, "toModel")?.trim();
-    if (!turnId || !fromModel || !toModel) {
+    if (!turnId) {
       return;
     }
-    childState.modelReroutesByTurn.set(turnId, { fromModel, toModel });
+    if (!fromModel || !toModel) {
+      childState.invalidModelRerouteTurns.add(turnId);
+      return;
+    }
+    const reroutes = childState.modelReroutesByTurn.get(turnId) ?? [];
+    reroutes.push({ fromModel, toModel });
+    childState.modelReroutesByTurn.set(turnId, reroutes);
+  }
+
+  private observeChildTurnStarted(
+    notification: CodexServerNotification,
+    childState: ChildState,
+  ): void {
+    const params = isJsonObject(notification.params) ? notification.params : undefined;
+    const turn = isJsonObject(params?.turn) ? params.turn : undefined;
+    const turnId = readString(params, "turnId")?.trim() ?? readString(turn, "id")?.trim();
+    if (turnId) {
+      childState.observedTurnStarts.add(turnId);
+    }
   }
 
   private resumeChild(childState: ChildState, options: { scheduleRecovery?: boolean } = {}): void {
@@ -538,6 +566,9 @@ class Monitor {
 
   private captureChildTurnAssistantMessages(childState: ChildState, turn: JsonObject): void {
     const turnId = readString(turn, "id");
+    if (turnId) {
+      childState.observedTurnCompletions.add(turnId);
+    }
     if (!turnId || !Array.isArray(turn.items)) {
       return;
     }
@@ -675,17 +706,17 @@ class Monitor {
       if (state && parentThreadId) {
         // Codex multi-agent V2 exposes the child only through this parent-scoped
         // activity item; its later wait item has no receiver thread ids.
-        if (
-          notification.method === "item/completed" &&
-          readString(item, "type") === "subAgentActivity"
-        ) {
+        if (readString(item, "type") === "subAgentActivity") {
+          if (normalizeIdentifier(readString(item, "kind")) !== "started") {
+            return state;
+          }
           const childThreadId = readString(item, "agentThreadId")?.trim();
           const agentPath = readString(item, "agentPath");
           if (childThreadId) {
             this.registerChildThread(
               parentThreadId,
               childThreadId,
-              agentPath === undefined ? {} : { agentPath },
+              agentPath === undefined ? {} : { agentPath, taskToken: agentPath },
             );
           }
           return state;
@@ -969,15 +1000,20 @@ class Monitor {
     if (childState.reviewerLineage) {
       return childState.reviewerLineage;
     }
+    if (childState.launchConfigMismatch || !childState.taskToken) {
+      return undefined;
+    }
+    // MultiAgent V2 exposes a SubAgentActivity item, not a CollabAgentToolCall.
+    // A typed native receipt is the cheap candidate test before reading history.
+    if (!isNativeFactCheckReceipt(completion.result)) {
+      return undefined;
+    }
     if (
-      childState.launchConfigMismatch ||
-      !childState.reviewerCandidate ||
-      !childState.taskToken ||
-      !childState.requestedModel ||
-      !childState.requestedReasoningEffort ||
-      !childState.reviewerMessageSha256 ||
-      !modelsMatch(childState.requestedModel, NATIVE_REVIEWER_MODEL) ||
-      childState.requestedReasoningEffort !== NATIVE_REVIEWER_REASONING_EFFORT
+      childState.reviewerCandidate &&
+      ((childState.requestedModel !== undefined &&
+        !modelsMatch(childState.requestedModel, NATIVE_REVIEWER_MODEL)) ||
+        (childState.requestedReasoningEffort !== undefined &&
+          childState.requestedReasoningEffort !== NATIVE_REVIEWER_REASONING_EFFORT))
     ) {
       return undefined;
     }
@@ -1007,18 +1043,7 @@ class Monitor {
     eventAt: number,
   ): Promise<CodexNativeReviewerLineage | undefined> {
     const taskToken = childState.taskToken;
-    const requestedModel = childState.requestedModel;
-    const requestedReasoningEffort = childState.requestedReasoningEffort;
-    const reviewerMessageSha256 = childState.reviewerMessageSha256;
-    if (
-      !taskToken ||
-      !requestedModel ||
-      !requestedReasoningEffort ||
-      !childState.reviewerCandidate ||
-      !reviewerMessageSha256 ||
-      !modelsMatch(requestedModel, NATIVE_REVIEWER_MODEL) ||
-      requestedReasoningEffort !== NATIVE_REVIEWER_REASONING_EFFORT
-    ) {
+    if (!taskToken) {
       return undefined;
     }
     const runId = codexNativeSubagentRunId(childState.childThreadId);
@@ -1039,22 +1064,38 @@ class Monitor {
       return undefined;
     }
     const firstCapture = readReviewerThreadCapture(firstThread, childState, completion.result);
-    if (!firstCapture || sha256Utf8(firstCapture.acceptedTask) !== reviewerMessageSha256) {
+    if (!firstCapture) {
       return undefined;
     }
-    // Codex 0.150.1 emits model/rerouted before turn/completed. A matching
-    // event is trusted execution evidence. Without one, the requested model
-    // remains valid because the protocol emitted no reroute for this turn.
-    const reroute = childState.modelReroutesByTurn.get(firstCapture.turnId);
     if (
-      reroute &&
-      (!modelsMatch(reroute.fromModel, requestedModel) ||
-        !modelsMatch(reroute.toModel, requestedModel))
+      !childState.observedTurnStarts.has(firstCapture.turnId) ||
+      !childState.observedTurnCompletions.has(firstCapture.turnId) ||
+      childState.invalidModelRerouteTurns.has(firstCapture.turnId)
     ) {
       return undefined;
     }
-    const actualModel = reroute?.toModel ?? requestedModel;
-    const actualReasoningEffort = requestedReasoningEffort;
+    if (
+      childState.reviewerMessageSha256 !== undefined &&
+      childState.reviewerMessageSha256 !== firstCapture.reviewMessageSha256
+    ) {
+      return undefined;
+    }
+    const firstTranscript = await readReviewerTranscript(
+      this.readTranscript,
+      childState,
+      firstCapture,
+    );
+    if (!firstTranscript) {
+      return undefined;
+    }
+    const reroutes = childState.modelReroutesByTurn.get(firstCapture.turnId) ?? [];
+    if (
+      reroutes.some((reroute) => !modelsMatch(reroute.toModel, NATIVE_REVIEWER_MODEL)) ||
+      (reroutes.length > 0 &&
+        !modelsMatch(reroutes[reroutes.length - 1]!.toModel, firstTranscript.actualModel))
+    ) {
+      return undefined;
+    }
     const secondResponse = await this.requestThreadRead(childState.childThreadId, true);
     const secondThread = isJsonObject(secondResponse.thread) ? secondResponse.thread : undefined;
     if (!secondThread) {
@@ -1062,6 +1103,19 @@ class Monitor {
     }
     const secondCapture = readReviewerThreadCapture(secondThread, childState, completion.result);
     if (!secondCapture || JSON.stringify(firstCapture) !== JSON.stringify(secondCapture)) {
+      return undefined;
+    }
+    const secondTranscript = await readReviewerTranscript(
+      this.readTranscript,
+      childState,
+      secondCapture,
+    );
+    if (
+      !secondTranscript ||
+      firstTranscript.rawSha256 !== secondTranscript.rawSha256 ||
+      firstTranscript.actualModel !== secondTranscript.actualModel ||
+      firstTranscript.actualReasoningEffort !== secondTranscript.actualReasoningEffort
+    ) {
       return undefined;
     }
     const transcriptSha256 = sha256Utf8(
@@ -1086,10 +1140,12 @@ class Monitor {
       itemIds: firstCapture.itemIds,
       terminalItemId: firstCapture.terminalItemId,
       taskSha256: sha256Utf8(firstCapture.acceptedTask),
+      taskBinding: "reviewer_attested",
+      reviewMessageSha256: firstCapture.reviewMessageSha256,
       terminalResultSha256: sha256Utf8(firstCapture.terminalResult),
       transcriptSha256,
-      actualModel,
-      actualReasoningEffort,
+      actualModel: firstTranscript.actualModel,
+      actualReasoningEffort: firstTranscript.actualReasoningEffort,
       freshContext: true,
       forkSource: null,
       completedAt: firstCapture.completedAt ?? eventAt,
@@ -1224,7 +1280,10 @@ class Monitor {
         childThreadId,
         parentThreadId,
         agentPathKeys: new Set<string>(),
-        modelReroutesByTurn: new Map<string, ModelRerouteEvidence>(),
+        modelReroutesByTurn: new Map<string, ModelRerouteEvidence[]>(),
+        invalidModelRerouteTurns: new Set<string>(),
+        observedTurnStarts: new Set<string>(),
+        observedTurnCompletions: new Set<string>(),
         assistantMessagesByTurn: new Map<string, ChildAssistantMessages>(),
         recoveryAttempt: 0,
         terminal: false,
@@ -1714,9 +1773,18 @@ type ReviewerThreadCapture = {
   turnId: string;
   itemIds: string[];
   acceptedTask: string;
+  taskBinding: "reviewer_attested";
+  reviewMessageSha256: string;
   terminalItemId: string;
   terminalResult: string;
+  threadPath: string;
   completedAt?: number;
+};
+
+type ReviewerTranscriptEvidence = {
+  rawSha256: string;
+  actualModel: string;
+  actualReasoningEffort: string;
 };
 
 function readReviewerThreadCapture(
@@ -1725,7 +1793,8 @@ function readReviewerThreadCapture(
   terminalResult: string,
 ): ReviewerThreadCapture | undefined {
   const canonicalTerminalResult = canonicalizeReviewerReceipt(terminalResult);
-  if (canonicalTerminalResult === undefined) {
+  const reviewerReceipt = parseNativeFactCheckReceipt(terminalResult);
+  if (canonicalTerminalResult === undefined || !reviewerReceipt) {
     return undefined;
   }
   if (readString(thread, "id") !== childState.childThreadId) {
@@ -1740,6 +1809,10 @@ function readReviewerThreadCapture(
     return undefined;
   }
   if (readThreadForkSource(thread) !== null) {
+    return undefined;
+  }
+  const threadPath = readString(thread, "path")?.trim();
+  if (!threadPath) {
     return undefined;
   }
   const turns = Array.isArray(thread.turns) ? thread.turns.filter(isJsonObject) : [];
@@ -1771,7 +1844,13 @@ function readReviewerThreadCapture(
     return undefined;
   }
   const acceptedTask = readRawUserMessageText(userMessage);
-  if (acceptedTask === undefined) {
+  if (acceptedTask === undefined || !isNativeReviewerMessage(acceptedTask)) {
+    return undefined;
+  }
+  if (
+    reviewerReceipt.taskBinding !== "reviewer_attested" ||
+    reviewerReceipt.reviewMessageSha256 !== sha256Utf8(acceptedTask)
+  ) {
     return undefined;
   }
   const itemIds: string[] = [];
@@ -1789,7 +1868,7 @@ function readReviewerThreadCapture(
       readString(item, "type") === "agentMessage" &&
       (normalizeIdentifier(readString(item, "phase")) === "finalanswer" ||
         !readString(item, "phase")) &&
-      readString(item, "text") === terminalResult
+      canonicalizeReviewerReceipt(readString(item, "text") ?? "") === canonicalTerminalResult
     ) {
       terminalItemId = itemId;
     }
@@ -1802,11 +1881,201 @@ function readReviewerThreadCapture(
     turnId,
     itemIds,
     acceptedTask,
+    taskBinding: reviewerReceipt.taskBinding,
+    reviewMessageSha256: reviewerReceipt.reviewMessageSha256,
     terminalItemId,
     terminalResult: canonicalTerminalResult,
+    threadPath,
     ...(completedAtSeconds === undefined
       ? {}
       : { completedAt: Math.round(completedAtSeconds * 1_000) }),
+  };
+}
+
+function parseNativeFactCheckReceipt(value: string):
+  | {
+      taskBinding: "reviewer_attested";
+      reviewMessageSha256: string;
+    }
+  | undefined {
+  let parsed: JsonValue;
+  try {
+    parsed = JSON.parse(value) as JsonValue;
+  } catch {
+    return undefined;
+  }
+  if (!isJsonObject(parsed)) {
+    return undefined;
+  }
+  const requiredStringKeys = [
+    "status",
+    "reviewer_context_id",
+    "reviewer_model",
+    "reasoning_effort",
+    "completed_at",
+    "summary",
+  ];
+  if (
+    requiredStringKeys.some((key) => !readString(parsed, key)?.trim()) ||
+    parsed.fresh_context !== true ||
+    !isJsonObject(parsed.bindings) ||
+    !Array.isArray(parsed.checked_claim_ids) ||
+    parsed.checked_claim_ids.some((claimId) => typeof claimId !== "string") ||
+    !Array.isArray(parsed.findings)
+  ) {
+    return undefined;
+  }
+  const taskBinding = readString(parsed, "taskBinding") ?? readString(parsed, "task_binding");
+  const camelReviewMessageSha256 = readString(parsed, "reviewMessageSha256")?.trim().toLowerCase();
+  const snakeReviewMessageSha256 = readString(parsed, "review_message_sha256")
+    ?.trim()
+    .toLowerCase();
+  const reviewMessageSha256 = camelReviewMessageSha256 ?? snakeReviewMessageSha256;
+  if (
+    taskBinding !== "reviewer_attested" ||
+    !reviewMessageSha256 ||
+    !/^[0-9a-f]{64}$/u.test(reviewMessageSha256)
+  ) {
+    return undefined;
+  }
+  if (
+    readString(parsed, "taskBinding") &&
+    readString(parsed, "task_binding") &&
+    readString(parsed, "taskBinding") !== readString(parsed, "task_binding")
+  ) {
+    return undefined;
+  }
+  if (
+    camelReviewMessageSha256 &&
+    snakeReviewMessageSha256 &&
+    camelReviewMessageSha256 !== snakeReviewMessageSha256
+  ) {
+    return undefined;
+  }
+  return { taskBinding, reviewMessageSha256 };
+}
+
+function isNativeFactCheckReceipt(value: string): boolean {
+  return parseNativeFactCheckReceipt(value) !== undefined;
+}
+
+async function readReviewerTranscript(
+  readTranscript: (path: string) => Promise<string>,
+  childState: ChildState,
+  capture: ReviewerThreadCapture,
+): Promise<ReviewerTranscriptEvidence | undefined> {
+  const transcriptPath = capture.threadPath;
+  let raw: string;
+  try {
+    raw = await readTranscript(transcriptPath);
+  } catch {
+    return undefined;
+  }
+  const records: JsonObject[] = [];
+  for (const line of raw.split(/\r?\n/u)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(line) as JsonValue;
+      if (!isJsonObject(record)) {
+        return undefined;
+      }
+      records.push(record);
+    } catch {
+      return undefined;
+    }
+  }
+  const sessionMeta = records.filter((record) => readString(record, "type") === "session_meta");
+  if (sessionMeta.length !== 1) {
+    return undefined;
+  }
+  const sessionPayload = sessionMeta[0]?.payload;
+  if (!isJsonObject(sessionPayload)) {
+    return undefined;
+  }
+  if (
+    readString(sessionPayload, "id") !== childState.childThreadId ||
+    readString(sessionPayload, "parent_thread_id") !== childState.parentThreadId ||
+    readString(sessionPayload, "agent_path") !== childState.taskToken
+  ) {
+    return undefined;
+  }
+  const source = isJsonObject(sessionPayload.source) ? sessionPayload.source : undefined;
+  const subagent = isJsonObject(source?.subagent)
+    ? source.subagent
+    : isJsonObject(source?.subAgent)
+      ? source.subAgent
+      : undefined;
+  const spawnSource = isJsonObject(subagent?.thread_spawn)
+    ? subagent.thread_spawn
+    : isJsonObject(subagent?.threadSpawn)
+      ? subagent.threadSpawn
+      : undefined;
+  if (
+    !spawnSource ||
+    readString(spawnSource, "parent_thread_id") !== childState.parentThreadId ||
+    readString(spawnSource, "agent_path") !== childState.taskToken
+  ) {
+    return undefined;
+  }
+  const contexts = records.filter((record) => {
+    if (readString(record, "type") !== "turn_context") {
+      return false;
+    }
+    const payload = isJsonObject(record.payload) ? record.payload : undefined;
+    return readString(payload, "turn_id") === capture.turnId;
+  });
+  if (contexts.length === 0) {
+    return undefined;
+  }
+  let actualModel: string | undefined;
+  let actualReasoningEffort: string | undefined;
+  for (const context of contexts) {
+    const payload = isJsonObject(context.payload) ? context.payload : undefined;
+    const model = readString(payload, "model")?.trim();
+    const effort = readString(payload, "effort")?.trim();
+    if (
+      !model ||
+      !effort ||
+      !modelsMatch(model, NATIVE_REVIEWER_MODEL) ||
+      effort !== NATIVE_REVIEWER_REASONING_EFFORT
+    ) {
+      return undefined;
+    }
+    actualModel ??= model;
+    actualReasoningEffort ??= effort;
+    if (actualModel !== model || actualReasoningEffort !== effort) {
+      return undefined;
+    }
+  }
+  const completions = records.filter((record) => {
+    if (readString(record, "type") !== "event_msg") {
+      return false;
+    }
+    const payload = isJsonObject(record.payload) ? record.payload : undefined;
+    return (
+      readString(payload, "type") === "task_complete" &&
+      readString(payload, "turn_id") === capture.turnId
+    );
+  });
+  if (completions.length !== 1) {
+    return undefined;
+  }
+  const lastAgentMessage = readString(
+    isJsonObject(completions[0]?.payload) ? completions[0]!.payload : undefined,
+    "last_agent_message",
+  );
+  if (
+    !lastAgentMessage ||
+    canonicalizeReviewerReceipt(lastAgentMessage) !== capture.terminalResult
+  ) {
+    return undefined;
+  }
+  return {
+    rawSha256: sha256Utf8(raw),
+    actualModel: actualModel!,
+    actualReasoningEffort: actualReasoningEffort!,
   };
 }
 

@@ -334,6 +334,8 @@ export type CodexThread = {
   forkedFromId?: string | null;
   projectId?: string | null;
   cwd?: string | null;
+  /** Exact persisted rollout transcript path returned by thread/read. */
+  path?: string | null;
   source?: CodexSessionSource | null;
   threadSource?: string | null;
   agentNickname?: string | null;
