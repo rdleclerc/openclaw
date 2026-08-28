@@ -67,6 +67,7 @@ type ChildState = {
   requestedReasoningEffort?: string;
   reviewerCandidate?: boolean;
   reviewerMessageSha256?: string;
+  v2Origin?: boolean;
   launchConfigMismatch?: boolean;
   modelReroutesByTurn: Map<string, ModelRerouteEvidence[]>;
   invalidModelRerouteTurns: Set<string>;
@@ -714,11 +715,10 @@ class Monitor {
           const childThreadId = readString(item, "agentThreadId")?.trim();
           const agentPath = readString(item, "agentPath");
           if (childThreadId) {
-            this.registerChildThread(
-              parentThreadId,
-              childThreadId,
-              agentPath === undefined ? {} : { agentPath, taskToken: agentPath },
-            );
+            this.registerChildThread(parentThreadId, childThreadId, {
+              v2Origin: true,
+              ...(agentPath === undefined ? {} : { agentPath, taskToken: agentPath }),
+            });
           }
           return state;
         }
@@ -1002,15 +1002,22 @@ class Monitor {
     completion: CodexNativeSubagentCompletion,
     eventAt: number,
   ): Promise<CodexNativeReviewerLineage | undefined> {
+    const capturedReviewerMessageSha256 = childState.reviewerMessageSha256;
+    if (
+      childState.v2Origin ||
+      childState.launchConfigMismatch ||
+      !childState.taskToken ||
+      capturedReviewerMessageSha256 === undefined
+    ) {
+      return undefined;
+    }
     if (childState.reviewerLineage) {
       return childState.reviewerLineage;
     }
-    if (childState.launchConfigMismatch || !childState.taskToken) {
-      return undefined;
-    }
     // MultiAgent V2 exposes a SubAgentActivity item, not a CollabAgentToolCall.
     // A typed native receipt is the cheap candidate test before reading history.
-    if (!isNativeFactCheckReceipt(completion.result)) {
+    const reviewerReceipt = parseNativeFactCheckReceipt(completion.result);
+    if (!reviewerReceipt || capturedReviewerMessageSha256 !== reviewerReceipt.reviewMessageSha256) {
       return undefined;
     }
     if (
@@ -1026,6 +1033,7 @@ class Monitor {
       state,
       childState,
       completion,
+      capturedReviewerMessageSha256,
       eventAt,
     ).catch((error: unknown) => {
       embeddedAgentLog.warn("Failed to capture Codex native reviewer lineage", {
@@ -1035,6 +1043,13 @@ class Monitor {
       return undefined;
     });
     const lineage = await childState.lineageCapture;
+    if (
+      childState.v2Origin ||
+      childState.launchConfigMismatch ||
+      childState.reviewerMessageSha256 !== capturedReviewerMessageSha256
+    ) {
+      return undefined;
+    }
     if (lineage) {
       childState.reviewerLineage = lineage;
     }
@@ -1045,6 +1060,7 @@ class Monitor {
     state: ParentState,
     childState: ChildState,
     completion: CodexNativeSubagentCompletion,
+    reviewerMessageSha256: string,
     eventAt: number,
   ): Promise<CodexNativeReviewerLineage | undefined> {
     const taskToken = childState.taskToken;
@@ -1144,9 +1160,9 @@ class Monitor {
       turnId: firstCapture.turnId,
       itemIds: firstCapture.itemIds,
       terminalItemId: firstCapture.terminalItemId,
-      taskSha256: firstCapture.reviewMessageSha256,
+      taskSha256: reviewerMessageSha256,
       taskBinding: "reviewer_attested",
-      reviewMessageSha256: firstCapture.reviewMessageSha256,
+      reviewMessageSha256: reviewerMessageSha256,
       terminalResultSha256: sha256Utf8(firstCapture.terminalResult),
       transcriptSha256,
       actualModel: firstTranscript.actualModel,
@@ -1263,6 +1279,7 @@ class Monitor {
       requestedReasoningEffort?: string;
       reviewerCandidate?: boolean;
       reviewerMessage?: string;
+      v2Origin?: boolean;
     } = {},
   ): ChildState | undefined {
     const parentThreadId = parentThreadIdInput.trim();
@@ -1306,6 +1323,9 @@ class Monitor {
     this.parentStates
       .get(parentThreadId)
       ?.mirror?.markAuthoritativeCompletionExpected(childThreadId);
+    if (options.v2Origin) {
+      childState.v2Origin = true;
+    }
     const agentPath = normalizeOptionalString(options.agentPath);
     if (agentPath) {
       this.registerAgentPath(childState, agentPath);

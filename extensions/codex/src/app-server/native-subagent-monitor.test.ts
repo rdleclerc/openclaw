@@ -422,6 +422,8 @@ type ReviewerCaptureOptions = {
   driftTranscriptOnSecondRead?: boolean;
   terminalResult?: string;
   v2?: boolean;
+  v2ThenV1Spawn?: boolean;
+  conflictingLaunchEvidenceOnFinalTranscriptRead?: boolean;
   missingObservedTurnStart?: boolean;
   omitThreadPath?: boolean;
   sessionMeta?: {
@@ -548,6 +550,8 @@ async function configureReviewerCapture(
     });
   } else {
     await notifyChildStarted(client, "parent-thread", "child-reviewer", "review-task");
+  }
+  if (!options.v2 || options.v2ThenV1Spawn) {
     await client.notify({
       method: "item/completed",
       params: {
@@ -566,7 +570,36 @@ async function configureReviewerCapture(
     });
   }
   client.setTranscript(history.transcriptPath, history.transcript);
-  if (options.driftTranscriptOnSecondRead) {
+  if (options.conflictingLaunchEvidenceOnFinalTranscriptRead) {
+    client.setTranscriptFactory(
+      history.transcriptPath,
+      (() => {
+        let readCount = 0;
+        return async () => {
+          readCount += 1;
+          if (readCount === 2) {
+            await client.notify({
+              method: "item/completed",
+              params: {
+                threadId: "parent-thread",
+                item: {
+                  type: "collabAgentToolCall",
+                  tool: "spawnAgent",
+                  senderThreadId: "parent-thread",
+                  receiverThreadIds: ["child-reviewer"],
+                  model: "gpt-5.6-sol",
+                  reasoningEffort: "ultra",
+                  prompt: "GAIA_NATIVE_REVIEWER_MESSAGE_V1\nConflicting launch evidence.",
+                  agentsStates: {},
+                },
+              },
+            });
+          }
+          return history.transcript;
+        };
+      })(),
+    );
+  } else if (options.driftTranscriptOnSecondRead) {
     client.setTranscriptFactory(
       history.transcriptPath,
       (() => {
@@ -821,7 +854,35 @@ describe("CodexNativeSubagentMonitor", () => {
     monitor.dispose();
   });
 
-  it("captures reviewer lineage from V2 activity without a spawn-task userMessage", async () => {
+  it("does not capture reviewer lineage after V2 activity followed by a V1 spawn event", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+    await configureReviewerCapture(client, runtime, { v2: true, v2ThenV1Spawn: true });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.request).not.toHaveBeenCalled();
+    expect(client.readTranscript).not.toHaveBeenCalled();
+    monitor.dispose();
+  });
+
+  it("does not cache reviewer lineage when launch evidence changes during the final transcript read", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = createReviewerMonitor(client, runtime);
+    registerParent(monitor, "parent-thread", "agent:main:main");
+    await configureReviewerCapture(client, runtime, {
+      conflictingLaunchEvidenceOnFinalTranscriptRead: true,
+    });
+
+    expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
+    expect(client.request).toHaveBeenCalledTimes(2);
+    expect(client.readTranscript).toHaveBeenCalledTimes(2);
+    monitor.dispose();
+  });
+
+  it("does not capture reviewer lineage from V2 activity without a spawn-task userMessage", async () => {
     const client = createClient();
     const runtime = createRuntime();
     const monitor = createReviewerMonitor(client, runtime);
@@ -830,17 +891,9 @@ describe("CodexNativeSubagentMonitor", () => {
     await configureReviewerCapture(client, runtime, { v2: true });
 
     const finalize = firstFinalizedTask(runtime);
-    expect(finalize?.detail?.lineage).toEqual(
-      expect.objectContaining({
-        taskBinding: "reviewer_attested",
-        actualModel: "gpt-5.6-sol",
-        actualReasoningEffort: "ultra",
-        freshContext: true,
-        forkSource: null,
-      }),
-    );
-    expect(client.readTranscript).toHaveBeenCalledTimes(2);
-    expect(client.readTranscript).toHaveBeenCalledWith("/tmp/codex-reviewer.jsonl");
+    expect(finalize?.detail).toBeUndefined();
+    expect(client.request).not.toHaveBeenCalled();
+    expect(client.readTranscript).not.toHaveBeenCalled();
     monitor.dispose();
   });
 
@@ -855,7 +908,7 @@ describe("CodexNativeSubagentMonitor", () => {
       const monitor = createReviewerMonitor(client, runtime);
       registerParent(monitor, "parent-thread", "agent:main:main");
 
-      await configureReviewerCapture(client, runtime, { ...options, v2: true });
+      await configureReviewerCapture(client, runtime, options);
 
       const finalize = firstFinalizedTask(runtime);
       expect(finalize).toEqual(
@@ -1143,7 +1196,7 @@ describe("CodexNativeSubagentMonitor", () => {
     const monitor = createReviewerMonitor(client, runtime);
     registerParent(monitor, "parent-thread", "agent:main:main");
 
-    await configureReviewerCapture(client, runtime, { ...options, v2: true });
+    await configureReviewerCapture(client, runtime, options);
 
     expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
     expect(client.readTranscript).toHaveBeenCalledTimes(1);
@@ -1161,7 +1214,7 @@ describe("CodexNativeSubagentMonitor", () => {
       const monitor = createReviewerMonitor(client, runtime);
       registerParent(monitor, "parent-thread", "agent:main:main");
 
-      await configureReviewerCapture(client, runtime, { ...options, v2: true });
+      await configureReviewerCapture(client, runtime, options);
 
       expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
       expect(client.request).toHaveBeenCalledTimes(expectedRequests);
@@ -1182,7 +1235,7 @@ describe("CodexNativeSubagentMonitor", () => {
     const monitor = createReviewerMonitor(client, runtime);
     registerParent(monitor, "parent-thread", "agent:main:main");
 
-    await configureReviewerCapture(client, runtime, { ...options, v2: true });
+    await configureReviewerCapture(client, runtime, options);
 
     expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
     expect(client.request).toHaveBeenCalledTimes(1);
@@ -1198,7 +1251,6 @@ describe("CodexNativeSubagentMonitor", () => {
 
     await configureReviewerCapture(client, runtime, {
       missingObservedTurnStart: true,
-      v2: true,
     });
 
     expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
@@ -1245,7 +1297,6 @@ describe("CodexNativeSubagentMonitor", () => {
 
     await configureReviewerCapture(client, runtime, {
       driftTranscriptOnSecondRead: true,
-      v2: true,
     });
 
     expect(firstFinalizedTask(runtime)?.detail).toBeUndefined();
