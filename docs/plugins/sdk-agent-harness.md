@@ -275,7 +275,17 @@ without delaying interactive replies. Use `awaitAgentEndSideEffects(...)` for
 local, non-interactive runs where the attempt must not resolve until those
 side effects finish. Both helpers accept the same `{ event, ctx }` payload as
 `runAgentHarnessAgentEndHook(...)`; their failures do not alter the completed
-attempt result.
+attempt result when the side effect is best effort.
+
+For typed Gmail attempts, pass the result of
+`buildGmailAgentEndSideEffectOptions(params.externalContentSource)` to
+`awaitAgentEndSideEffects(...)`. Gmail finalization is required and must be awaited even when an interactive target has a message channel or provider. The
+host-owned message ID is required. A missing handler, message ID, timeout, or
+handler failure raises `AgentEndTerminalFinalizationError`, so the attempt does
+not report durable completion before the Gmail outcome settles. Other agent-end side effects remain best effort: channel-backed non-Gmail attempts
+may use fire-and-forget `runAgentEndSideEffects(...)`, and local non-channel
+attempts may await them. Undefined, empty, or whitespace-only host message IDs
+are rejected for required Gmail finalization.
 
 ### User input and tool surfaces
 

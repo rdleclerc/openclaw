@@ -4,6 +4,7 @@ import {
   runAgentCleanupStep,
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
+  toAgentEndTerminalFinalizationError,
   type EmbeddedRunAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
@@ -17,6 +18,10 @@ import {
 } from "./attempt-results.js";
 import { isCodexContextRestartSelectionChangedError } from "./attempt-startup.js";
 import type { CodexTurnStartResponse } from "./protocol.js";
+import {
+  runCodexRequiredCleanupStep,
+  type CodexRequiredCleanupFailure,
+} from "./run-attempt-cleanup.js";
 import { emitCodexAppServerEvent, runCodexAgentEndHook } from "./run-attempt-lifecycle.js";
 import type { CodexAttemptNotificationController } from "./run-attempt-notification-controller.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
@@ -224,32 +229,77 @@ export async function startCodexAttemptTurn(
         ...historyState.messages,
         buildCodexUserPromptMessage({ ...runtimeParams, prompt: turnState.codexTurnPromptText }),
       ];
-      const agentEndFinalizationPromise = runCodexAgentEndHook(params, {
-        event: {
-          messages: messagesSnapshot,
-          success: false,
-          error: message,
-          durationMs: Date.now() - attemptStartedAt,
-        },
-        ctx: hookContext,
-        hookRunner,
-      });
       let agentEndFinalizationError: unknown;
+      let agentEndFinalizationFailed = false;
       try {
-        await agentEndFinalizationPromise;
+        await runCodexAgentEndHook(params, {
+          event: {
+            messages: messagesSnapshot,
+            success: false,
+            error: message,
+            durationMs: Date.now() - attemptStartedAt,
+          },
+          ctx: hookContext,
+          hookRunner,
+        });
       } catch (error) {
+        agentEndFinalizationFailed = true;
         agentEndFinalizationError = error;
       }
+      let firstRequiredCleanupFailure: CodexRequiredCleanupFailure | undefined;
+      const runRequiredCleanupStep = async (
+        step: string,
+        cleanup: () => Promise<void>,
+      ): Promise<void> => {
+        const failure = await runCodexRequiredCleanupStep({
+          runId: params.runId,
+          sessionId: params.sessionId,
+          step,
+          log: embeddedAgentLog,
+          cleanup,
+        });
+        if (failure !== undefined && firstRequiredCleanupFailure === undefined) {
+          firstRequiredCleanupFailure = failure;
+        }
+      };
       if (!state.timedOut) {
-        await unsubscribeCodexThreadBestEffort(resourceState.client, {
-          threadId: resourceState.thread.threadId,
-          timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
+        await runAgentCleanupStep({
+          runId: params.runId,
+          sessionId: params.sessionId,
+          step: "codex-thread-unsubscribe-startup-failure",
+          log: embeddedAgentLog,
+          cleanup: async () => {
+            await unsubscribeCodexThreadBestEffort(resourceState.client, {
+              threadId: resourceState.thread.threadId,
+              timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
+            });
+          },
         });
       }
-      releaseCurrentRoute();
-      activateNativePreToolUseFailureFallback();
-      resourceState.nativeHookRelay?.unregister();
-      await releaseSandboxExecEnvironment();
+      await runRequiredCleanupStep("codex-route-release-startup-failure", async () =>
+        releaseCurrentRoute(),
+      );
+      await runAgentCleanupStep({
+        runId: params.runId,
+        sessionId: params.sessionId,
+        step: "codex-native-pre-tool-use-fallback-startup-failure",
+        log: embeddedAgentLog,
+        cleanup: async () => activateNativePreToolUseFailureFallback(),
+      });
+      await runAgentCleanupStep({
+        runId: params.runId,
+        sessionId: params.sessionId,
+        step: "codex-native-hook-relay-unregister-startup-failure",
+        log: embeddedAgentLog,
+        cleanup: async () => resourceState.nativeHookRelay?.unregister(),
+      });
+      await runRequiredCleanupStep(
+        "codex-sandbox-release-startup-failure",
+        releaseSandboxExecEnvironment,
+      );
+      await runRequiredCleanupStep("codex-scoped-mcp-dispose-startup-failure", async () => {
+        await prompt.context.attemptTools.scopedMcpTools?.dispose();
+      });
       await runAgentCleanupStep({
         runId: params.runId,
         sessionId: params.sessionId,
@@ -257,10 +307,22 @@ export async function startCodexAttemptTurn(
         log: embeddedAgentLog,
         cleanup: async () => trajectoryRecorder?.flush(),
       });
-      params.abortSignal?.removeEventListener("abort", abortFromUpstream);
-      await releaseSharedClientLeaseAndRetireOneShotClient();
-      if (agentEndFinalizationError !== undefined) {
+      await runAgentCleanupStep({
+        runId: params.runId,
+        sessionId: params.sessionId,
+        step: "codex-abort-listener-remove-startup-failure",
+        log: embeddedAgentLog,
+        cleanup: async () => params.abortSignal?.removeEventListener("abort", abortFromUpstream),
+      });
+      await runRequiredCleanupStep(
+        "codex-shared-client-release-startup-failure",
+        releaseSharedClientLeaseAndRetireOneShotClient,
+      );
+      if (agentEndFinalizationFailed) {
         throw agentEndFinalizationError;
+      }
+      if (firstRequiredCleanupFailure !== undefined) {
+        throw toAgentEndTerminalFinalizationError(firstRequiredCleanupFailure.error);
       }
       if (usageLimitError) {
         await markCodexAuthProfileBlockedFromRateLimits({
@@ -268,6 +330,9 @@ export async function startCodexAttemptTurn(
           authProfileId: startupAuthProfileId,
           rateLimits: usageLimitError.rateLimitsForProfile,
         });
+        if (params.externalContentSource === "gmail") {
+          throw toAgentEndTerminalFinalizationError(turnStartError);
+        }
         return {
           result: buildCodexTurnStartFailureResult({
             params,
@@ -279,6 +344,9 @@ export async function startCodexAttemptTurn(
         };
       }
       if (isCodexContextRestartSelectionChangedError(turnStartError)) {
+        if (params.externalContentSource === "gmail") {
+          throw toAgentEndTerminalFinalizationError(turnStartError);
+        }
         return {
           result: {
             ...buildCodexTurnStartFailureResult({
@@ -295,6 +363,9 @@ export async function startCodexAttemptTurn(
             },
           },
         };
+      }
+      if (params.externalContentSource === "gmail") {
+        throw toAgentEndTerminalFinalizationError(turnStartError);
       }
       throw turnStartError;
     }

@@ -15,6 +15,13 @@ import { AgentEndTerminalFinalizationError } from "./terminal-finalization-error
 
 const log = createSubsystemLogger("agents/harness");
 
+function hasHostMessageIdentity(value: unknown): value is string | number {
+  return (
+    (typeof value === "string" && value.trim().length > 0) ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
 type BaseAgentEndSideEffectsParams = Parameters<typeof runAgentHarnessAgentEndHook>[0];
 type AgentEndSideEffectsParams = Omit<BaseAgentEndSideEffectsParams, "ctx"> & {
   /** Fail closed when the typed terminal source has no host-owned message id. */
@@ -94,7 +101,7 @@ export function runAgentEndSideEffects(params: AgentEndSideEffectsParams): void 
 
 /** Runs agent-end side effects and waits for plugin/core completion. */
 export async function awaitAgentEndSideEffects(params: AgentEndSideEffectsParams): Promise<void> {
-  if (params.requireMessageId && params.ctx.messageId === undefined) {
+  if (params.requireMessageId && !hasHostMessageIdentity(params.ctx.messageId)) {
     throw new AgentEndTerminalFinalizationError(
       "required agent_end handler missing host-owned message identity",
     );

@@ -1,7 +1,9 @@
 // Codex tests cover run attempt.usage limits plugin behavior.
 import path from "node:path";
 import { saveAuthProfileStore } from "openclaw/plugin-sdk/agent-runtime";
-import { describe, expect, it } from "vitest";
+import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
+import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { describe, expect, it, vi } from "vitest";
 import { readCodexRateLimitsRevision, rememberCodexRateLimitsRead } from "./rate-limit-cache.js";
 import {
   createParams,
@@ -215,8 +217,20 @@ describe("runCodexAppServerAttempt usage limits", () => {
       }
       return undefined;
     });
+    const agentEnd = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
 
     const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-streamed-usage-limit-message";
     params.agentDir = path.join(tempDir, "streamed-usage-limit-agent");
     params.authProfileId = authProfileId;
     params.authProfileStore = {
@@ -250,12 +264,12 @@ describe("runCodexAppServerAttempt usage limits", () => {
       },
     });
 
-    const result = await run;
-
-    const promptError = expectUsageLimitPromptError(result.promptError);
-    expect(promptError.message).toContain("You've reached your Codex subscription usage limit.");
-    expect(promptError.message).toContain("Next reset in");
-    expect(promptError.message).not.toContain("Codex did not return a reset time");
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: expect.stringContaining("You've reached your Codex subscription usage limit."),
+    });
+    expect(agentEnd).toHaveBeenCalledTimes(1);
     expect(params.authProfileStore.usageStats?.[authProfileId]?.blockedUntil).toBe(resetsAt * 1000);
     expect(harness.requests.some((request) => request.method === "account/rateLimits/read")).toBe(
       true,

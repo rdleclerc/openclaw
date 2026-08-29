@@ -52,6 +52,8 @@ export async function activateCodexAttemptTurn(
   const { emitExecutionPhaseOnce, emitLifecycleStart, maybeAnnounceFastModeAutoOff } = lifecycle;
   const { enqueueNotification } = notifications;
   const activeTurnId = turn.turn.id;
+  let activationFailed = false;
+  let activationError: unknown;
   const streamState = { eventEmitted: false, needsTerminalSnapshot: false };
   emitExecutionPhaseOnce("turn_accepted", { phase: "turn_accepted" });
   userInputBridgeRef.current = createCodexUserInputBridge({
@@ -112,13 +114,21 @@ export async function activateCodexAttemptTurn(
     try {
       await resourceState.turnRoute.bindTurn(activeTurnId);
     } catch (error) {
-      if (!state.terminalTurnNotificationQueued) {
-        throw error;
+      let bindFailure = true;
+      if (state.terminalTurnNotificationQueued) {
+        try {
+          await resourceState.turnRoute.drain();
+          bindFailure = !state.completed;
+        } catch (drainError) {
+          activationError = drainError;
+        }
       }
-      await resourceState.turnRoute.drain();
-      if (!state.completed) {
+      if (bindFailure || activationError !== undefined) {
+        activationFailed = true;
+        activationError ??= error;
         turnWatches.clearAllTimers();
-        throw error;
+        state.completed = true;
+        state.resolveCompletion?.();
       }
     }
   }
@@ -211,6 +221,8 @@ export async function activateCodexAttemptTurn(
     activeTurnId,
     activeProjector,
     streamState,
+    activationFailed,
+    activationError,
     handle,
     freezeRunTerminalOutcome,
     notifyUserMessagePersisted,

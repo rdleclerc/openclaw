@@ -6,6 +6,7 @@ import {
   resolveActiveEmbeddedRunSessionId,
   type AgentEventPayload,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import * as agentHarnessRuntime from "openclaw/plugin-sdk/agent-harness-runtime";
 import { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import {
   onInternalDiagnosticEvent,
@@ -38,6 +39,7 @@ import {
   readCodexAppServerBinding,
   testCodexAppServerBindingStore,
 } from "./session-binding.test-helpers.js";
+import * as sharedClientModule from "./shared-client.js";
 
 type ReplyBackend = Parameters<
   NonNullable<ReturnType<typeof createParams>["replyOperation"]>["attachBackend"]
@@ -119,7 +121,11 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       createMockPluginRegistry([
         { hookName: "llm_input", handler: llmInput },
         { hookName: "llm_output", handler: llmOutput },
-        { hookName: "agent_end", handler: agentEnd },
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
       ]),
     );
     const sessionFile = path.join(tempDir, "session.jsonl");
@@ -131,6 +137,8 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     const params = createParams(sessionFile, workspaceDir);
     params.runtimePlan = createCodexRuntimePlanFixture();
     params.onAgentEvent = onRunAgentEvent;
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-message-1";
     const run = runCodexAppServerAttempt(params);
     await harness.waitForMethod("turn/start");
     expect(llmInput).toHaveBeenCalled();
@@ -273,13 +281,15 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     expect(llmOutputContext.contextWindowReferenceTokens).toBe(200_000);
     const [agentEndPayload, agentEndContext] = mockCall(agentEnd, "agent_end") as [
       { messages?: Array<{ role?: string }>; success?: boolean },
-      { runId?: string; sessionId?: string },
+      { externalContentSource?: string; messageId?: string; runId?: string; sessionId?: string },
     ];
     expect(agentEndPayload.success).toBe(true);
     expect(agentEndPayload.messages?.some((message) => message.role === "user")).toBe(true);
     expect(agentEndPayload.messages?.some((message) => message.role === "assistant")).toBe(true);
     expect(agentEndContext.runId).toBe("run-1");
     expect(agentEndContext.sessionId).toBe("session-1");
+    expect(agentEndContext.externalContentSource).toBe("gmail");
+    expect(agentEndContext.messageId).toBe("gmail-message-1");
   });
 
   it("emits gated model-call content diagnostics for codex turns", async () => {
@@ -834,6 +844,48 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     await expect(readCodexAppServerBinding(sessionFile)).resolves.toBeUndefined();
   });
 
+  it("returns a terminal error when Gmail binding coverage cleanup fails", async () => {
+    const agentEnd = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-binding-coverage-failure.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-binding-coverage-workspace");
+    const harness = createStartedThreadHarness();
+    const bindingStore = {
+      ...testCodexAppServerBindingStore,
+      mutate: vi.fn(async (...args: Parameters<typeof testCodexAppServerBindingStore.mutate>) => {
+        const mutation = args[1];
+        if (mutation.kind === "patch" && mutation.patch.historyCoveredThrough) {
+          throw new Error("simulated binding coverage write failure");
+        }
+        if (mutation.kind === "clear") {
+          throw new Error("simulated stale binding clear failure");
+        }
+        return await testCodexAppServerBindingStore.mutate(...args);
+      }),
+    };
+    const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-binding-coverage-message";
+    const run = runCodexAppServerAttempt(params, { bindingStore });
+    await harness.waitForMethod("turn/start");
+
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: "simulated stale binding clear failure",
+    });
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+  });
+
   it("does not wait for agent_end hooks before resolving channel-backed codex turns", async () => {
     let releaseAgentEnd: () => void = () => undefined;
     const agentEndSettled = new Promise<void>((resolve) => {
@@ -860,7 +912,7 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     releaseAgentEnd();
   });
 
-  it("waits for Gmail agent_end hooks and forwards source and message identity", async () => {
+  it("waits for Gmail agent_end hooks before resolving channel-backed codex turns", async () => {
     let releaseAgentEnd: () => void = () => undefined;
     const agentEndSettled = new Promise<void>((resolve) => {
       releaseAgentEnd = resolve;
@@ -875,14 +927,14 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
         },
       ]),
     );
-    const sessionFile = path.join(tempDir, "gmail-session.jsonl");
-    const workspaceDir = path.join(tempDir, "gmail-workspace");
+    const sessionFile = path.join(tempDir, "gmail-channel-session.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-channel-workspace");
     const harness = createStartedThreadHarness();
     const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-channel-message";
     params.messageChannel = "discord";
     params.messageProvider = "discord";
-    params.externalContentSource = "gmail";
-    params.currentMessageId = "gmail-message-123";
     const run = runCodexAppServerAttempt(params);
     let settled = false;
     void run.then(() => {
@@ -899,12 +951,242 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     ];
     expect(agentEndContext).toMatchObject({
       externalContentSource: "gmail",
-      messageId: "gmail-message-123",
+      messageId: "gmail-channel-message",
     });
-
     releaseAgentEnd();
     await expect(run).resolves.toMatchObject({ promptError: null });
+    expect(settled).toBe(true);
   });
+
+  it("finalizes and cleans up when accepted-turn activation cannot bind its route", async () => {
+    const agentEnd = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-activation-failure.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-activation-failure-workspace");
+    let harness: ReturnType<typeof createStartedThreadHarness>;
+    const onRunAgentEvent = vi.fn((event: AgentEventPayload) => {
+      if (event.stream === "lifecycle" && event.data.phase === "start") {
+        harness.close();
+      }
+    });
+    harness = createStartedThreadHarness();
+    const detachBackend = vi.fn();
+    const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-activation-failure-message";
+    params.onAgentEvent = onRunAgentEvent;
+    params.replyOperation = {
+      attachBackend: vi.fn(),
+      detachBackend,
+      freezeAbort: vi.fn(),
+    } as unknown as NonNullable<typeof params.replyOperation>;
+    const run = runCodexAppServerAttempt(params);
+
+    await harness.waitForMethod("turn/start");
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+    });
+
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+    const [agentEndPayload] = mockCall(agentEnd, "agent_end") as [{ success?: boolean }, unknown];
+    expect(agentEndPayload.success).toBe(false);
+    expect(detachBackend).toHaveBeenCalledTimes(1);
+    expect(resolveActiveEmbeddedRunSessionId(params.sessionId)).toBeUndefined();
+  });
+
+  it("finalizes and cleans up when accepted-turn activation throws before publication", async () => {
+    const agentEnd = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-activation-throw.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-activation-throw-workspace");
+    const harness = createStartedThreadHarness();
+    const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-activation-throw-message";
+    params.onExecutionPhase = vi.fn(() => {
+      throw new Error("accepted activation exploded");
+    });
+    params.replyOperation = {
+      attachBackend: vi.fn(),
+      detachBackend: vi.fn(),
+      freezeAbort: vi.fn(),
+    } as unknown as NonNullable<typeof params.replyOperation>;
+    const run = runCodexAppServerAttempt(params);
+
+    await harness.waitForMethod("turn/start");
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: "accepted activation exploded",
+    });
+
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+    expect(params.replyOperation?.attachBackend).not.toHaveBeenCalled();
+    expect(params.replyOperation?.detachBackend).not.toHaveBeenCalled();
+    expect(resolveActiveEmbeddedRunSessionId(params.sessionId)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "normal cleanup with a missing message ID",
+      sessionName: "gmail-missing-message-id",
+      currentMessageId: undefined,
+      finalizerError: undefined,
+      turnStartError: undefined,
+    },
+    {
+      label: "normal cleanup after finalizer rejection",
+      sessionName: "gmail-finalizer-failure",
+      currentMessageId: "gmail-finalizer-message",
+      finalizerError: "gmail finalizer failed",
+      turnStartError: undefined,
+    },
+    {
+      label: "turn-start cleanup with a missing message ID",
+      sessionName: "gmail-turn-start-missing-message-id",
+      currentMessageId: undefined,
+      finalizerError: undefined,
+      turnStartError: "turn start exploded",
+    },
+    {
+      label: "turn-start cleanup after finalizer rejection",
+      sessionName: "gmail-turn-start-finalizer-failure",
+      currentMessageId: "gmail-turn-start-message",
+      finalizerError: "gmail finalizer failed",
+      turnStartError: "turn start exploded",
+    },
+  ])(
+    "returns AgentEndTerminalFinalizationError for $label",
+    async ({ sessionName, currentMessageId, finalizerError, turnStartError }) => {
+      const finalizerFailure = finalizerError;
+      const turnStartFailure = turnStartError;
+      const agentEnd = finalizerFailure
+        ? vi.fn(async () => {
+            throw new Error(finalizerFailure);
+          })
+        : vi.fn();
+      const onRunAgentEvent = vi.fn();
+      const diagnosticEvents: DiagnosticEventPayload[] = [];
+      const stopDiagnostics = turnStartFailure
+        ? onInternalDiagnosticEvent((event) => {
+            if (event.type.startsWith("model.call.")) {
+              diagnosticEvents.push(event);
+            }
+          })
+        : undefined;
+      try {
+        initializeGlobalHookRunner(
+          createMockPluginRegistry([
+            {
+              hookName: "agent_end",
+              handler: agentEnd,
+              requiredForExternalContentSource: "gmail",
+            },
+          ]),
+        );
+        if (turnStartFailure) {
+          vi.stubEnv("OPENCLAW_TRAJECTORY", "1");
+        }
+        const sessionFile = path.join(tempDir, `${sessionName}.jsonl`);
+        const workspaceDir = path.join(tempDir, `${sessionName}-workspace`);
+        const trajectoryFlush = vi.fn(async () => undefined);
+        const params = createParams(sessionFile, workspaceDir);
+        params.externalContentSource = "gmail";
+        params.onAgentEvent = onRunAgentEvent;
+        if (currentMessageId) {
+          params.currentMessageId = currentMessageId;
+        }
+        params.replyOperation = {
+          attachBackend: vi.fn(),
+          detachBackend: vi.fn(),
+          freezeAbort: vi.fn(),
+        } as unknown as NonNullable<typeof params.replyOperation>;
+        if (turnStartFailure) {
+          params.config = {
+            diagnostics: { enabled: true, otel: { enabled: true, traces: true } },
+          } as never;
+          Object.assign(params, {
+            trajectorySessionFile: `sqlite:main:session-1:${path.join(tempDir, `${sessionName}.sqlite`)}`,
+            trajectoryRecorder: {
+              recordEvent: vi.fn(),
+              flush: trajectoryFlush,
+            },
+          });
+        }
+        const harness = turnStartFailure
+          ? createStartedThreadHarness(async (method) => {
+              if (method === "turn/start") {
+                throw new Error(turnStartFailure);
+              }
+              return undefined;
+            })
+          : createStartedThreadHarness();
+        const run = runCodexAppServerAttempt(params);
+
+        if (turnStartFailure) {
+          await expect(run).rejects.toMatchObject({
+            name: "AgentEndTerminalFinalizationError",
+            code: "agent_end_terminal_finalization",
+            ...(finalizerFailure ? { message: finalizerFailure } : {}),
+          });
+          await flushDiagnosticEvents();
+        } else {
+          await harness.waitForMethod("turn/start");
+          await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+          await expect(run).rejects.toMatchObject({
+            name: "AgentEndTerminalFinalizationError",
+            code: "agent_end_terminal_finalization",
+            ...(finalizerFailure ? { message: finalizerFailure } : {}),
+          });
+        }
+
+        expect(agentEnd).toHaveBeenCalledTimes(finalizerFailure ? 1 : 0);
+        if (!turnStartFailure) {
+          expect(params.replyOperation?.detachBackend).toHaveBeenCalledTimes(1);
+        } else {
+          const trajectoryRecorder = (
+            params as unknown as { trajectoryRecorder?: { flush: typeof trajectoryFlush } }
+          ).trajectoryRecorder;
+          expect(trajectoryRecorder?.flush).toHaveBeenCalledTimes(1);
+          const lifecycleEvents = onRunAgentEvent.mock.calls
+            .map(([event]) => event)
+            .filter((event) => event.stream === "codex_app_server.lifecycle");
+          expect(lifecycleEvents).toContainEqual(
+            expect.objectContaining({
+              data: { error: turnStartFailure, phase: "turn_start_failed" },
+            }),
+          );
+          expect(diagnosticEvents.map((event) => event.type)).toContain("model.call.error");
+          if (finalizerFailure) {
+            const [agentEndPayload] = mockCall(agentEnd, "agent_end") as [
+              { error?: string },
+              unknown,
+            ];
+            expect(agentEndPayload.error).toBe(turnStartFailure);
+          }
+        }
+      } finally {
+        stopDiagnostics?.();
+      }
+    },
+  );
 
   it("waits for agent_end hooks before rejecting local codex turn-start failures", async () => {
     let releaseAgentEnd: () => void = () => undefined;
@@ -935,6 +1217,58 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     await expect(run).rejects.toThrow("turn start exploded");
     expect(settled).toBe(true);
   });
+
+  it.each([
+    {
+      label: "ordinary error",
+      error: new Error("turn start exploded"),
+    },
+    {
+      label: "usage limit",
+      error: Object.assign(new Error("You've reached your usage limit."), {
+        data: { codexErrorInfo: "usageLimitExceeded" },
+      }),
+    },
+    {
+      label: "context-owner restart",
+      error: Object.assign(new Error("context owner changed during restart"), {
+        code: "CODEX_APP_SERVER_CONTEXT_RESTART_SELECTION_CHANGED",
+      }),
+    },
+  ])(
+    "returns a terminal error for a Gmail turn-start $label after agent_end succeeds",
+    async ({ error: turnStartFailure }) => {
+      const agentEnd = vi.fn();
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "agent_end",
+            handler: agentEnd,
+            requiredForExternalContentSource: "gmail",
+          },
+        ]),
+      );
+      const sessionFile = path.join(tempDir, "gmail-turn-start-failure.jsonl");
+      const workspaceDir = path.join(tempDir, "gmail-turn-start-failure-workspace");
+      const params = createParams(sessionFile, workspaceDir);
+      params.externalContentSource = "gmail";
+      params.currentMessageId = "gmail-turn-start-failure-message";
+      createStartedThreadHarness(async (method) => {
+        if (method === "turn/start") {
+          throw turnStartFailure;
+        }
+        return undefined;
+      });
+      const run = runCodexAppServerAttempt(params);
+
+      await expect(run).rejects.toMatchObject({
+        name: "AgentEndTerminalFinalizationError",
+        code: "agent_end_terminal_finalization",
+        message: turnStartFailure.message,
+      });
+      expect(agentEnd).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("runs startup cleanup before rethrowing Gmail agent_end failure", async () => {
     const order: string[] = [];
@@ -981,6 +1315,270 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     });
     expect(order).toEqual(["agent_end", "trajectory_flush"]);
     expect(trajectoryFlush).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the Gmail finalization error primary when normal cleanup also fails", async () => {
+    const agentEnd = vi.fn(async () => {
+      throw new Error("gmail finalizer failed");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-normal-dual-failure.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-normal-dual-failure-workspace");
+    const harness = createStartedThreadHarness();
+    const detachBackend = vi.fn(() => {
+      throw new Error("normal cleanup failed");
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-normal-dual-failure-message";
+    params.replyOperation = {
+      attachBackend: vi.fn(),
+      detachBackend,
+      freezeAbort: vi.fn(),
+    } as unknown as NonNullable<typeof params.replyOperation>;
+    const run = runCodexAppServerAttempt(params);
+
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: "gmail finalizer failed",
+    });
+
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+    expect(detachBackend).toHaveBeenCalledTimes(1);
+    expect(resolveActiveEmbeddedRunSessionId(params.sessionId)).toBeUndefined();
+  });
+
+  it("types required cleanup failure after Gmail agent_end completes", async () => {
+    const agentEnd = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "agent_end",
+          handler: agentEnd,
+          requiredForExternalContentSource: "gmail",
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "gmail-cleanup-failure.jsonl");
+    const workspaceDir = path.join(tempDir, "gmail-cleanup-failure-workspace");
+    const harness = createStartedThreadHarness();
+    const detachBackend = vi.fn(() => {
+      throw new Error("post-agent_end cleanup failed");
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    params.externalContentSource = "gmail";
+    params.currentMessageId = "gmail-cleanup-failure-message";
+    params.replyOperation = {
+      attachBackend: vi.fn(),
+      detachBackend,
+      freezeAbort: vi.fn(),
+    } as unknown as NonNullable<typeof params.replyOperation>;
+    const run = runCodexAppServerAttempt(params);
+
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await expect(run).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: "post-agent_end cleanup failed",
+    });
+
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+    expect(detachBackend).toHaveBeenCalledTimes(1);
+    expect(resolveActiveEmbeddedRunSessionId(params.sessionId)).toBeUndefined();
+  });
+
+  it.each([
+    { kind: "cleanup", mode: "rejection" },
+    { kind: "cleanup", mode: "timeout" },
+    { kind: "scoped MCP", mode: "rejection" },
+    { kind: "scoped MCP", mode: "timeout" },
+  ] as const)(
+    "handles required $kind $mode failure and runs later cleanup",
+    async ({ kind, mode }) => {
+      if (mode === "timeout") vi.stubEnv("OPENCLAW_AGENT_CLEANUP_TIMEOUT_MS", "5");
+      const name = `${kind.replace(" ", "-")}-${mode}`;
+      const params = createParams(
+        path.join(tempDir, `${name}.jsonl`),
+        path.join(tempDir, `${name}-workspace`),
+      );
+      if (kind === "cleanup") {
+        const detachBackend =
+          mode === "rejection"
+            ? vi.fn(() => {
+                throw new Error("required cleanup failed");
+              })
+            : vi.fn(async () => new Promise<never>(() => {}));
+        params.replyOperation = {
+          attachBackend: vi.fn(),
+          detachBackend,
+        } as unknown as NonNullable<typeof params.replyOperation>;
+        const harness = createStartedThreadHarness();
+        const run = runCodexAppServerAttempt(params);
+        await harness.waitForMethod("turn/start");
+        await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+        if (mode === "rejection") {
+          await expect(run).rejects.toMatchObject({
+            name: "AgentEndTerminalFinalizationError",
+            code: "agent_end_terminal_finalization",
+            message: "required cleanup failed",
+          });
+        } else {
+          await expect(run).rejects.toMatchObject({
+            name: "AgentEndTerminalFinalizationError",
+            code: "agent_end_terminal_finalization",
+            message: expect.stringContaining("step=codex-reply-backend-detach"),
+          });
+        }
+        expect(resolveActiveEmbeddedRunSessionId(params.sessionId)).toBeUndefined();
+        return;
+      }
+      const dispose =
+        mode === "rejection"
+          ? vi.fn(async () => {
+              throw new Error("scoped MCP disposal failed");
+            })
+          : vi.fn(async () => new Promise<never>(() => {}));
+      vi.spyOn(
+        agentHarnessRuntime,
+        "materializeRequesterScopedMcpToolsForHarnessRun",
+      ).mockResolvedValue({
+        tools: [],
+        advertisedTools: [],
+        dispose,
+      } as never);
+      vi.stubEnv("OPENCLAW_TRAJECTORY", "1");
+      const trajectoryFlush = vi.fn(async () => undefined);
+      Object.assign(params, {
+        trajectorySessionFile: `sqlite:main:session-1:${path.join(tempDir, `${name}.sqlite`)}`,
+        trajectoryRecorder: { recordEvent: vi.fn(), flush: trajectoryFlush },
+      });
+      createStartedThreadHarness(async (method) => {
+        if (method === "turn/start") {
+          throw new Error("turn start exploded");
+        }
+      });
+      const run = runCodexAppServerAttempt(params);
+      if (mode === "rejection") {
+        await expect(run).rejects.toThrow("scoped MCP disposal failed");
+      } else {
+        await expect(run).rejects.toMatchObject({
+          message: expect.stringContaining("step=codex-scoped-mcp-dispose-startup-failure"),
+        });
+      }
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(trajectoryFlush).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("keeps the Gmail finalization error primary when turn-start cleanup also fails", async () => {
+    const agentEnd = vi.fn(async () => {
+      throw new Error("gmail finalizer failed");
+    });
+    const onRunAgentEvent = vi.fn();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const stopDiagnostics = onInternalDiagnosticEvent((event) => {
+      if (event.type.startsWith("model.call.")) {
+        diagnosticEvents.push(event);
+      }
+    });
+    const scopedMcpDispose = vi.fn(async () => {
+      throw new Error("scoped MCP disposal failed");
+    });
+    const scopedMcpMaterializer = vi
+      .spyOn(agentHarnessRuntime, "materializeRequesterScopedMcpToolsForHarnessRun")
+      .mockResolvedValue({
+        tools: [],
+        advertisedTools: [],
+        dispose: scopedMcpDispose,
+      } as never);
+    const upstreamAbortController = new AbortController();
+    const retireSpy = vi
+      .spyOn(sharedClientModule, "retireSharedCodexAppServerClientIfCurrent")
+      .mockReturnValue({ activeLeases: 0, closed: true });
+    const removeAbortListener = vi.spyOn(upstreamAbortController.signal, "removeEventListener");
+    try {
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "agent_end",
+            handler: agentEnd,
+            requiredForExternalContentSource: "gmail",
+          },
+        ]),
+      );
+      vi.stubEnv("OPENCLAW_TRAJECTORY", "1");
+      const sessionFile = path.join(tempDir, "gmail-turn-start-dual-failure.jsonl");
+      const workspaceDir = path.join(tempDir, "gmail-turn-start-dual-failure-workspace");
+      const trajectoryFlush = vi.fn(async () => undefined);
+      const params = createParams(sessionFile, workspaceDir);
+      params.externalContentSource = "gmail";
+      params.currentMessageId = "gmail-turn-start-dual-failure-message";
+      params.onAgentEvent = onRunAgentEvent;
+      params.abortSignal = upstreamAbortController.signal;
+      params.cleanupBundleMcpOnRunEnd = true;
+      params.config = {
+        diagnostics: { enabled: true, otel: { enabled: true, traces: true } },
+      } as never;
+      Object.assign(params, {
+        trajectorySessionFile: `sqlite:main:session-1:${path.join(tempDir, "gmail-turn-start-dual-failure.sqlite")}`,
+        trajectoryRecorder: {
+          recordEvent: vi.fn(),
+          flush: trajectoryFlush,
+        },
+      });
+      const harness = createStartedThreadHarness(async (method) => {
+        if (method === "turn/start") {
+          throw new Error("turn start exploded");
+        }
+        return undefined;
+      });
+      const closeAndWait = vi.fn(async () => true);
+      Object.assign(harness.client, { closeAndWait });
+      const run = runCodexAppServerAttempt(params);
+
+      await expect(run).rejects.toMatchObject({
+        name: "AgentEndTerminalFinalizationError",
+        code: "agent_end_terminal_finalization",
+        message: "gmail finalizer failed",
+      });
+      await flushDiagnosticEvents();
+
+      expect(agentEnd).toHaveBeenCalledTimes(1);
+      expect(scopedMcpMaterializer).toHaveBeenCalledTimes(1);
+      expect(scopedMcpDispose).toHaveBeenCalledTimes(1);
+      expect(removeAbortListener).toHaveBeenCalledTimes(1);
+      expect(retireSpy).toHaveBeenCalledTimes(1);
+      expect(closeAndWait).toHaveBeenCalledTimes(1);
+      expect(trajectoryFlush).toHaveBeenCalledTimes(1);
+      const [agentEndPayload] = mockCall(agentEnd, "agent_end") as [{ error?: string }, unknown];
+      expect(agentEndPayload.error).toBe("turn start exploded");
+      const lifecycleEvents = onRunAgentEvent.mock.calls
+        .map(([event]) => event)
+        .filter((event) => event.stream === "codex_app_server.lifecycle");
+      expect(lifecycleEvents).toContainEqual(
+        expect.objectContaining({
+          data: { error: "turn start exploded", phase: "turn_start_failed" },
+        }),
+      );
+      expect(diagnosticEvents.map((event) => event.type)).toContain("model.call.error");
+    } finally {
+      scopedMcpMaterializer.mockRestore();
+      removeAbortListener.mockRestore();
+      retireSpy.mockRestore();
+      stopDiagnostics();
+    }
   });
 
   it("fires agent_end with failure metadata when the codex turn fails", async () => {
@@ -1059,7 +1657,6 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       if (method === "turn/start") {
         throw new Error("turn start exploded");
       }
-      return undefined;
     });
 
     const params = createParams(sessionFile, workspaceDir);

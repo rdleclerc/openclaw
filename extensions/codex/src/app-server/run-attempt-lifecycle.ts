@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions,
   embeddedAgentLog,
   emitAgentEvent as emitGlobalAgentEvent,
   runAgentEndSideEffects,
@@ -112,9 +113,7 @@ export async function runCodexAgentEndHook(
   if (params.externalContentSource === "gmail") {
     await awaitAgentEndSideEffects({
       ...sideEffectParams,
-      requiredForExternalContentSource: "gmail",
-      awaitOnlyRequired: true,
-      requireMessageId: true,
+      ...buildGmailAgentEndSideEffectOptions(params.externalContentSource),
     });
     return;
   }

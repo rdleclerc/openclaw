@@ -135,19 +135,26 @@ describe("agent end side effects", () => {
     expect(mockExperienceReview).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects a required Gmail terminal turn without a host-owned message identity", async () => {
+  it.each([
+    { label: "undefined", messageId: undefined },
+    { label: "null", messageId: null },
+    { label: "empty", messageId: "" },
+    { label: "whitespace", messageId: " \t\n" },
+  ])("rejects a required Gmail terminal turn with $label host identity", async ({ messageId }) => {
     const result = awaitAgentEndSideEffects({
       event: { messages: [], success: true },
-      ctx: { runId: "run-1", externalContentSource: "gmail" },
+      ctx: { runId: "run-1", externalContentSource: "gmail", messageId } as never,
       requiredForExternalContentSource: "gmail",
       awaitOnlyRequired: true,
       requireMessageId: true,
     });
 
+    await expect(result).rejects.toMatchObject({
+      name: "AgentEndTerminalFinalizationError",
+      code: "agent_end_terminal_finalization",
+      message: "required agent_end handler missing host-owned message identity",
+    });
     await expect(result).rejects.toBeInstanceOf(AgentEndTerminalFinalizationError);
-    await expect(result).rejects.toThrow(
-      "required agent_end handler missing host-owned message identity",
-    );
 
     expect(mockAwaitAgentEndHook).not.toHaveBeenCalled();
   });

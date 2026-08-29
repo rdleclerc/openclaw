@@ -7,6 +7,7 @@ import {
   resolveContextEngineOwnerPluginId,
   runAgentHarnessLlmOutputHook,
   runHarnessContextEngineMaintenance,
+  toAgentEndTerminalFinalizationError,
   type EmbeddedRunAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { readMirroredSessionHistoryMessages } from "./attempt-context.js";
@@ -97,6 +98,8 @@ export async function finalizeCodexAttempt(
     activeTurnId,
     activeProjector,
     streamState,
+    activationFailed,
+    activationError,
     freezeRunTerminalOutcome,
     notifyUserMessagePersisted,
   } = activeTurn;
@@ -162,6 +165,14 @@ export async function finalizeCodexAttempt(
       : effectiveTimedOut
         ? "codex app-server attempt timed out"
         : result.promptError);
+  if (activationFailed && !finalPromptError) {
+    const activationErrorMessage =
+      formatErrorMessage(activationError) || "codex app-server active turn activation failed";
+    finalPromptError =
+      activationError instanceof Error
+        ? activationError
+        : new Error(activationErrorMessage, { cause: activationError });
+  }
   const finalPromptErrorMessage =
     typeof finalPromptError === "string"
       ? finalPromptError
@@ -224,7 +235,9 @@ export async function finalizeCodexAttempt(
     });
   }
   const finalPromptErrorSource =
-    effectiveTimedOut || clientClosedPromptErrorForFinal ? "prompt" : result.promptErrorSource;
+    activationFailed || effectiveTimedOut || clientClosedPromptErrorForFinal
+      ? "prompt"
+      : result.promptErrorSource;
   const codexAppServerFailureKind = clientClosedPromptErrorForFinal
     ? "client_closed_before_turn_completed"
     : effectiveTurnCompletionIdleTimedOut
@@ -399,6 +412,9 @@ export async function finalizeCodexAttempt(
     ctx: hookContext,
     hookRunner,
   });
+  if (params.externalContentSource === "gmail" && isCodexUsageLimitPromptError(finalPromptError)) {
+    throw toAgentEndTerminalFinalizationError(finalPromptError);
+  }
   state.shouldDelayNativeHookRelayUnregister =
     completedTurnStatus === "completed" &&
     !effectiveTimedOut &&
@@ -414,13 +430,27 @@ export async function finalizeCodexAttempt(
       });
     } catch (error) {
       if (resourceState.thread.connectionScope === "supervision") {
+        if (params.externalContentSource === "gmail") {
+          throw toAgentEndTerminalFinalizationError(error);
+        }
         throw error;
       }
-      const cleared = await bindingStore.mutate(bindingIdentity, {
-        kind: "clear",
-        threadId: resourceState.thread.threadId,
-      });
+      let cleared: boolean;
+      try {
+        cleared = await bindingStore.mutate(bindingIdentity, {
+          kind: "clear",
+          threadId: resourceState.thread.threadId,
+        });
+      } catch (clearError) {
+        if (params.externalContentSource === "gmail") {
+          throw toAgentEndTerminalFinalizationError(clearError);
+        }
+        throw clearError;
+      }
       if (!cleared) {
+        if (params.externalContentSource === "gmail") {
+          throw toAgentEndTerminalFinalizationError(error);
+        }
         throw error;
       }
       embeddedAgentLog.warn(

@@ -1,14 +1,21 @@
 // Codex plugin module implements run attempt behavior.
-import type {
-  EmbeddedRunAttemptParams,
-  EmbeddedRunAttemptResult,
+import {
+  embeddedAgentLog,
+  formatErrorMessage,
+  toAgentEndTerminalFinalizationError,
+  type EmbeddedRunAttemptParams,
+  type EmbeddedRunAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { activateCodexAttemptTurn } from "./run-attempt-active-turn.js";
+import {
+  activateCodexAttemptTurn,
+  type CodexAttemptActiveTurn,
+} from "./run-attempt-active-turn.js";
 import { cleanupCodexAttempt } from "./run-attempt-cleanup.js";
 import { prepareCodexAttemptConnection } from "./run-attempt-connection.js";
 import { prepareCodexAttemptContext } from "./run-attempt-context.js";
 import { finalizeCodexAttempt } from "./run-attempt-finalize.js";
 import { createCodexAttemptLifecycleController } from "./run-attempt-lifecycle-controller.js";
+import { runCodexAgentEndHook } from "./run-attempt-lifecycle.js";
 import { createCodexAttemptNotificationController } from "./run-attempt-notification-controller.js";
 import { prepareCodexAttemptPrompt } from "./run-attempt-prompt.js";
 import { prepareCodexAttemptResources } from "./run-attempt-resources.js";
@@ -21,6 +28,7 @@ import { prepareCodexAttemptTurnRequest } from "./run-attempt-turn-request.js";
 import { startCodexAttemptTurn } from "./run-attempt-turn-start.js";
 import { createCodexAttemptTurnState } from "./run-attempt-turn-state.js";
 import type { CodexRunAttemptOptions } from "./run-attempt-types.js";
+import { buildCodexUserPromptMessage } from "./transcript-mirror.js";
 
 export async function runCodexAppServerAttempt(
   params: EmbeddedRunAttemptParams,
@@ -58,16 +66,19 @@ export async function runCodexAppServerAttempt(
   if ("result" in turnStart) {
     return turnStart.result;
   }
-  const activeTurn = await activateCodexAttemptTurn(
-    resources,
-    turnRuntime,
-    lifecycle,
-    notifications,
-    turnStart.turn,
-  );
-
+  let activeTurn: CodexAttemptActiveTurn | undefined;
+  let result: EmbeddedRunAttemptResult | undefined;
+  let finalizationError: unknown;
+  let finalizationFailed = false;
   try {
-    return await finalizeCodexAttempt(
+    activeTurn = await activateCodexAttemptTurn(
+      resources,
+      turnRuntime,
+      lifecycle,
+      notifications,
+      turnStart.turn,
+    );
+    result = await finalizeCodexAttempt(
       resources,
       turnRuntime,
       lifecycle,
@@ -75,7 +86,76 @@ export async function runCodexAppServerAttempt(
       turnRequest,
       activeTurn,
     );
-  } finally {
-    await cleanupCodexAttempt(resources, turnRuntime, lifecycle, turnRequest, activeTurn);
+  } catch (error) {
+    finalizationFailed = true;
+    finalizationError = error;
+    if (!activeTurn) {
+      turnRuntime.turnWatches.clearAllTimers();
+      turnRuntime.state.completed = true;
+      turnRuntime.state.resolveCompletion?.();
+      const { prompt } = resources;
+      const { context, turnState } = prompt;
+      const { runtime, historyState, hookContext, hookRunner } = context;
+      const { connection, runtimeParams } = runtime;
+      const activationErrorMessage =
+        formatErrorMessage(error) || "codex app-server active turn activation failed";
+      try {
+        await runCodexAgentEndHook(params, {
+          event: {
+            messages: [
+              ...historyState.messages,
+              buildCodexUserPromptMessage({
+                ...runtimeParams,
+                prompt: turnState.codexTurnPromptText,
+              }),
+            ],
+            success: false,
+            error: activationErrorMessage,
+            durationMs: Date.now() - connection.attemptStartedAt,
+          },
+          ctx: hookContext,
+          hookRunner,
+        });
+      } catch (agentEndError) {
+        finalizationError = toAgentEndTerminalFinalizationError(agentEndError);
+      }
+      if (finalizationError === error) {
+        finalizationError = toAgentEndTerminalFinalizationError(error);
+      }
+    }
   }
+
+  let cleanupError: unknown;
+  let cleanupFailed = false;
+  try {
+    await cleanupCodexAttempt(resources, turnRuntime, lifecycle, turnRequest, activeTurn);
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = error;
+  }
+
+  if (finalizationFailed) {
+    if (cleanupFailed) {
+      embeddedAgentLog.warn("codex app-server cleanup failed after attempt finalization failure", {
+        error: cleanupError,
+      });
+    }
+    throw finalizationError;
+  }
+  if (cleanupFailed) {
+    if (activeTurn?.activationFailed) {
+      embeddedAgentLog.warn(
+        "codex app-server cleanup failed after active-turn activation failure",
+        {
+          error: cleanupError,
+        },
+      );
+      throw toAgentEndTerminalFinalizationError(activeTurn.activationError);
+    }
+    throw toAgentEndTerminalFinalizationError(cleanupError);
+  }
+  if (activeTurn?.activationFailed) {
+    throw toAgentEndTerminalFinalizationError(activeTurn.activationError);
+  }
+  return result as EmbeddedRunAttemptResult;
 }

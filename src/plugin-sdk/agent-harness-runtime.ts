@@ -384,8 +384,10 @@ export {
 } from "../agents/harness/hook-helpers.js";
 export {
   awaitAgentEndSideEffects,
+  buildGmailAgentEndSideEffectOptions,
   runAgentEndSideEffects,
 } from "../agents/harness/agent-end-side-effects.js";
+export { toAgentEndTerminalFinalizationError } from "../agents/harness/terminal-finalization-error.js";
 export {
   awaitAgentHarnessAgentEndHook,
   getAgentHarnessHookRunner,
