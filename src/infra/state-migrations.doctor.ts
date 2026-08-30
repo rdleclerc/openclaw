@@ -6,7 +6,12 @@ import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { getChannelPlugin } from "../channels/plugins/registry.js";
 import type { ChannelLegacyStateMigrationPlan } from "../channels/plugins/types.core.js";
 import type { ChannelId } from "../channels/plugins/types.public.js";
-import { isNamedProfile, resolveOAuthDir, resolveStateDir } from "../config/paths.js";
+import {
+  isNamedProfile,
+  resolveLegacyStateDirs,
+  resolveOAuthDir,
+  resolveStateDir,
+} from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
@@ -24,6 +29,7 @@ import { resolveLegacyInstalledPluginIndexStorePath } from "../plugins/installed
 import { DEFAULT_ACCOUNT_ID, DEFAULT_MAIN_KEY, normalizeAgentId } from "../routing/session-key.js";
 import {
   detectOpenClawStateDatabaseSchemaMigrations,
+  type OpenClawStateDatabaseSchemaMigration,
   repairOpenClawStateDatabaseSchema,
 } from "../state/openclaw-state-db.js";
 import {
@@ -131,6 +137,55 @@ export function resetAutoMigrateLegacyStateForTest(): void {
   autoMigrateChecked = false;
   resetAutoMigrateLegacyTaskStateSidecarsForTest();
   resetLegacySessionSurfacesForTest();
+}
+
+function describeStateSchemaMigration(migration: OpenClawStateDatabaseSchemaMigration): string {
+  switch (migration.kind) {
+    case "agent-databases-composite-primary-key":
+      return "agent database registry primary key → agent_id,path";
+    case "audit-events-v2":
+      return "audit event ledger → versioned message lifecycle schema";
+    case "operator-approvals-system-agent":
+      return "operator approvals → OpenClaw system changes";
+    case "session-watch-cursor-provenance-v4":
+      return "session watch cursors → provenance column";
+    case "strict-tables-v3":
+      return "tables → SQLite STRICT typing";
+  }
+  return migration.kind satisfies never;
+}
+
+function preflightStateSchemaRepair(params: {
+  env: NodeJS.ProcessEnv;
+  homedir: () => string;
+  stateDirs?: readonly string[];
+}): { changes: string[]; warnings: string[] } {
+  const stateDirs =
+    params.stateDirs ??
+    (params.env.OPENCLAW_STATE_DIR?.trim()
+      ? [resolveStateDir(params.env, params.homedir)]
+      : [resolveStateDir(params.env, params.homedir), ...resolveLegacyStateDirs(params.homedir)]);
+  const checkedStateDirs = new Set<string>();
+  for (const stateDir of stateDirs) {
+    const resolvedStateDir = path.resolve(stateDir);
+    if (checkedStateDirs.has(resolvedStateDir)) {
+      continue;
+    }
+    checkedStateDirs.add(resolvedStateDir);
+    try {
+      detectOpenClawStateDatabaseSchemaMigrations({
+        env: { ...params.env, OPENCLAW_STATE_DIR: resolvedStateDir },
+      });
+    } catch (err) {
+      return {
+        changes: [],
+        warnings: [
+          `Failed migrating shared state database schema during Doctor preflight: ${String(err)}`,
+        ],
+      };
+    }
+  }
+  return { changes: [], warnings: [] };
 }
 
 async function collectChannelLegacyStateMigrationPlans(params: {
@@ -521,11 +576,7 @@ export async function detectLegacyStateMigrations(params: {
   }
   if (stateSchemaMigrations.length > 0) {
     for (const migration of stateSchemaMigrations) {
-      preview.push(
-        migration.kind === "agent-databases-composite-primary-key"
-          ? "- Shared SQLite schema: agent database registry primary key → agent_id,path"
-          : "- Shared SQLite schema: audit event ledger → versioned message lifecycle schema",
-      );
+      preview.push(`- Shared SQLite schema: ${describeStateSchemaMigration(migration)}`);
     }
     preview.push(
       "- Rerun doctor after shared SQLite schema repair to detect plugin state migrations",
@@ -730,12 +781,22 @@ export async function autoMigrateLegacyPluginDoctorState(params: {
   notices?: string[];
 }> {
   const env = params.env ?? process.env;
+  const homedir = params.homedir ?? os.homedir;
+  const preflight = preflightStateSchemaRepair({ env, homedir });
+  if (preflight.warnings.length > 0) {
+    return {
+      migrated: false,
+      skipped: false,
+      changes: [],
+      warnings: preflight.warnings,
+    };
+  }
   const stateDirResult = await autoMigrateLegacyStateDir({
     env,
-    homedir: params.homedir,
+    homedir,
     log: params.log,
   });
-  const stateDir = resolveStateDir(env, params.homedir ?? os.homedir);
+  const stateDir = resolveStateDir(env, homedir);
   const oauthDir = resolveOAuthDir(env, stateDir);
   const stateSchema = repairOpenClawStateDatabaseSchema({
     env: { ...env, OPENCLAW_STATE_DIR: stateDir },
@@ -806,8 +867,16 @@ export async function runLegacyStateMigrations(params: {
   const now = params.now ?? (() => Date.now());
   const detected = params.detected;
   const env = params.env ?? process.env;
+  const stateSchemaPreflight = preflightStateSchemaRepair({
+    env,
+    homedir: os.homedir,
+    stateDirs: [detected.stateDir],
+  });
+  if (stateSchemaPreflight.warnings.length > 0) {
+    return stateSchemaPreflight;
+  }
   const stateSchema = migrateLegacyStateSchema(detected, env);
-  if (detected.stateSchema.hasLegacy && stateSchema.warnings.length > 0) {
+  if (stateSchema.warnings.length > 0) {
     return stateSchema;
   }
   const pluginStateSidecar = await migrateLegacyPluginStateSidecar({
@@ -999,15 +1068,24 @@ export async function autoMigrateLegacyState(params: {
   if (autoMigrateChecked) {
     return { migrated: false, skipped: true, changes: [], warnings: [] };
   }
-  autoMigrateChecked = true;
-
   const env = params.env ?? process.env;
+  const homedir = params.homedir ?? os.homedir;
+  const preflight = preflightStateSchemaRepair({ env, homedir });
+  if (preflight.warnings.length > 0) {
+    return {
+      migrated: false,
+      skipped: false,
+      changes: [],
+      warnings: preflight.warnings,
+    };
+  }
+  autoMigrateChecked = true;
   const stateDirResult = await autoMigrateLegacyStateDir({
     env,
-    homedir: params.homedir,
+    homedir,
     log: params.log,
   });
-  const stateDir = resolveStateDir(env, params.homedir ?? os.homedir);
+  const stateDir = resolveStateDir(env, homedir);
   const stateSchema = repairOpenClawStateDatabaseSchema({
     env: { ...env, OPENCLAW_STATE_DIR: stateDir },
   });

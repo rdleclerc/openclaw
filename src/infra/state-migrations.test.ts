@@ -15,6 +15,14 @@ import {
   openOpenClawStateDatabase,
   OPENCLAW_STATE_SCHEMA_VERSION,
 } from "../state/openclaw-state-db.js";
+import {
+  activateOpenClawSchema6MultiObjectCase,
+  captureOpenClawSchema6CompatibilityReceipt,
+  getOpenClawSchema6CompatibilityCases,
+  markOpenClawStateDatabaseSourceVersion,
+  type OpenClawSchema6CompatibilityCase,
+  type OpenClawSchema6SourceVersion,
+} from "../state/sqlite-schema-shape.test-support.js";
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
 import {
   executeSqliteQuerySync,
@@ -363,6 +371,152 @@ function createEnv(stateDir: string): NodeJS.ProcessEnv {
     HOME: path.dirname(stateDir),
     OPENCLAW_STATE_DIR: stateDir,
   };
+}
+
+async function createDoctorSchemaCompatibilityFixture(params: {
+  version: OpenClawSchema6SourceVersion;
+  compatibilityCase?: OpenClawSchema6CompatibilityCase;
+  multiObject?: boolean;
+}): Promise<{
+  cfg: OpenClawConfig;
+  databasePath: string;
+  detected: Awaited<ReturnType<typeof detectLegacyStateMigrations>>;
+  env: NodeJS.ProcessEnv;
+  expectedObjects: readonly string[];
+  legacyCredentialPath: string;
+  legacyVoiceWakePath: string;
+  migrateLegacyState: ReturnType<typeof vi.fn>;
+  root: string;
+}> {
+  const root = await createTempDir();
+  const stateDir = path.join(root, ".openclaw");
+  const env = createEnv(stateDir);
+  const cfg = createConfig();
+  const databasePath = openOpenClawStateDatabase({ env }).path;
+  closeOpenClawStateDatabaseForTest();
+  const database = new DatabaseSync(databasePath);
+  try {
+    markOpenClawStateDatabaseSourceVersion(database, params.version);
+  } finally {
+    database.close();
+  }
+
+  const legacyCredentialPath = path.join(stateDir, "credentials", "creds.json");
+  const legacyVoiceWakePath = path.join(stateDir, "settings", "voicewake.json");
+  await fs.mkdir(path.dirname(legacyCredentialPath), { recursive: true });
+  await fs.mkdir(path.dirname(legacyVoiceWakePath), { recursive: true });
+  await fs.writeFile(legacyCredentialPath, '{"auth":true}\n', "utf8");
+  await fs.writeFile(legacyVoiceWakePath, '{"triggers":["wake"]}\n', "utf8");
+
+  const migrateLegacyState = vi.fn(() => ({
+    changes: ["unexpected plugin migration"],
+    warnings: [],
+  }));
+  pluginDoctorStateMigrationEntries.entries = [
+    {
+      pluginId: "schema6-gate-probe",
+      migration: {
+        id: "schema6-gate-probe",
+        label: "schema-6 gate probe",
+        detectLegacyState: () => ({ preview: ["schema-6 gate probe"] }),
+        migrateLegacyState,
+      },
+    },
+  ];
+
+  const beforeDetection = captureOpenClawSchema6CompatibilityReceipt(databasePath);
+  const detected = await detectLegacyStateMigrations({ cfg, env, homedir: () => root });
+  expect(captureOpenClawSchema6CompatibilityReceipt(databasePath)).toEqual(beforeDetection);
+
+  let expectedObjects: readonly string[];
+  const activeDatabase = new DatabaseSync(databasePath);
+  try {
+    if (params.multiObject) {
+      expectedObjects = activateOpenClawSchema6MultiObjectCase(activeDatabase, params.version);
+    } else if (params.compatibilityCase) {
+      params.compatibilityCase.activate(activeDatabase);
+      expectedObjects = params.compatibilityCase.expectedObjects;
+    } else {
+      throw new Error("Doctor schema compatibility fixture needs an active case");
+    }
+    expect(activeDatabase.prepare("PRAGMA foreign_key_check;").all()).toEqual([]);
+  } finally {
+    activeDatabase.close();
+  }
+
+  return {
+    cfg,
+    databasePath,
+    detected,
+    env,
+    expectedObjects,
+    legacyCredentialPath,
+    legacyVoiceWakePath,
+    migrateLegacyState,
+    root,
+  };
+}
+
+async function expectDoctorSchemaCompatibilityRefusal(
+  params: Awaited<ReturnType<typeof createDoctorSchemaCompatibilityFixture>>,
+): Promise<void> {
+  const before = captureOpenClawSchema6CompatibilityReceipt(params.databasePath);
+  const errorFragment = `unsupported active shared-state objects: ${params.expectedObjects.join(", ")}`;
+
+  await expect(
+    detectLegacyStateMigrations({
+      cfg: params.cfg,
+      env: params.env,
+      homedir: () => params.root,
+    }),
+  ).rejects.toThrow(errorFragment);
+  expect(captureOpenClawSchema6CompatibilityReceipt(params.databasePath)).toEqual(before);
+
+  const runResult = await runLegacyStateMigrations({
+    detected: params.detected,
+    config: params.cfg,
+    env: params.env,
+  });
+  expect(runResult).toEqual({
+    changes: [],
+    warnings: [expect.stringContaining(errorFragment)],
+  });
+  expect(captureOpenClawSchema6CompatibilityReceipt(params.databasePath)).toEqual(before);
+
+  const pluginResult = await autoMigrateLegacyPluginDoctorState({
+    config: params.cfg,
+    env: params.env,
+    homedir: () => params.root,
+  });
+  expect(pluginResult).toEqual({
+    migrated: false,
+    skipped: false,
+    changes: [],
+    warnings: [expect.stringContaining(errorFragment)],
+  });
+  expect(captureOpenClawSchema6CompatibilityReceipt(params.databasePath)).toEqual(before);
+
+  const autoResult = await autoMigrateLegacyState({
+    cfg: params.cfg,
+    env: params.env,
+    homedir: () => params.root,
+  });
+  expect(autoResult).toEqual({
+    migrated: false,
+    skipped: false,
+    changes: [],
+    warnings: [expect.stringContaining(errorFragment)],
+  });
+  expect(captureOpenClawSchema6CompatibilityReceipt(params.databasePath)).toEqual(before);
+  expect(params.migrateLegacyState).not.toHaveBeenCalled();
+  await expect(fs.readFile(params.legacyCredentialPath, "utf8")).resolves.toBe('{"auth":true}\n');
+  await expect(fs.readFile(params.legacyVoiceWakePath, "utf8")).resolves.toBe(
+    '{"triggers":["wake"]}\n',
+  );
+  await expectMissingPath(
+    path.join(path.dirname(params.legacyCredentialPath), "mobileauth", "default", "creds.json"),
+  );
+  await expectMissingPath(`${params.legacyVoiceWakePath}.migrated`);
 }
 
 async function createLegacyAuditLedger(stateDir: string): Promise<string> {
@@ -2992,6 +3146,30 @@ describe("state migrations", () => {
     expect(result.changes).toContain(`Merged sessions store → ${targetStorePath}`);
     expect(result.warnings).toStrictEqual([]);
     await expectMissingPath(path.join(stateDir, "sessions", "sessions.json"));
+  });
+
+  describe("schema-6 compatibility Doctor gate", () => {
+    const sourceVersions = [3, 4, 5, 6] as const;
+
+    for (const version of sourceVersions) {
+      for (const compatibilityCase of getOpenClawSchema6CompatibilityCases(version)) {
+        it(`keeps schema ${version} ${compatibilityCase.name} unchanged before all callbacks`, async () => {
+          const fixture = await createDoctorSchemaCompatibilityFixture({
+            version,
+            compatibilityCase,
+          });
+          await expectDoctorSchemaCompatibilityRefusal(fixture);
+        });
+      }
+
+      it(`keeps schema ${version} multi-object refusal ordered and unchanged`, async () => {
+        const fixture = await createDoctorSchemaCompatibilityFixture({
+          version,
+          multiObject: true,
+        });
+        await expectDoctorSchemaCompatibilityRefusal(fixture);
+      });
+    }
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

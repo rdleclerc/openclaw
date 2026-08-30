@@ -120,6 +120,11 @@ function rowToNodeHostConfig(row: NodeHostConfigRuntimeRow): NodeHostConfig {
   if (row.gateway_tls !== null && row.gateway_tls !== 0 && row.gateway_tls !== 1) {
     throw new Error("invalid node-host SQLite row: gateway_tls must be 0, 1, or null");
   }
+  if (row.installed_apps_sharing !== 0) {
+    throw new Error(
+      "node-host config refused unsupported active shared-state object: node_host_config.installed_apps_sharing",
+    );
+  }
   const gateway: NodeHostGatewayConfig = {
     host: optionalNonEmptyString(row.gateway_host, "gateway_host"),
     port: validatePort(row.gateway_port, "SQLite gateway_port"),
@@ -163,6 +168,7 @@ function configToRow(params: {
     gateway_tls: gateway?.tls === undefined ? null : gateway.tls ? 1 : 0,
     gateway_tls_fingerprint: gateway?.tlsFingerprint ?? null,
     gateway_context_path: gateway?.contextPath ?? null,
+    installed_apps_sharing: 0,
     updated_at_ms: params.updatedAtMs,
   };
 }
@@ -184,6 +190,7 @@ function readNodeHostConfigRow(
         "gateway_tls",
         "gateway_tls_fingerprint",
         "gateway_context_path",
+        "installed_apps_sharing",
         "updated_at_ms",
       ])
       .where("config_key", "=", NODE_HOST_CONFIG_KEY),

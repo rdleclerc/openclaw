@@ -82,6 +82,7 @@ function toPendingRow(record: DevicePairingPendingRecord): DevicePairingPending 
     device_family: record.deviceFamily ?? null,
     client_id: record.clientId ?? null,
     client_mode: record.clientMode ?? null,
+    browser_origin: null,
     role: record.role ?? null,
     roles_json: toJsonColumn(record.roles),
     scopes_json: toJsonColumn(record.scopes),
@@ -124,6 +125,7 @@ function toPairedRow(device: PairedDevice): DevicePairingPaired {
     device_family: device.deviceFamily ?? null,
     client_id: device.clientId ?? null,
     client_mode: device.clientMode ?? null,
+    browser_origin: null,
     role: device.role ?? null,
     roles_json: toJsonColumn(device.roles),
     scopes_json: toJsonColumn(device.scopes),
@@ -219,9 +221,49 @@ function fromBootstrapRow(row: DeviceBootstrapTokens): DeviceBootstrapTokenRecor
   };
 }
 
+function assertDevicePairingBrowserOriginsInactive(
+  db: import("node:sqlite").DatabaseSync,
+  target: DevicePairingStoreTarget,
+): void {
+  const kysely = getNodeSqliteKysely<OpenClawStateKyselyDatabase>(db);
+  const unsupported: string[] = [];
+  if (
+    target !== "paired" &&
+    executeSqliteQuerySync(
+      db,
+      kysely
+        .selectFrom("device_pairing_pending")
+        .select("request_id")
+        .where("browser_origin", "is not", null)
+        .limit(1),
+    ).rows.length > 0
+  ) {
+    unsupported.push("device_pairing_pending.browser_origin");
+  }
+  if (
+    target !== "pending" &&
+    executeSqliteQuerySync(
+      db,
+      kysely
+        .selectFrom("device_pairing_paired")
+        .select("device_id")
+        .where("browser_origin", "is not", null)
+        .limit(1),
+    ).rows.length > 0
+  ) {
+    unsupported.push("device_pairing_paired.browser_origin");
+  }
+  if (unsupported.length > 0) {
+    throw new Error(
+      `Device-pairing snapshot write refused unsupported active shared-state objects: ${unsupported.join(", ")}`,
+    );
+  }
+}
+
 /** Load the full pending + paired device snapshot from the shared state DB. */
 export function loadDevicePairingStoreState(baseDir?: string): DevicePairingStoreState {
   const { db } = openOpenClawStateDatabase(resolveDevicePairingStateDbOptions(baseDir));
+  assertDevicePairingBrowserOriginsInactive(db, "both");
   const kysely = getNodeSqliteKysely<OpenClawStateKyselyDatabase>(db);
   const pendingById: Record<string, DevicePairingPendingRecord> = {};
   for (const row of executeSqliteQuerySync(
@@ -247,6 +289,7 @@ export function persistDevicePairingStoreState(
   target: DevicePairingStoreTarget,
 ): void {
   runOpenClawStateWriteTransaction(({ db }) => {
+    assertDevicePairingBrowserOriginsInactive(db, target);
     const kysely = getNodeSqliteKysely<OpenClawStateKyselyDatabase>(db);
     if (target !== "paired") {
       executeSqliteQuerySync(db, kysely.deleteFrom("device_pairing_pending"));

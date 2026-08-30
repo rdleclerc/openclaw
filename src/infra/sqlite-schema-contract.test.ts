@@ -1,6 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { assertSqliteSchemaContains } from "./sqlite-schema-contract.js";
+import {
+  assertSqliteSchemaContains,
+  assertSqliteSchemaTablesPresent,
+} from "./sqlite-schema-contract.js";
 
 const CANONICAL_SCHEMA = `
   CREATE TABLE parents (
@@ -241,6 +244,42 @@ describe("assertSqliteSchemaContains", () => {
       expect(() => assertSqliteSchemaContains(database, "test database", CANONICAL_SCHEMA)).toThrow(
         expected,
       );
+    } finally {
+      database.close();
+    }
+  });
+});
+
+describe("assertSqliteSchemaTablesPresent", () => {
+  it("allows only explicitly versioned additive tables to be absent", () => {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec("CREATE TABLE parents (id TEXT PRIMARY KEY);");
+
+      expect(() =>
+        assertSqliteSchemaTablesPresent(database, "test database", CANONICAL_SCHEMA, {
+          allowedMissingTables: ["children", "events", "features", "other_parents"],
+        }),
+      ).not.toThrow();
+      expect(() =>
+        assertSqliteSchemaTablesPresent(database, "test database", CANONICAL_SCHEMA),
+      ).toThrow("missing table other_parents");
+    } finally {
+      database.close();
+    }
+  });
+
+  it("does not create a missing canonical table", () => {
+    const database = new DatabaseSync(":memory:");
+    try {
+      expect(() =>
+        assertSqliteSchemaTablesPresent(database, "test database", CANONICAL_SCHEMA),
+      ).toThrow("missing table children");
+      expect(
+        database
+          .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'children'")
+          .get(),
+      ).toBeUndefined();
     } finally {
       database.close();
     }

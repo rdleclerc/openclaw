@@ -4,7 +4,10 @@ import {
   FULL_ACCESS_PAIRING_SETUP_BOOTSTRAP_PROFILE,
   PAIRING_SETUP_BOOTSTRAP_PROFILE,
 } from "../shared/device-bootstrap-profile.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../state/openclaw-state-db.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import { issueDeviceBootstrapToken, verifyDeviceBootstrapToken } from "./device-bootstrap.js";
 import {
@@ -225,6 +228,55 @@ describe("device pairing tokens", () => {
     expect(first.created).toBe(true);
     expect(second.created).toBe(false);
     expect(second.request.requestId).toBe(first.request.requestId);
+  });
+
+  test("refuses to load or replace a pending snapshot with browser-origin state", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const requested = await requestDevicePairing(
+      { deviceId: "browser-pending", publicKey: "browser-pending-key" },
+      baseDir,
+    );
+    const snapshot = loadDevicePairingStoreState(baseDir);
+    const database = openOpenClawStateDatabase({
+      env: { ...process.env, OPENCLAW_STATE_DIR: baseDir },
+    }).db;
+    database
+      .prepare("UPDATE device_pairing_pending SET browser_origin = ? WHERE request_id = ?")
+      .run("https://control.example", requested.request.requestId);
+
+    const refusal =
+      "Device-pairing snapshot write refused unsupported active shared-state objects: " +
+      "device_pairing_pending.browser_origin";
+    expect(() => loadDevicePairingStoreState(baseDir)).toThrow(refusal);
+    expect(() => persistDevicePairingStoreState(snapshot, baseDir, "pending")).toThrow(refusal);
+    expect(
+      database
+        .prepare("SELECT browser_origin FROM device_pairing_pending WHERE request_id = ?")
+        .get(requested.request.requestId),
+    ).toEqual({ browser_origin: "https://control.example" });
+  });
+
+  test("refuses to load or replace a paired snapshot with browser-origin state", async () => {
+    const baseDir = await makeDevicePairingDir();
+    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
+    const snapshot = loadDevicePairingStoreState(baseDir);
+    const database = openOpenClawStateDatabase({
+      env: { ...process.env, OPENCLAW_STATE_DIR: baseDir },
+    }).db;
+    database
+      .prepare("UPDATE device_pairing_paired SET browser_origin = ? WHERE device_id = ?")
+      .run("https://control.example", "device-1");
+
+    const refusal =
+      "Device-pairing snapshot write refused unsupported active shared-state objects: " +
+      "device_pairing_paired.browser_origin";
+    expect(() => loadDevicePairingStoreState(baseDir)).toThrow(refusal);
+    expect(() => persistDevicePairingStoreState(snapshot, baseDir, "paired")).toThrow(refusal);
+    expect(
+      database
+        .prepare("SELECT browser_origin FROM device_pairing_paired WHERE device_id = ?")
+        .get("device-1"),
+    ).toEqual({ browser_origin: "https://control.example" });
   });
 
   test("re-requesting with identical params preserves the original ts to prevent queue-jumping", async () => {

@@ -138,10 +138,22 @@ function resolveVoiceCallStateDatabaseEnv(
   };
 }
 
-function describeVoiceCallSchemaMigration(migration: OpenClawStateDatabaseSchemaMigration): string {
-  return migration.kind === "agent-databases-composite-primary-key"
-    ? "agent database registry primary key -> agent_id,path"
-    : "audit event ledger -> versioned message lifecycle schema";
+export function describeVoiceCallSchemaMigration(
+  migration: OpenClawStateDatabaseSchemaMigration,
+): string {
+  switch (migration.kind) {
+    case "agent-databases-composite-primary-key":
+      return "agent database registry primary key -> agent_id,path";
+    case "audit-events-v2":
+      return "audit event ledger -> versioned message lifecycle schema";
+    case "operator-approvals-system-agent":
+      return "operator approvals -> OpenClaw system changes";
+    case "session-watch-cursor-provenance-v4":
+      return "session watch cursors -> provenance column";
+    case "strict-tables-v3":
+      return "tables -> SQLite STRICT typing";
+  }
+  return migration.kind satisfies never;
 }
 
 /** Return true when a path exists and is a file. */

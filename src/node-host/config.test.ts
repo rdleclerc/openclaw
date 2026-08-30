@@ -179,15 +179,64 @@ describe("node-host SQLite config", () => {
     });
     closeOpenClawStateDatabaseForTest();
     await expect(loadNodeHostConfig(env)).resolves.toEqual(configured);
+    expect(
+      openOpenClawStateDatabase({ env })
+        .db.prepare(
+          "SELECT installed_apps_sharing FROM node_host_config WHERE config_key = 'current'",
+        )
+        .get(),
+    ).toEqual({ installed_apps_sharing: 0 });
     await expect(fs.stat(path.join(stateDir, "node.json"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("refuses to read or replace installed-app sharing state", async () => {
+    const { env } = makeTestEnv();
+    await configureNodeHost({
+      nodeId: "node-shared-apps",
+      fallbackDisplayName: "node",
+      gateway: {},
+      env,
+      nowMs: 1,
+    });
+    const database = openOpenClawStateDatabase({ env }).db;
+    database
+      .prepare(
+        "UPDATE node_host_config SET installed_apps_sharing = 1 WHERE config_key = 'current'",
+      )
+      .run();
+
+    const refusal =
+      "node-host config refused unsupported active shared-state object: " +
+      "node_host_config.installed_apps_sharing";
+    await expect(loadNodeHostConfig(env)).rejects.toThrow(refusal);
+    await expect(
+      configureNodeHost({
+        nodeId: "replacement-node",
+        fallbackDisplayName: "node",
+        gateway: {},
+        env,
+        nowMs: 2,
+      }),
+    ).rejects.toThrow(refusal);
+    expect(
+      database
+        .prepare(
+          "SELECT node_id, installed_apps_sharing FROM node_host_config WHERE config_key = 'current'",
+        )
+        .get(),
+    ).toEqual({ node_id: "node-shared-apps", installed_apps_sharing: 1 });
   });
 
   it("adds the gateway context-path column to an existing state database", async () => {
     const { env } = makeTestEnv();
     const database = openOpenClawStateDatabase({ env });
     database.db.exec("ALTER TABLE node_host_config DROP COLUMN gateway_context_path");
+    database.db.exec(`
+      PRAGMA user_version = 5;
+      UPDATE schema_meta SET schema_version = 5 WHERE meta_key = 'primary';
+    `);
     closeOpenClawStateDatabaseForTest();
 
     const configured = await configureNodeHost({

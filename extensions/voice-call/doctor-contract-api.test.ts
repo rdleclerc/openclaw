@@ -10,11 +10,16 @@ import {
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import type {
+  OpenClawStateDatabaseSchemaMigration,
   OpenKeyedStoreOptions,
   PluginDoctorStateMigrationContext,
 } from "openclaw/plugin-sdk/runtime-doctor";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { resolveSessionStoreAgentIds, stateMigrations } from "./doctor-contract-api.js";
+import {
+  describeVoiceCallSchemaMigration,
+  resolveSessionStoreAgentIds,
+  stateMigrations,
+} from "./doctor-contract-api.js";
 import {
   createTestStorePath,
   makePersistedCall,
@@ -165,6 +170,26 @@ describe("voice-call doctor state migration", () => {
     ).toEqual(["main"]);
   });
 
+  it("maps every shared-state migration kind to its exact description", () => {
+    type MigrationKind = OpenClawStateDatabaseSchemaMigration["kind"];
+    const descriptions = {
+      "agent-databases-composite-primary-key":
+        "agent database registry primary key -> agent_id,path",
+      "audit-events-v2": "audit event ledger -> versioned message lifecycle schema",
+      "operator-approvals-system-agent": "operator approvals -> OpenClaw system changes",
+      "session-watch-cursor-provenance-v4": "session watch cursors -> provenance column",
+      "strict-tables-v3": "tables -> SQLite STRICT typing",
+    } satisfies Record<MigrationKind, string>;
+
+    const cases = Object.entries(descriptions) as Array<[MigrationKind, string]>;
+    expect(cases).toHaveLength(5);
+    for (const [kind, description] of cases) {
+      expect(describeVoiceCallSchemaMigration({ kind, path: "/state/openclaw.sqlite" })).toBe(
+        description,
+      );
+    }
+  });
+
   it("imports legacy calls.jsonl into plugin state", async () => {
     const sourcePath = path.join(storePath, "calls.jsonl");
     const call = makePersistedCall({
@@ -279,11 +304,13 @@ describe("voice-call doctor state migration", () => {
     await expect(migration.detectLegacyState(params)).resolves.toEqual({
       preview: [
         "- Voice Call SQLite schema: audit event ledger -> versioned message lifecycle schema",
+        "- Voice Call SQLite schema: tables -> SQLite STRICT typing",
       ],
     });
     await expect(migration.migrateLegacyState(params)).resolves.toEqual({
       changes: [
         "Migrated Voice Call SQLite audit event ledger -> versioned message lifecycle schema",
+        "Migrated Voice Call SQLite tables -> SQLite STRICT typing",
       ],
       warnings: [],
     });
