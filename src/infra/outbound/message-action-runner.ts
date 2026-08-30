@@ -25,6 +25,7 @@ import {
   type ConversationReadInvocationOrigin,
 } from "../../channels/plugins/conversation-read-origin.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
+import * as messageActionDiscovery from "../../channels/plugins/message-action-discovery.js";
 import { dispatchChannelMessageAction } from "../../channels/plugins/message-action-dispatch.js";
 import type {
   ChannelId,
@@ -1607,7 +1608,7 @@ async function handlePluginAction(ctx: ResolvedActionContext): Promise<MessageAc
   // gateway or local dispatch to keep both execution modes on the same topic.
   const targetForThreading =
     normalizeOptionalString(params.to) ?? normalizeOptionalString(params.channelId) ?? "";
-  if (targetForThreading) {
+  if (targetForThreading && !(action === "read" && readBooleanParam(params, "complete") === true)) {
     resolveAndApplyOutboundThreadId(params, {
       cfg,
       to: targetForThreading,
@@ -1706,11 +1707,8 @@ export async function runMessageAction(
     action,
   });
   const completeRead = readBooleanParam(params, "complete") === true;
-  if (completeRead && action !== "read") {
-    throw new Error(
-      'UNSUPPORTED_COMPLETE_READ_CHANNEL: complete reads require action "read" on Slack.',
-    );
-  }
+  if (completeRead && action !== "read")
+    throw new Error('UNSUPPORTED_COMPLETE_READ_CHANNEL: complete reads require action "read".');
   if (action === "broadcast") {
     return handleBroadcastAction(input, params);
   }
@@ -1727,8 +1725,30 @@ export async function runMessageAction(
     throw new Error(`Action ${action} requires a target.`);
   }
   const channel = await resolveChannel(cfg, params, input.toolContext);
-  if (completeRead && normalizeOptionalLowercaseString(channel) !== "slack") {
-    throw new Error("UNSUPPORTED_COMPLETE_READ_CHANNEL: complete reads require Slack.");
+  const discovery = completeRead
+    ? messageActionDiscovery.resolveCurrentChannelMessageToolDiscoveryAdapter(channel)
+    : null;
+  const supportsCompleteRead = discovery
+    ? messageActionDiscovery
+        .resolveMessageActionDiscoveryForPlugin({
+          pluginId: discovery.pluginId,
+          actions: discovery.actions,
+          context: messageActionDiscovery.createMessageActionDiscoveryContext({
+            cfg,
+            channel,
+            accountId: readStringParam(params, "accountId") ?? input.defaultAccountId,
+          }),
+          includeSchema: true,
+        })
+        .schemaContributions.some(
+          ({ actions, properties }) =>
+            (actions == null || actions.includes("read")) && Object.hasOwn(properties, "complete"),
+        )
+    : false;
+  if (completeRead && !supportsCompleteRead) {
+    throw new Error(
+      "UNSUPPORTED_COMPLETE_READ_CHANNEL: selected channel does not support complete reads.",
+    );
   }
   params.channel = channel;
   const channelPlugin = resolveOutboundChannelPlugin({ channel, cfg });

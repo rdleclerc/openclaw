@@ -171,6 +171,24 @@ function readSlackBlocksParam(params: Record<string, unknown>) {
   return slackActionRuntime.parseSlackBlocksInput(params.blocks);
 }
 
+function readCompleteSlackReadTarget(params: Record<string, unknown>) {
+  const threadId = readStringParam(params, "threadId");
+  const messageId = readStringParam(params, "messageId");
+  if ((threadId ? 1 : 0) + (messageId ? 1 : 0) !== 1) {
+    throw new Error("Complete Slack reads require exactly one of threadId or messageId.");
+  }
+  if (
+    params.limit !== undefined ||
+    ["before", "after", "around"].some((key) => readStringParam(params, key) !== undefined) ||
+    readBooleanParam(params, "includeThread") === true
+  ) {
+    throw new Error(
+      "Complete Slack reads do not accept limit, before, after, around, or includeThread.",
+    );
+  }
+  return { threadId, messageId };
+}
+
 function isImageContentType(value: string | undefined): boolean {
   return value?.trim().toLowerCase().startsWith("image/") === true;
 }
@@ -894,19 +912,7 @@ export async function handleSlackAction(
         const channelId = resolveChannelId();
         const complete = readBooleanParam(params, "complete") === true;
         if (complete) {
-          const threadId = readStringParam(params, "threadId");
-          const messageId = readStringParam(params, "messageId");
-          if (
-            params.limit !== undefined ||
-            ["before", "after", "around"].some(
-              (key) => readStringParam(params, key) !== undefined,
-            ) ||
-            readBooleanParam(params, "includeThread") === true
-          ) {
-            throw new Error(
-              "Complete Slack reads do not accept limit, before, after, around, or includeThread.",
-            );
-          }
+          const { threadId, messageId } = readCompleteSlackReadTarget(params);
           await assertReadTargetAllowed(channelId);
           const result = await slackActionRuntime.readSlackMessages(channelId, {
             ...readOpts,

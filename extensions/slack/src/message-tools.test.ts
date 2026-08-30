@@ -296,10 +296,12 @@ describe("Slack message tools", () => {
     });
     const { schema, property } = requireSchemaProperty(discovery, "complete");
 
-    expect(schema.actions).toEqual(["read"]);
+    expect(schema).toMatchObject({ actions: ["read"], visibility: "all-configured" });
     expect((property as { type?: string }).type).toBe("boolean");
     expect(property.description).toMatch(/Slack-only complete read mode/i);
-    expect(property.description).toContain("exactly one threadId or messageId");
+    expect(property.description).toMatch(
+      /exactly one threadId or messageId.*incomplete results never prove that a message is absent.*startedAt.*not completedAt/i,
+    );
   });
 
   it("describes current Slack message id actions without stale aliases", () => {

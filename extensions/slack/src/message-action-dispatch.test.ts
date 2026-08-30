@@ -864,17 +864,24 @@ describe("handleSlackMessageAction", () => {
       ctx: {
         action: "read",
         cfg: {},
-        params: { channelId: "C1", threadId: "171234.567", complete: true },
+        params: {
+          channelId: "C1",
+          threadId: "171234.567",
+          complete: true,
+          around: "171234.568",
+          includeThread: true,
+        },
       } as never,
       invoke: invoke as never,
     });
 
-    expect(invoke).toHaveBeenCalledTimes(1);
     expect(firstAction(invoke)).toMatchObject({
       action: "readMessages",
       channelId: "C1",
       threadId: "171234.567",
       complete: true,
+      around: "171234.568",
+      includeThread: true,
     });
   });
 

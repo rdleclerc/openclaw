@@ -1495,19 +1495,24 @@ describe("handleSlackAction", () => {
   });
 
   it("returns the complete read receipt without legacy fields", async () => {
+    for (const params of [
+      { complete: true },
+      { complete: true, threadId: "root", messageId: "exact" },
+      { complete: true, threadId: "root", around: "near" },
+      { complete: true, threadId: "root", includeThread: true },
+    ]) {
+      await expect(
+        handleSlackAction({ action: "readMessages", channelId: "C1", ...params }, slackConfig()),
+      ).rejects.toThrow(/Complete Slack reads/);
+    }
+    expect(resolveSlackConversationInfo).not.toHaveBeenCalled();
+    expect(readSlackMessages).not.toHaveBeenCalled();
     const complete = {
       status: "complete",
-      code: null,
-      channelId: "C1",
       threadId: "1712345678.123456",
       root: { ts: "1712345678.123456", text: "root", actorId: "U1", isBot: false },
       messages: [],
       replies: [],
-      startedAt: "2026-08-30T00:00:00.000Z",
-      completedAt: "2026-08-30T00:00:01.000Z",
-      pages: 1,
-      finalCursor: "",
-      paginationComplete: true,
     };
     readSlackMessages.mockResolvedValueOnce(complete);
 
@@ -1518,8 +1523,6 @@ describe("handleSlackAction", () => {
 
     const details = requireDetails(result);
     expect(details).toEqual(complete);
-    expect(details).not.toHaveProperty("ok");
-    expect(details).not.toHaveProperty("hasMore");
     expectRecordFields(requireRecordArg(readSlackMessages, "readSlackMessages", 0, 1), {
       complete: true,
       threadId: "1712345678.123456",

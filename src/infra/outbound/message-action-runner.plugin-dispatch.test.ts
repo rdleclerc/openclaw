@@ -1,6 +1,7 @@
 // Covers plugin-dispatched message actions, target resolution, dry-run behavior,
 // and plugin tool-result extraction.
 import path from "node:path";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { jsonResult } from "../../agents/tools/common.js";
 import { dispatchChannelMessageAction } from "../../channels/plugins/message-action-dispatch.js";
@@ -2291,6 +2292,41 @@ describe("runMessageAction plugin dispatch", () => {
         expect(handleAction).toHaveBeenCalledTimes(executionMode === "local" ? 1 : 0);
       },
     );
+
+    it("does not inherit a current thread for complete reads", async () => {
+      const plugin = createThreadedPlugin("local");
+      plugin.actions!.supportsAction = ({ action }) => action === "read";
+      plugin.actions!.describeMessageTool = () => ({
+        actions: ["read"],
+        schema: { actions: ["read"], properties: { complete: Type.Boolean() } },
+      });
+      setActivePluginRegistry(
+        createTestRegistry([{ pluginId: "forumchat", source: "test", plugin }]),
+      );
+
+      await runMessageAction({
+        cfg,
+        action: "read",
+        params: {
+          channel: "forumchat",
+          target: "forum:123",
+          messageId: "msg-789",
+          accountId: "default",
+          complete: true,
+        },
+        toolContext: {
+          currentChannelProvider: "forumchat",
+          currentChannelId: "forum:123",
+          currentThreadTs: "42",
+        },
+        requesterAccountId: "default",
+        dryRun: false,
+      });
+
+      expect(
+        readRecordField(readFirstPluginCall(handleAction), "params", "plugin params"),
+      ).not.toHaveProperty("threadId");
+    });
   });
 
   describe("presentation send routing", () => {

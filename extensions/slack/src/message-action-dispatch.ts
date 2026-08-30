@@ -198,6 +198,8 @@ export async function handleSlackMessageAction(params: {
       limit,
       before: readStringParam(actionParams, "before"),
       after: readStringParam(actionParams, "after"),
+      around: readStringParam(actionParams, "around"),
+      includeThread: readBooleanParam(actionParams, "includeThread"),
       messageId: readStringParam(actionParams, "messageId"),
       accountId,
     };

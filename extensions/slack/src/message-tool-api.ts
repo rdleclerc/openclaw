@@ -103,11 +103,12 @@ export function describeSlackMessageTool({
         complete: Type.Optional(
           Type.Boolean({
             description:
-              "Slack-only complete read mode. Set true with exactly one threadId or messageId. The bounded result reports whether pagination completed.",
+              "Slack-only complete read mode. Set true with exactly one threadId or messageId. Incomplete results never prove that a message is absent. Absence is authoritative only through startedAt, not completedAt.",
           }),
         ),
       },
       actions: ["read"],
+      visibility: "all-configured",
     });
   }
   if (actions.includes("upload-file")) {

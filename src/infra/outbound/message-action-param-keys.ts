@@ -13,7 +13,6 @@ const STANDARD_MESSAGE_ACTION_PARAM_KEYS = new Set([
   "caption",
   "channel",
   "channelId",
-  "complete",
   "contentType",
   "delivery",
   "dryRun",

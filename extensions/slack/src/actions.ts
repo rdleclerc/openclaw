@@ -3,7 +3,6 @@ import type { Block, KnownBlock, WebClient } from "@slack/web-api";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { z } from "zod";
 import { resolveSlackAccount } from "./accounts.js";
 import type { SlackAuthoredTextPlacement } from "./authored-text.js";
@@ -52,12 +51,6 @@ export type SlackMessageSummary = {
   }>;
 };
 
-export type SlackCompleteReadMessage = Record<"ts" | "text" | "actorId", string> & {
-  isBot: boolean;
-  botId?: string;
-  clientMessageId?: string;
-  threadTs?: string;
-};
 export type SlackPin = {
   type?: string;
   message?: { ts?: string; text?: string };
@@ -454,7 +447,6 @@ export async function resolveSlackConversationName(
   return info.channel?.name?.trim() || undefined;
 }
 
-const COMPLETE_READ_MAX_DURATION_MS = 30_000;
 const COMPLETE_READ_TIMEOUT = Symbol("complete-read-timeout");
 type SlackReadOptions = SlackActionClientOpts & {
   limit?: number;
@@ -467,56 +459,48 @@ type SlackReadOptions = SlackActionClientOpts & {
   complete?: boolean;
 };
 
-function normalizeCompleteReadMessage(value: unknown): SlackCompleteReadMessage | undefined {
-  if (
-    !isRecord(value) ||
-    typeof value.ts !== "string" ||
-    !value.ts.trim() ||
-    typeof value.text !== "string"
-  )
-    return;
-  const read = (key: string): string | null | undefined => {
-    const raw = value[key];
-    return raw === undefined ? undefined : typeof raw === "string" && raw.trim() ? raw : null;
-  };
-  const fields = ["user", "bot_id", "client_msg_id", "thread_ts"];
-  const [user, bot, clientMessageId, threadTs] = fields.map(read);
-  const actorId = bot ?? user;
-  if (!actorId || [user, bot, clientMessageId, threadTs].includes(null)) return;
-  return {
-    ts: value.ts,
-    text: value.text,
-    actorId,
-    ...(bot ? { botId: bot } : {}),
-    isBot: Boolean(bot),
-    ...(clientMessageId ? { clientMessageId } : {}),
-    ...(threadTs ? { threadTs } : {}),
-  };
-}
+const COMPLETE_READ_MESSAGE_SCHEMA = z
+  .object({
+    ts: z.string().trim().min(1),
+    text: z.string(),
+    user: z.string().trim().min(1).optional(),
+    bot_id: z.string().trim().min(1).optional(),
+    client_msg_id: z.string().trim().min(1).optional(),
+    thread_ts: z.string().trim().min(1).optional(),
+  })
+  .transform(({ ts, text, user, bot_id, client_msg_id, thread_ts }) =>
+    bot_id || user
+      ? {
+          ts,
+          text,
+          actorId: bot_id ?? user!,
+          isBot: Boolean(bot_id),
+          ...(bot_id ? { botId: bot_id } : {}),
+          ...(client_msg_id ? { clientMessageId: client_msg_id } : {}),
+          ...(thread_ts ? { threadTs: thread_ts } : {}),
+        }
+      : undefined,
+  );
+type SlackCompleteReadMessage = NonNullable<z.infer<typeof COMPLETE_READ_MESSAGE_SCHEMA>>;
 
-function parseCompleteReadPage(value: unknown) {
-  if (!isRecord(value) || !Array.isArray(value.messages)) {
-    return { messages: [], nextCursor: "", malformed: true };
-  }
-  const metadata = value.response_metadata;
-  const rawCursor =
-    metadata === undefined ? undefined : isRecord(metadata) ? metadata.next_cursor : null;
-  const nextCursor =
-    rawCursor === undefined
-      ? ""
-      : typeof rawCursor === "string" && rawCursor.trim() === rawCursor
-        ? rawCursor
-        : null;
-  const hasMore = value.has_more;
-  return {
-    messages: value.messages,
-    nextCursor: nextCursor ?? "",
-    malformed:
-      nextCursor === null ||
-      (hasMore !== undefined && typeof hasMore !== "boolean") ||
-      (hasMore === true && !nextCursor) ||
-      (hasMore === false && Boolean(nextCursor)),
-  };
+function parseCompleteReadPage(value: unknown, requestedLimit: number) {
+  const parsed = z
+    .object({
+      messages: z.array(COMPLETE_READ_MESSAGE_SCHEMA),
+      has_more: z.boolean().optional(),
+      response_metadata: z.object({ next_cursor: z.string() }).optional(),
+    })
+    .safeParse(value);
+  if (!parsed.success) return { messages: [], nextCursor: "", malformed: true };
+  const messages = parsed.data.messages.filter(Boolean) as SlackCompleteReadMessage[];
+  const nextCursor = parsed.data.response_metadata?.next_cursor ?? "";
+  const malformed =
+    nextCursor.trim() !== nextCursor ||
+    messages.length !== parsed.data.messages.length ||
+    messages.length > requestedLimit ||
+    (parsed.data.has_more === true && !nextCursor) ||
+    (parsed.data.has_more === false && Boolean(nextCursor));
+  return { messages, nextCursor, malformed };
 }
 
 async function readCompleteSlackMessages(
@@ -525,31 +509,26 @@ async function readCompleteSlackMessages(
 ) {
   const threadId = opts.threadId?.trim();
   const messageId = opts.messageId?.trim();
-  if ((threadId ? 1 : 0) + (messageId ? 1 : 0) !== 1) {
+  if (Boolean(threadId) === Boolean(messageId)) {
     throw new Error("Complete Slack reads require exactly one of threadId or messageId.");
   }
-  if (
+  const invalidOptions =
     opts.limit !== undefined ||
     [opts.before, opts.after, opts.around].some((value) => value?.trim()) ||
-    opts.includeThread === true
-  ) {
-    throw new Error(
-      "Complete Slack reads do not accept limit, before, after, around, or includeThread.",
-    );
+    opts.includeThread === true;
+  if (invalidOptions) {
+    throw new Error("Complete Slack reads do not accept filters or limit.");
   }
   const client = await getClient(opts);
-  const startedAtMs = Date.now(),
-    startedAt = new Date(startedAtMs).toISOString();
+  const startedAt = new Date().toISOString();
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<typeof COMPLETE_READ_TIMEOUT>((resolve) => {
-    deadlineTimer = setTimeout(() => resolve(COMPLETE_READ_TIMEOUT), COMPLETE_READ_MAX_DURATION_MS);
+    deadlineTimer = setTimeout(() => resolve(COMPLETE_READ_TIMEOUT), 30_000);
   });
-  const replies: SlackCompleteReadMessage[] = [],
-    messages: SlackCompleteReadMessage[] = [];
-  let root: SlackCompleteReadMessage | undefined;
-  let cursor = "";
-  let pages = 0;
-  let completedAt = startedAt;
+  const messages: SlackCompleteReadMessage[] = [];
+  let root: SlackCompleteReadMessage | undefined,
+    cursor = "",
+    pages = 0;
   const seenCursors = new Set([cursor]);
   const buildResult = (status: "complete" | "incomplete", finalCursor: string) => ({
     status,
@@ -557,10 +536,10 @@ async function readCompleteSlackMessages(
     channelId,
     ...(threadId ? { threadId } : {}),
     ...(root ? { root } : {}),
-    messages: threadId ? replies : messages,
-    replies,
+    messages,
+    replies: threadId ? messages : [],
     startedAt,
-    completedAt,
+    completedAt: new Date().toISOString(),
     pages,
     finalCursor,
     paginationComplete: status === "complete",
@@ -587,31 +566,24 @@ async function readCompleteSlackMessages(
       ]);
       if (result === COMPLETE_READ_TIMEOUT) {
         if (pages === 0) throw new Error("Complete Slack read timed out before any page settled.");
-        completedAt = new Date().toISOString();
         return buildResult("incomplete", cursor);
       }
       pages++;
-      const page = parseCompleteReadPage(result);
+      const page = parseCompleteReadPage(result, threadId ? 100 : 1);
       let malformed = page.malformed;
-      for (const rawMessage of page.messages) {
-        const message = normalizeCompleteReadMessage(rawMessage);
-        if (!message) {
-          malformed = true;
-          continue;
-        }
+      for (const message of page.messages) {
         if (threadId && message.ts === threadId) {
-          root = message;
-        } else if (threadId) {
-          replies.push(message);
-        } else if (message.ts === messageId) {
+          malformed ||= Boolean(root);
+          root ||= message;
+        } else if (!threadId && (message.ts !== messageId || messages.length > 0)) {
+          malformed = true;
+        } else {
           messages.push(message);
         }
       }
-      const now = Date.now();
-      completedAt = new Date(now).toISOString();
       if (
         malformed ||
-        now - startedAtMs >= COMPLETE_READ_MAX_DURATION_MS ||
+        Date.now() - Date.parse(startedAt) >= 30_000 ||
         (page.nextCursor && (pages >= 100 || seenCursors.has(page.nextCursor) || messageId))
       ) {
         return buildResult("incomplete", page.nextCursor);
