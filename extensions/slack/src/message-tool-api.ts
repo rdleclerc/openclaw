@@ -97,6 +97,19 @@ export function describeSlackMessageTool({
       actions: ["send"],
     });
   }
+  if (actions.includes("read")) {
+    schema.push({
+      properties: {
+        complete: Type.Optional(
+          Type.Boolean({
+            description:
+              "Slack-only complete read mode. Set true with exactly one threadId or messageId. The bounded result reports whether pagination completed.",
+          }),
+        ),
+      },
+      actions: ["read"],
+    });
+  }
   if (actions.includes("upload-file")) {
     schema.push({
       properties: createSlackTopLevelActionSchema(),

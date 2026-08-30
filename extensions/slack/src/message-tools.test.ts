@@ -290,6 +290,18 @@ describe("Slack message tools", () => {
     expect(property.description).toMatch(/not the Slack message timestamp\/messageId/i);
   });
 
+  it("describes complete reads as a Slack read-only boolean", () => {
+    const discovery = describeSlackMessageTool({
+      cfg: { channels: { slack: { botToken: "xoxb-test" } } },
+    });
+    const { schema, property } = requireSchemaProperty(discovery, "complete");
+
+    expect(schema.actions).toEqual(["read"]);
+    expect((property as { type?: string }).type).toBe("boolean");
+    expect(property.description).toMatch(/Slack-only complete read mode/i);
+    expect(property.description).toContain("exactly one threadId or messageId");
+  });
+
   it("describes current Slack message id actions without stale aliases", () => {
     const discovery = describeSlackMessageTool({
       cfg: {

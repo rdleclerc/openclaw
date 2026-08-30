@@ -328,6 +328,39 @@ describe("runMessageAction plugin dispatch", () => {
     mocks.prepareOutboundMirrorRoute.mockClear();
   });
 
+  it("rejects complete reads for non-Slack channels before plugin dispatch", async () => {
+    const handleAction = vi.fn(async () => jsonResult({ ok: true }));
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "discord",
+          source: "test",
+          plugin: createGatewayActionPlugin({
+            pluginId: "discord",
+            label: "Discord",
+            blurb: "Discord complete-read routing test plugin.",
+            actions: ["read"],
+            handleAction,
+          }),
+        },
+      ]),
+    );
+
+    try {
+      await expect(
+        runMessageAction({
+          cfg: { channels: { discord: { enabled: true } } } as OpenClawConfig,
+          action: "read",
+          params: { channel: "discord", to: "channel:C1", complete: true },
+          dryRun: false,
+        }),
+      ).rejects.toThrow("UNSUPPORTED_COMPLETE_READ_CHANNEL");
+      expect(handleAction).not.toHaveBeenCalled();
+    } finally {
+      setActivePluginRegistry(createTestRegistry([]));
+    }
+  });
+
   describe("alias-based plugin action dispatch", () => {
     const handleAction = vi.fn(async ({ params }: { params: Record<string, unknown> }) =>
       jsonResult({

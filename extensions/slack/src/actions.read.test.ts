@@ -69,6 +69,267 @@ describe("Slack read actions", () => {
     expect(result.messages.map((message) => message.ts)).toEqual(["171234.890", "171235.000"]);
   });
 
+  it("reads a complete thread with a normalized root and replies", async () => {
+    const client = createClient();
+    client.conversations.replies
+      .mockResolvedValueOnce({
+        messages: [
+          { ts: "root", text: "question", user: "U1", thread_ts: "root" },
+          { ts: "reply-1", text: "answer", user: "U2", thread_ts: "root" },
+        ],
+        has_more: true,
+        response_metadata: { next_cursor: "page-2" },
+      })
+      .mockResolvedValueOnce({
+        messages: [{ ts: "reply-2", text: "bot answer", bot_id: "B1", thread_ts: "root" }],
+        has_more: false,
+        response_metadata: { next_cursor: "" },
+      });
+
+    const result = await readSlackMessages("C1", {
+      client,
+      threadId: "root",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(client.conversations.replies).toHaveBeenNthCalledWith(1, {
+      channel: "C1",
+      ts: "root",
+      limit: 100,
+    });
+    expect(client.conversations.replies).toHaveBeenNthCalledWith(2, {
+      channel: "C1",
+      ts: "root",
+      limit: 100,
+      cursor: "page-2",
+    });
+    expect(result).toMatchObject({
+      status: "complete",
+      code: null,
+      channelId: "C1",
+      threadId: "root",
+      pages: 2,
+      finalCursor: "",
+      paginationComplete: true,
+      startedAt: expect.any(String),
+      completedAt: expect.any(String),
+    });
+    expect(result.root).toEqual({
+      ts: "root",
+      text: "question",
+      actorId: "U1",
+      isBot: false,
+      threadTs: "root",
+    });
+    expect(result.replies).toEqual([
+      { ts: "reply-1", text: "answer", actorId: "U2", isBot: false, threadTs: "root" },
+      {
+        ts: "reply-2",
+        text: "bot answer",
+        actorId: "B1",
+        botId: "B1",
+        isBot: true,
+        threadTs: "root",
+      },
+    ]);
+    expect(result.messages).toEqual(result.replies);
+  });
+
+  it("reads one exact channel message with bounded history parameters", async () => {
+    const client = createClient();
+    client.conversations.history.mockResolvedValueOnce({
+      messages: [{ ts: "171234.890", text: "exact", user: "U1" }],
+      has_more: false,
+      response_metadata: { next_cursor: "" },
+    });
+
+    const result = await readSlackMessages("C1", {
+      client,
+      messageId: "171234.890",
+      complete: true,
+    });
+
+    expect(client.conversations.history).toHaveBeenCalledWith({
+      channel: "C1",
+      limit: 1,
+      inclusive: true,
+      latest: "171234.890",
+      oldest: "171234.890",
+    });
+    expect(result).toMatchObject({
+      status: "complete",
+      code: null,
+      messages: [{ ts: "171234.890", text: "exact", actorId: "U1", isBot: false }],
+      replies: [],
+      pages: 1,
+      finalCursor: "",
+      paginationComplete: true,
+    });
+  });
+
+  it.each([
+    ["malformed cursor", { messages: [], response_metadata: { next_cursor: 7 } }],
+    ["malformed has_more", { messages: [], has_more: "true" }],
+    [
+      "cursor and flag conflict",
+      { messages: [], has_more: false, response_metadata: { next_cursor: "next" } },
+    ],
+    ["malformed row", { messages: [{ ts: "1", text: "missing actor" }], has_more: false }],
+  ])("returns an incomplete receipt for %s", async (_label, page) => {
+    const client = createClient();
+    client.conversations.replies.mockResolvedValueOnce(page);
+
+    const result = await readSlackMessages("C1", {
+      client,
+      threadId: "root",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(result).toMatchObject({
+      status: "incomplete",
+      code: "SLACK_READ_INCOMPLETE",
+      pages: 1,
+      paginationComplete: false,
+    });
+    expect(client.conversations.replies).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns incomplete when a thread page omits its root", async () => {
+    const client = createClient();
+    client.conversations.replies.mockResolvedValueOnce({
+      messages: [{ ts: "reply", text: "reply", user: "U1", thread_ts: "root" }],
+      has_more: false,
+    });
+
+    const result = await readSlackMessages("C1", {
+      client,
+      threadId: "root",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(result).toMatchObject({
+      status: "incomplete",
+      code: "SLACK_READ_INCOMPLETE",
+      threadId: "root",
+      pages: 1,
+      finalCursor: "",
+      paginationComplete: false,
+    });
+  });
+
+  it("returns incomplete instead of following a repeated cursor", async () => {
+    const client = createClient();
+    client.conversations.replies
+      .mockResolvedValueOnce({
+        messages: [{ ts: "root", text: "root", user: "U1" }],
+        has_more: true,
+        response_metadata: { next_cursor: "same" },
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: true,
+        response_metadata: { next_cursor: "same" },
+      });
+
+    const result = await readSlackMessages("C1", {
+      client,
+      threadId: "root",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(result).toMatchObject({
+      status: "incomplete",
+      finalCursor: "same",
+      pages: 2,
+      paginationComplete: false,
+    });
+    expect(client.conversations.replies).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns incomplete at the page cap", async () => {
+    const client = createClient();
+    client.conversations.replies.mockImplementation(async ({ cursor }: { cursor?: string }) => ({
+      messages: cursor ? [] : [{ ts: "root", text: "root", user: "U1" }],
+      has_more: true,
+      response_metadata: { next_cursor: cursor ? `next-${cursor}` : "next-1" },
+    }));
+
+    const result = await readSlackMessages("C1", {
+      client,
+      threadId: "root",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(result).toMatchObject({ status: "incomplete", pages: 100, paginationComplete: false });
+    expect(client.conversations.replies).toHaveBeenCalledTimes(100);
+  });
+
+  it("returns incomplete when the total deadline expires during a later page", async () => {
+    const client = createClient();
+    client.conversations.replies
+      .mockResolvedValueOnce({
+        messages: [{ ts: "root", text: "root", user: "U1" }],
+        has_more: true,
+        response_metadata: { next_cursor: "next" },
+      })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    vi.useFakeTimers();
+    try {
+      const resultPromise = readSlackMessages("C1", { client, threadId: "root", complete: true });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(resultPromise).resolves.toMatchObject({
+        status: "incomplete",
+        pages: 1,
+        finalCursor: "next",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns incomplete for an exact message with any cursor", async () => {
+    const client = createClient();
+    client.conversations.history.mockResolvedValueOnce({
+      messages: [{ ts: "exact", text: "exact", user: "U1" }],
+      has_more: true,
+      response_metadata: { next_cursor: "next" },
+    });
+
+    const result = await readSlackMessages("C1", {
+      client,
+      messageId: "exact",
+      complete: true,
+      token: "xoxb-test",
+    });
+
+    expect(result).toMatchObject({ status: "incomplete", pages: 1, finalCursor: "next" });
+    expect(client.conversations.history).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects invalid complete targets and filters before client I/O", async () => {
+    const client = createClient();
+    for (const options of [
+      { complete: true },
+      { complete: true, threadId: "root", messageId: "exact" },
+      { complete: true, threadId: "root", limit: 1 },
+      { complete: true, threadId: "root", before: "1" },
+      { complete: true, threadId: "root", after: "1" },
+      { complete: true, threadId: "root", around: "1" },
+      { complete: true, threadId: "root", includeThread: true },
+    ]) {
+      await expect(readSlackMessages("C1", { client, ...options } as never)).rejects.toThrow(
+        /Complete Slack reads/,
+      );
+    }
+    expect(client.conversations.replies).not.toHaveBeenCalled();
+    expect(client.conversations.history).not.toHaveBeenCalled();
+  });
+
   it("filters a specific thread reply by messageId", async () => {
     const client = createClient();
     client.conversations.replies.mockResolvedValueOnce({

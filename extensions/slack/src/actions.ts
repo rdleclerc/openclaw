@@ -3,6 +3,7 @@ import type { Block, KnownBlock, WebClient } from "@slack/web-api";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { z } from "zod";
 import { resolveSlackAccount } from "./accounts.js";
 import type { SlackAuthoredTextPlacement } from "./authored-text.js";
@@ -51,6 +52,12 @@ export type SlackMessageSummary = {
   }>;
 };
 
+export type SlackCompleteReadMessage = Record<"ts" | "text" | "actorId", string> & {
+  isBot: boolean;
+  botId?: string;
+  clientMessageId?: string;
+  threadTs?: string;
+};
 export type SlackPin = {
   type?: string;
   message?: { ts?: string; text?: string };
@@ -447,16 +454,202 @@ export async function resolveSlackConversationName(
   return info.channel?.name?.trim() || undefined;
 }
 
+const COMPLETE_READ_MAX_DURATION_MS = 30_000;
+const COMPLETE_READ_TIMEOUT = Symbol("complete-read-timeout");
+type SlackReadOptions = SlackActionClientOpts & {
+  limit?: number;
+  before?: string;
+  after?: string;
+  threadId?: string;
+  messageId?: string;
+  around?: string;
+  includeThread?: boolean;
+  complete?: boolean;
+};
+
+function normalizeCompleteReadMessage(value: unknown): SlackCompleteReadMessage | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.ts !== "string" ||
+    !value.ts.trim() ||
+    typeof value.text !== "string"
+  )
+    return;
+  const read = (key: string): string | null | undefined => {
+    const raw = value[key];
+    return raw === undefined ? undefined : typeof raw === "string" && raw.trim() ? raw : null;
+  };
+  const fields = ["user", "bot_id", "client_msg_id", "thread_ts"];
+  const [user, bot, clientMessageId, threadTs] = fields.map(read);
+  const actorId = bot ?? user;
+  if (!actorId || [user, bot, clientMessageId, threadTs].includes(null)) return;
+  return {
+    ts: value.ts,
+    text: value.text,
+    actorId,
+    ...(bot ? { botId: bot } : {}),
+    isBot: Boolean(bot),
+    ...(clientMessageId ? { clientMessageId } : {}),
+    ...(threadTs ? { threadTs } : {}),
+  };
+}
+
+function parseCompleteReadPage(value: unknown) {
+  if (!isRecord(value) || !Array.isArray(value.messages)) {
+    return { messages: [], nextCursor: "", malformed: true };
+  }
+  const metadata = value.response_metadata;
+  const rawCursor =
+    metadata === undefined ? undefined : isRecord(metadata) ? metadata.next_cursor : null;
+  const nextCursor =
+    rawCursor === undefined
+      ? ""
+      : typeof rawCursor === "string" && rawCursor.trim() === rawCursor
+        ? rawCursor
+        : null;
+  const hasMore = value.has_more;
+  return {
+    messages: value.messages,
+    nextCursor: nextCursor ?? "",
+    malformed:
+      nextCursor === null ||
+      (hasMore !== undefined && typeof hasMore !== "boolean") ||
+      (hasMore === true && !nextCursor) ||
+      (hasMore === false && Boolean(nextCursor)),
+  };
+}
+
+async function readCompleteSlackMessages(
+  channelId: string,
+  opts: SlackReadOptions & { complete: true },
+) {
+  const threadId = opts.threadId?.trim();
+  const messageId = opts.messageId?.trim();
+  if ((threadId ? 1 : 0) + (messageId ? 1 : 0) !== 1) {
+    throw new Error("Complete Slack reads require exactly one of threadId or messageId.");
+  }
+  if (
+    opts.limit !== undefined ||
+    [opts.before, opts.after, opts.around].some((value) => value?.trim()) ||
+    opts.includeThread === true
+  ) {
+    throw new Error(
+      "Complete Slack reads do not accept limit, before, after, around, or includeThread.",
+    );
+  }
+  const client = await getClient(opts);
+  const startedAtMs = Date.now(),
+    startedAt = new Date(startedAtMs).toISOString();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<typeof COMPLETE_READ_TIMEOUT>((resolve) => {
+    deadlineTimer = setTimeout(() => resolve(COMPLETE_READ_TIMEOUT), COMPLETE_READ_MAX_DURATION_MS);
+  });
+  const replies: SlackCompleteReadMessage[] = [],
+    messages: SlackCompleteReadMessage[] = [];
+  let root: SlackCompleteReadMessage | undefined;
+  let cursor = "";
+  let pages = 0;
+  let completedAt = startedAt;
+  const seenCursors = new Set([cursor]);
+  const buildResult = (status: "complete" | "incomplete", finalCursor: string) => ({
+    status,
+    code: status === "complete" ? null : "SLACK_READ_INCOMPLETE",
+    channelId,
+    ...(threadId ? { threadId } : {}),
+    ...(root ? { root } : {}),
+    messages: threadId ? replies : messages,
+    replies,
+    startedAt,
+    completedAt,
+    pages,
+    finalCursor,
+    paginationComplete: status === "complete",
+  });
+  try {
+    while (true) {
+      const result = await Promise.race([
+        threadId
+          ? client.conversations.replies({
+              channel: channelId,
+              ts: threadId,
+              limit: 100,
+              ...(cursor ? { cursor } : {}),
+            })
+          : client.conversations.history({
+              channel: channelId,
+              limit: 1,
+              inclusive: true,
+              latest: messageId,
+              oldest: messageId,
+              ...(cursor ? { cursor } : {}),
+            }),
+        deadline,
+      ]);
+      if (result === COMPLETE_READ_TIMEOUT) {
+        if (pages === 0) throw new Error("Complete Slack read timed out before any page settled.");
+        completedAt = new Date().toISOString();
+        return buildResult("incomplete", cursor);
+      }
+      pages++;
+      const page = parseCompleteReadPage(result);
+      let malformed = page.malformed;
+      for (const rawMessage of page.messages) {
+        const message = normalizeCompleteReadMessage(rawMessage);
+        if (!message) {
+          malformed = true;
+          continue;
+        }
+        if (threadId && message.ts === threadId) {
+          root = message;
+        } else if (threadId) {
+          replies.push(message);
+        } else if (message.ts === messageId) {
+          messages.push(message);
+        }
+      }
+      const now = Date.now();
+      completedAt = new Date(now).toISOString();
+      if (
+        malformed ||
+        now - startedAtMs >= COMPLETE_READ_MAX_DURATION_MS ||
+        (page.nextCursor && (pages >= 100 || seenCursors.has(page.nextCursor) || messageId))
+      ) {
+        return buildResult("incomplete", page.nextCursor);
+      }
+      if (!page.nextCursor) {
+        return buildResult(threadId && !root ? "incomplete" : "complete", "");
+      }
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+  } finally {
+    clearTimeout(deadlineTimer);
+  }
+}
+
+type SlackCompleteReadResult = Awaited<ReturnType<typeof readCompleteSlackMessages>>;
+
+export function readSlackMessages(
+  channelId: string,
+  opts: SlackReadOptions & { complete: true },
+): Promise<SlackCompleteReadResult>;
+export function readSlackMessages(
+  channelId: string,
+  opts?: SlackReadOptions,
+): Promise<{ messages: SlackMessageSummary[]; hasMore: boolean }>;
 export async function readSlackMessages(
   channelId: string,
-  opts: SlackActionClientOpts & {
-    limit?: number;
-    before?: string;
-    after?: string;
-    threadId?: string;
-    messageId?: string;
-  } = {},
-): Promise<{ messages: SlackMessageSummary[]; hasMore: boolean }> {
+  opts: SlackReadOptions = {},
+): Promise<
+  | SlackCompleteReadResult
+  | {
+      messages: SlackMessageSummary[];
+      hasMore: boolean;
+    }
+> {
+  if (opts.complete === true) {
+    return await readCompleteSlackMessages(channelId, { ...opts, complete: true });
+  }
   const exactMessageId = opts.messageId?.trim();
   const readLimit = exactMessageId ? 1 : opts.limit;
   const exactBounds = exactMessageId

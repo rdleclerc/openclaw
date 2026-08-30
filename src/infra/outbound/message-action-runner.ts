@@ -1705,6 +1705,12 @@ export async function runMessageAction(
     agentId: resolvedAgentId,
     action,
   });
+  const completeRead = readBooleanParam(params, "complete") === true;
+  if (completeRead && action !== "read") {
+    throw new Error(
+      'UNSUPPORTED_COMPLETE_READ_CHANNEL: complete reads require action "read" on Slack.',
+    );
+  }
   if (action === "broadcast") {
     return handleBroadcastAction(input, params);
   }
@@ -1721,6 +1727,9 @@ export async function runMessageAction(
     throw new Error(`Action ${action} requires a target.`);
   }
   const channel = await resolveChannel(cfg, params, input.toolContext);
+  if (completeRead && normalizeOptionalLowercaseString(channel) !== "slack") {
+    throw new Error("UNSUPPORTED_COMPLETE_READ_CHANNEL: complete reads require Slack.");
+  }
   params.channel = channel;
   const channelPlugin = resolveOutboundChannelPlugin({ channel, cfg });
   const pluginOwnedAction = action !== "send" && action !== "poll";

@@ -892,6 +892,30 @@ export async function handleSlackAction(
       }
       case "readMessages": {
         const channelId = resolveChannelId();
+        const complete = readBooleanParam(params, "complete") === true;
+        if (complete) {
+          const threadId = readStringParam(params, "threadId");
+          const messageId = readStringParam(params, "messageId");
+          if (
+            params.limit !== undefined ||
+            ["before", "after", "around"].some(
+              (key) => readStringParam(params, key) !== undefined,
+            ) ||
+            readBooleanParam(params, "includeThread") === true
+          ) {
+            throw new Error(
+              "Complete Slack reads do not accept limit, before, after, around, or includeThread.",
+            );
+          }
+          await assertReadTargetAllowed(channelId);
+          const result = await slackActionRuntime.readSlackMessages(channelId, {
+            ...readOpts,
+            complete: true,
+            threadId,
+            messageId,
+          });
+          return jsonResult(result);
+        }
         await assertReadTargetAllowed(channelId);
         const limit = readPositiveIntegerParam(params, "limit", {
           message: "limit must be a positive integer.",

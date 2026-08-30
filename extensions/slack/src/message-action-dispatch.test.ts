@@ -856,6 +856,28 @@ describe("handleSlackMessageAction", () => {
     expect(firstInvokeCall(invoke)[1]).toEqual({});
   });
 
+  it("forwards complete read targets through the ordinary read action", async () => {
+    const invoke = createInvokeSpy();
+    await handleSlackMessageAction({
+      providerId: "slack",
+      includeReadThreadId: true,
+      ctx: {
+        action: "read",
+        cfg: {},
+        params: { channelId: "C1", threadId: "171234.567", complete: true },
+      } as never,
+      invoke: invoke as never,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(firstAction(invoke)).toMatchObject({
+      action: "readMessages",
+      channelId: "C1",
+      threadId: "171234.567",
+      complete: true,
+    });
+  });
+
   it("rejects fractional read limits before invoking Slack actions", async () => {
     const invoke = createInvokeSpy();
 
