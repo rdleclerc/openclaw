@@ -58,4 +58,13 @@
   five-file manifest, exact package source, R3 terminal evidence, and plan
   review. Phase 1 can change only the two test owners and write the red receipt.
 - Attempt: implementation attempt 1 of 1.
-- Status: pending dispatch after the approval receipt commit.
+- Worker task: `/root/fs_safe_stage0_r4_luna`.
+- Status: Phase 1 complete. Phase 2 is pending.
+- Red result: 30 failed and 32 passed across 62 tests, with all seven required
+  failure groups.
+- Test budgets: direct owner 783 changed lines; JSON owner 12 changed lines.
+- Autoreview: exit 1 with three findings. All three findings were rejected as
+  non-actionable because they target call paths that differ from the exact
+  published 0.4.1 package or remove a required red failure.
+- Accepted or actionable findings: none.
+- Receipt: `red-proof.md`.

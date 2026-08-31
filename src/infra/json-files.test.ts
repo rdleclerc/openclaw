@@ -112,7 +112,7 @@ describe("json file helpers", () => {
     });
   });
 
-  it("preserves text when Windows rename reports EPERM", async () => {
+  it("propagates Windows rename EPERM and preserves text", async () => {
     await withTempDir({ prefix: "openclaw-json-files-" }, async (base) => {
       const filePath = path.join(base, "state.json");
       await fsPromises.writeFile(filePath, "old", "utf8");
@@ -121,10 +121,10 @@ describe("json file helpers", () => {
       const renameError = Object.assign(new Error("EPERM"), { code: "EPERM" });
       const renameSpy = vi.spyOn(fsPromises, "rename").mockRejectedValueOnce(renameError);
 
-      await writeTextAtomic(filePath, "new");
+      await expect(writeTextAtomic(filePath, "new")).rejects.toBe(renameError);
 
       expect(renameSpy).toHaveBeenCalledOnce();
-      await expect(fsPromises.readFile(filePath, "utf8")).resolves.toBe("new");
+      await expect(fsPromises.readFile(filePath, "utf8")).resolves.toBe("old");
     });
   });
 
@@ -151,7 +151,7 @@ describe("json file helpers", () => {
     });
   });
 
-  it("refuses Windows copy fallback through symlink destinations", async () => {
+  it("propagates Windows rename EPERM and preserves symlink destinations", async () => {
     await withTempDir({ prefix: "openclaw-json-files-" }, async (base) => {
       const filePath = path.join(base, "state.json");
       const outsidePath = path.join(base, "outside.json");
@@ -162,9 +162,7 @@ describe("json file helpers", () => {
       const renameError = Object.assign(new Error("EPERM"), { code: "EPERM" });
       vi.spyOn(fsPromises, "rename").mockRejectedValueOnce(renameError);
 
-      await expect(writeTextAtomic(filePath, "new")).rejects.toThrow(
-        "Refusing copy fallback through symlink destination",
-      );
+      await expect(writeTextAtomic(filePath, "new")).rejects.toBe(renameError);
 
       const fileStat = await fsPromises.lstat(filePath);
       expect(fileStat.isSymbolicLink()).toBe(true);
