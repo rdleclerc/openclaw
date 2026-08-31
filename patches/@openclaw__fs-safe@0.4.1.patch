@@ -1,3 +1,16 @@
+diff --git a/README.md b/README.md
+index 3cfce6a32bc053b9f2970562ca29b934faafca68..c72385e2a135363f24fdd49334b080edeeb36d72 100644
+--- a/README.md
++++ b/README.md
+@@ -218,7 +218,7 @@ JSON5-backed plugin manifests.
+ 
+ ## Atomic writes
+ 
+-`replaceFileAtomic()` writes a sibling temp file, optionally fsyncs it, and renames it over the destination. Mode preservation, rename retry / copy fallback on `EPERM`, parent-directory fsync, and a `beforeRename` hook for backup or observer flows are all opt-in. `movePathWithCopyFallback()` stages cross-device moves before commit and removes only the copied source entries, so concurrent source additions or replacements are preserved.
++`replaceFileAtomic()` writes a sibling temp file, optionally fsyncs it, and renames it over the destination. Mode preservation, rename retry, parent-directory fsync, and a `beforeRename` hook for backup or observer flows are all opt-in. Terminal rename permission failures (`EPERM`/`EEXIST`) fail closed and preserve the destination. `movePathWithCopyFallback()` stages cross-device moves before commit and removes only the copied source entries, so concurrent source additions or replacements are preserved.
+ 
+ ```ts
+ import { replaceFileAtomic } from "@openclaw/fs-safe/atomic";
 diff --git a/dist/pinned-python.js b/dist/pinned-python.js
 index c6177eaf56295780ef2edba47ca8bee02cdcdbf2..f6f361974d48f8f4abd3f1e47f1fdb10bc3f2f77 100644
 --- a/dist/pinned-python.js
@@ -70,3 +83,310 @@ index 77d0ddfa5a1df2de0449c806d19781daaed4910b..09dd77aef95659865b93ce29e15f26e8
          await handle.close().catch(() => undefined);
          handle = undefined;
          await withAsyncDirectoryGuards([parentGuard], async () => {
+diff --git a/dist/replace-file.js b/dist/replace-file.js
+index 81cc63607654964f9826f7f3016976fa7a5d3f29..5538aedcf327655243baf34214c0c56c2bcdb9ce 100644
+--- a/dist/replace-file.js
++++ b/dist/replace-file.js
+@@ -8,16 +8,6 @@ import { serializePathWrite } from "./write-queue.js";
+ function isRetryableRenameError(error) {
+     return error.code === "EBUSY";
+ }
+-function isPermissionRenameError(error) {
+-    const code = error.code;
+-    return code === "EPERM" || code === "EEXIST";
+-}
+-const SUPPORTS_NOFOLLOW = process.platform !== "win32" && "O_NOFOLLOW" in syncFs.constants;
+-const OPEN_READ_FLAGS = syncFs.constants.O_RDONLY | (SUPPORTS_NOFOLLOW ? syncFs.constants.O_NOFOLLOW : 0);
+-const OPEN_WRITE_EXCLUSIVE_FLAGS = syncFs.constants.O_WRONLY |
+-    syncFs.constants.O_CREAT |
+-    syncFs.constants.O_EXCL |
+-    (SUPPORTS_NOFOLLOW ? syncFs.constants.O_NOFOLLOW : 0);
+ async function sleep(ms) {
+     await new Promise((resolve) => setTimeout(resolve, ms));
+ }
+@@ -32,10 +22,6 @@ async function renameWithRetry(params) {
+                 await sleep(params.baseDelayMs * 2 ** attempt);
+                 continue;
+             }
+-            if (params.copyFallbackOnPermissionError && isPermissionRenameError(error)) {
+-                await copyFallbackReplace(params.fsModule, params.src, params.dest);
+-                return { method: "copy-fallback" };
+-            }
+             throw error;
+         }
+     }
+@@ -58,97 +44,11 @@ function renameWithRetrySync(params) {
+                 sleepSync(params.baseDelayMs * 2 ** attempt);
+                 continue;
+             }
+-            if (params.copyFallbackOnPermissionError && isPermissionRenameError(error)) {
+-                copyFallbackReplaceSync(params.fsModule, params.src, params.dest);
+-                return { method: "copy-fallback" };
+-            }
+             throw error;
+         }
+     }
+     throw new Error("Atomic rename retry loop exhausted.");
+ }
+-async function copyFallbackReplace(fsModule, src, dest) {
+-    const sourceStat = await fsModule.lstat(src);
+-    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+-        throw new Error(`Refusing copy fallback from non-file source: ${src}`);
+-    }
+-    const destStat = await fsModule.lstat(dest).catch((lstatError) => {
+-        if (lstatError.code === "ENOENT") {
+-            return null;
+-        }
+-        throw lstatError;
+-    });
+-    if (destStat?.isSymbolicLink()) {
+-        throw new Error(`Refusing copy fallback through symlink destination: ${dest}`);
+-    }
+-    if (destStat) {
+-        await fsModule.rm(dest, { force: true });
+-    }
+-    let sourceHandle = null;
+-    let destHandle = null;
+-    try {
+-        sourceHandle = await fsModule.open(src, OPEN_READ_FLAGS);
+-        destHandle = await fsModule.open(dest, OPEN_WRITE_EXCLUSIVE_FLAGS, sourceStat.mode & 0o777);
+-        await destHandle.writeFile(await sourceHandle.readFile());
+-    }
+-    finally {
+-        await destHandle?.close().catch(() => undefined);
+-        await sourceHandle?.close().catch(() => undefined);
+-    }
+-    await fsModule.unlink(src).catch(() => undefined);
+-}
+-function copyFallbackReplaceSync(fsModule, src, dest) {
+-    const sourceStat = fsModule.lstatSync(src);
+-    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+-        throw new Error(`Refusing copy fallback from non-file source: ${src}`);
+-    }
+-    let destStat = null;
+-    try {
+-        destStat = fsModule.lstatSync(dest);
+-    }
+-    catch (lstatError) {
+-        if (lstatError.code !== "ENOENT") {
+-            throw lstatError;
+-        }
+-    }
+-    if (destStat?.isSymbolicLink()) {
+-        throw new Error(`Refusing copy fallback through symlink destination: ${dest}`);
+-    }
+-    if (destStat) {
+-        fsModule.rmSync(dest, { force: true });
+-    }
+-    let sourceFd;
+-    let destFd;
+-    try {
+-        sourceFd = fsModule.openSync(src, OPEN_READ_FLAGS);
+-        destFd = fsModule.openSync(dest, OPEN_WRITE_EXCLUSIVE_FLAGS, sourceStat.mode & 0o777);
+-        fsModule.writeFileSync(destFd, fsModule.readFileSync(sourceFd));
+-    }
+-    finally {
+-        if (destFd !== undefined) {
+-            try {
+-                fsModule.closeSync(destFd);
+-            }
+-            catch {
+-                // Best-effort close after fallback replacement.
+-            }
+-        }
+-        if (sourceFd !== undefined) {
+-            try {
+-                fsModule.closeSync(sourceFd);
+-            }
+-            catch {
+-                // Best-effort close after fallback replacement.
+-            }
+-        }
+-    }
+-    try {
+-        fsModule.unlinkSync(src);
+-    }
+-    catch {
+-        // Best-effort cleanup after fallback replacement.
+-    }
+-}
+ function validateReplaceFilePath(filePath) {
+     if (!filePath || filePath.includes("\0")) {
+         throw new Error("Atomic replace file path must be non-empty.");
+@@ -272,14 +172,15 @@ async function replaceFileAtomicUnserialized(options) {
+     const dirMode = options.dirMode ?? 0o700;
+     const mode = await resolveMode(options);
+     const tempPath = buildReplaceTempPath(filePath, options.tempPrefix);
+-    const unregisterTempPath = registerTempPathForExit(tempPath);
++    let unregisterTempPath;
+     let tempExists = false;
+     let originalError;
+     await fsModule.mkdir(dir, { recursive: true, mode: dirMode });
+     await fsModule.chmod(dir, dirMode).catch(() => undefined);
+     try {
+-        tempExists = true;
+         await fsModule.writeFile(tempPath, options.content, { mode, flag: "wx" });
++        tempExists = true;
++        unregisterTempPath = registerTempPathForExit(tempPath);
+         if (options.syncTempFile) {
+             await syncTempFile(fsModule, tempPath);
+         }
+@@ -292,10 +193,9 @@ async function replaceFileAtomicUnserialized(options) {
+             dest: filePath,
+             maxRetries: options.renameMaxRetries ?? 0,
+             baseDelayMs: options.renameRetryBaseDelayMs ?? 50,
+-            copyFallbackOnPermissionError: options.copyFallbackOnPermissionError === true,
+         });
+         tempExists = false;
+-        unregisterTempPath();
++        unregisterTempPath?.();
+         await fsModule.chmod(filePath, mode).catch(() => undefined);
+         if (options.syncParentDir) {
+             await syncDirectoryBestEffort(fsModule, dir);
+@@ -307,15 +207,19 @@ async function replaceFileAtomicUnserialized(options) {
+         throw error;
+     }
+     finally {
+-        if (tempExists) {
+-            await cleanupTempFile({
+-                fsModule,
+-                tempPath,
+-                originalError,
+-                throwOnCleanupError: options.throwOnCleanupError === true,
+-            });
++        try {
++            if (tempExists) {
++                await cleanupTempFile({
++                    fsModule,
++                    tempPath,
++                    originalError,
++                    throwOnCleanupError: options.throwOnCleanupError === true,
++                });
++            }
++        }
++        finally {
++            unregisterTempPath?.();
+         }
+-        unregisterTempPath();
+     }
+ }
+ export function replaceFileAtomicSync(options) {
+@@ -326,7 +230,7 @@ export function replaceFileAtomicSync(options) {
+     const dirMode = options.dirMode ?? 0o700;
+     const mode = resolveModeSync(options);
+     const tempPath = buildReplaceTempPath(filePath, options.tempPrefix);
+-    const unregisterTempPath = registerTempPathForExit(tempPath);
++    let unregisterTempPath;
+     let tempExists = false;
+     let originalError;
+     fsModule.mkdirSync(dir, { recursive: true, mode: dirMode });
+@@ -337,8 +241,9 @@ export function replaceFileAtomicSync(options) {
+         // Best-effort on platforms that do not enforce POSIX modes.
+     }
+     try {
+-        tempExists = true;
+         fsModule.writeFileSync(tempPath, options.content, { mode, flag: "wx" });
++        tempExists = true;
++        unregisterTempPath = registerTempPathForExit(tempPath);
+         if (options.syncTempFile) {
+             syncTempFileSync(fsModule, tempPath);
+         }
+@@ -351,10 +256,9 @@ export function replaceFileAtomicSync(options) {
+             dest: filePath,
+             maxRetries: options.renameMaxRetries ?? 0,
+             baseDelayMs: options.renameRetryBaseDelayMs ?? 50,
+-            copyFallbackOnPermissionError: options.copyFallbackOnPermissionError === true,
+         });
+         tempExists = false;
+-        unregisterTempPath();
++        unregisterTempPath?.();
+         try {
+             fsModule.chmodSync(filePath, mode);
+         }
+@@ -371,17 +275,21 @@ export function replaceFileAtomicSync(options) {
+         throw error;
+     }
+     finally {
+-        if (tempExists) {
+-            try {
+-                fsModule.rmSync(tempPath, { force: true });
+-            }
+-            catch (cleanupError) {
+-                if (options.throwOnCleanupError && originalError !== undefined) {
+-                    throw new Error(`Atomic file replace failed (${String(originalError)}); cleanup also failed (${String(cleanupError)})`, { cause: originalError });
++        try {
++            if (tempExists) {
++                try {
++                    fsModule.rmSync(tempPath, { force: true });
++                }
++                catch (cleanupError) {
++                    if (options.throwOnCleanupError && originalError !== undefined) {
++                        throw new Error(`Atomic file replace failed (${String(originalError)}); cleanup also failed (${String(cleanupError)})`, { cause: originalError });
++                    }
++                    // The temp file is best-effort cleanup after write failure.
+                 }
+-                // The temp file is best-effort cleanup after write failure.
+             }
+         }
+-        unregisterTempPath();
++        finally {
++            unregisterTempPath?.();
++        }
+     }
+ }
+diff --git a/docs/atomic.md b/docs/atomic.md
+index deb56f0b74d651478a91f91779281f71f50d6676..783030eddaf30a86da961bfeb91655fd81562ed1 100644
+--- a/docs/atomic.md
++++ b/docs/atomic.md
+@@ -42,7 +42,7 @@ type ReplaceFileAtomicOptions = {
+   tempPrefix?: string;
+   renameMaxRetries?: number;
+   renameRetryBaseDelayMs?: number;
+-  copyFallbackOnPermissionError?: boolean;
++  copyFallbackOnPermissionError?: boolean; // retained for compatibility; terminal rename errors remain fail-closed
+   syncTempFile?: boolean;           // fsync(temp) before rename
+   syncParentDir?: boolean;          // fsync(parent) after rename (POSIX only)
+   beforeRename?: (params: { filePath: string; tempPath: string }) => Promise<void>;
+@@ -66,14 +66,12 @@ await replaceFileAtomic({
+ 
+ If `beforeRename` throws, the rename is skipped and the temp file is removed — the destination is unchanged.
+ 
+-### `EPERM` and copy fallback
++### Terminal rename errors
+ 
+-On systems where `rename` fails with `EPERM`/`EEXIST`, pass
+-`copyFallbackOnPermissionError: true` to fall back to a non-atomic copy
+-replacement. The fallback removes the old destination, opens the replacement
+-with exclusive/no-follow flags where the platform supports them, and refuses
+-known symlink destinations so it does not write through a replaced destination
+-link.
++Terminal `rename` failures with `EPERM` or `EEXIST` are propagated
++unchanged. The `copyFallbackOnPermissionError` option remains accepted for
++source compatibility, but it does not enable a destructive copy fallback. The
++destination remains unchanged when the rename fails.
+ 
+ ### Sync variant
+ 
+@@ -102,7 +100,8 @@ Atomic UTF-8 text write with the same secure defaults as `writeJson`: sibling
+ temp file, temp fsync, rename, parent fsync, and final chmod best-effort.
+ It delegates to `replaceFileAtomic()` with a smaller call shape. Use it when
+ you do not need replacement hooks such as `beforeRename`, `preserveExistingMode`,
+-or custom copy-fallback policy.
++or custom rename-error policy. Terminal `EPERM`/`EEXIST` failures remain
++fail-closed.
+ 
+ ```ts
+ import { writeTextAtomic } from "@openclaw/fs-safe/atomic";
+diff --git a/docs/index.md b/docs/index.md
+index 59866a3f5309b69a97ea6b742f269bdcfb8d469a..590df733809d5966016c89176b058a011c2209b3 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -51,7 +51,7 @@ await fs.remove("notes/archive/today.txt");
+ | [`root()`](root.md) | One boundary for read/write/move/remove inside a trusted directory. |
+ | [`@openclaw/fs-safe/config`](config.md) | Process-global Python helper and lock-option defaults. |
+ | [Python helper policy](python-helper.md) | Choose `auto`, `off`, or `require` for POSIX fd-relative hardening. |
+-| [`replaceFileAtomic`](atomic.md) | Sibling-temp + rename, fsync hooks, mode preservation, copy fallback. |
++| [`replaceFileAtomic`](atomic.md) | Sibling-temp + rename, fsync hooks, mode preservation, fail-closed terminal rename errors. |
+ | [`writeExternalFileWithinRoot`](output.md) | Stage external-library file output in private temp storage, then finalize under a root. |
+ | [`writeJson` / `readJson*`](json.md) | JSON state files with strict and lenient read variants. |
+ | [`@openclaw/fs-safe/store`](store.md) | Overview of `fileStore`, `fileStoreSync`, and `jsonStore`. |

@@ -80,4 +80,13 @@
   `6a299404b8d7bc90dcbf02a762b49e420b25417c`. Tests are frozen. Only the
   package patch, lockfile, guard comment, and green receipt can change.
 - Attempt: Phase 2 follow-up in implementation attempt 1 of 1.
-- Status: pending dispatch.
+- Status: complete. The product commit is pending parent inspection.
+- Package patch: 392 lines, six sections, 20 context-bearing hunks.
+- Package patch SHA-256:
+  `9cb2b91283ac7a5b6ae3d1e4d28375af94e2628be47b14f9ea32d120cf227c42`.
+- Intended, manual, and overlay package trees: equal, 310 manifest rows.
+- Focused proof: 62 of 62 tests and five of five patch-guard tests passed.
+- Autoreview: exit 1 with one P2 finding. The finding conflicts with the
+  reviewed ownership order and accepted pre-registration orphan trade-off.
+- Accepted or actionable findings: none.
+- Receipt: `green-proof.md`.
