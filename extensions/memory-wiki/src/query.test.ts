@@ -527,6 +527,65 @@ describe("searchMemoryWiki", () => {
     expect(routeResults[0]?.path).toBe("entities/brad.md");
   });
 
+  it("does not rescan the compiled vault to pad digest matches", async () => {
+    const { rootDir, config } = await createQueryVault({ initialize: true });
+    await fs.writeFile(
+      path.join(rootDir, "entities", "areti.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "entity",
+          id: "entity.areti",
+          title: "Areti",
+        },
+        body: "# Areti\n\nClinical trial recruitment company.\n",
+      }),
+      "utf8",
+    );
+    const latePagePath = path.join(rootDir, "entities", "unrelated.md");
+    await fs.writeFile(
+      latePagePath,
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "entity",
+          id: "entity.unrelated",
+          title: "Unrelated",
+        },
+        body: "# Unrelated\n\nNo matching terms.\n",
+      }),
+      "utf8",
+    );
+    await compileMemoryWikiVault(config);
+    await fs.writeFile(
+      latePagePath,
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "entity",
+          id: "entity.unrelated",
+          title: "Unrelated",
+        },
+        body: "# Unrelated\n\nAreti appeared after the compiled digest.\n",
+      }),
+      "utf8",
+    );
+
+    const results = await searchMemoryWiki({
+      config,
+      query: "Areti",
+      maxResults: 10,
+      compiledDigestOnly: true,
+    });
+
+    expect(collectWikiResultPaths(results)).toEqual(["entities/areti.md"]);
+
+    const noDigestMatch = await searchMemoryWiki({
+      config,
+      query: "appeared after",
+      maxResults: 10,
+      compiledDigestOnly: true,
+    });
+    expect(collectWikiResultPaths(noDigestMatch)).toEqual([]);
+  });
+
   it("uses body text instead of frontmatter for fallback snippets", async () => {
     const { rootDir, config } = await createQueryVault({
       initialize: true,

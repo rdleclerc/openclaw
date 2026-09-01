@@ -27,6 +27,9 @@ export function createWikiCorpusSupplement(params: {
         maxResults: input.maxResults,
         searchBackend: "local",
         searchCorpus: "wiki",
+        // memory_search already has a primary indexed corpus. Keep this additive
+        // compiled-wiki pass on its digest instead of rescanning the whole vault.
+        compiledDigestOnly: true,
       });
     },
     get: async (input: {

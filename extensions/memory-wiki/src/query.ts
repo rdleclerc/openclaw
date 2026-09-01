@@ -1411,6 +1411,7 @@ async function searchWikiCorpus(params: {
   query: string;
   maxResults: number;
   mode: WikiSearchMode;
+  compiledDigestOnly?: boolean;
 }): Promise<WikiSearchResult[]> {
   const digest = await readQueryDigestBundle(params.rootDir);
   const candidatePaths = digest
@@ -1425,7 +1426,9 @@ async function searchWikiCorpus(params: {
   const candidatePages =
     candidatePaths.length > 0
       ? await readQueryableWikiPagesByPaths(params.rootDir, candidatePaths)
-      : await readQueryableWikiPages(params.rootDir);
+      : params.compiledDigestOnly
+        ? []
+        : await readQueryableWikiPages(params.rootDir);
   for (const page of candidatePages) {
     seenPaths.add(page.relativePath);
   }
@@ -1433,7 +1436,11 @@ async function searchWikiCorpus(params: {
   const results = candidatePages
     .map((page) => toWikiSearchResult(page, params.query, params.mode))
     .filter((page) => page.score > 0);
-  if (candidatePaths.length === 0 || results.length >= params.maxResults) {
+  if (
+    params.compiledDigestOnly ||
+    candidatePaths.length === 0 ||
+    results.length >= params.maxResults
+  ) {
     return results;
   }
 
@@ -1483,6 +1490,7 @@ export async function searchMemoryWiki(params: {
   searchBackend?: WikiSearchBackend;
   searchCorpus?: WikiSearchCorpus;
   mode?: WikiSearchMode;
+  compiledDigestOnly?: boolean;
 }): Promise<WikiSearchResult[]> {
   const effectiveConfig = applySearchOverrides(params.config, params);
   assertSessionVisibilityAppConfig({
@@ -1503,6 +1511,7 @@ export async function searchMemoryWiki(params: {
         query: params.query,
         maxResults,
         mode,
+        compiledDigestOnly: params.compiledDigestOnly,
       })
     : [];
 
