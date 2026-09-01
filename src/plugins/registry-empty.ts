@@ -55,6 +55,7 @@ export function createEmptyPluginRegistry(): PluginRegistry {
     sessionSchedulerJobs: [],
     sessionActions: [],
     conversationBindingResolvedHandlers: [],
+    restartBlockers: [],
     diagnostics: [],
   };
 }

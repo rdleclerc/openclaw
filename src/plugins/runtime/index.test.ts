@@ -125,6 +125,7 @@ describe("plugin runtime command execution", () => {
       agentWaitProviderStarted: true,
       agentWaitTimeoutPhase: true,
       auditAgentRunSourceSequence: true,
+      channelIngressRestartBarrier: true,
       sessionsAbortDurableTerminal: true,
     });
     expect(Object.isFrozen(capabilities)).toBe(true);

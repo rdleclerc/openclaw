@@ -1,7 +1,10 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeOptionalAgentRuntimeId } from "../agents/agent-runtime-id.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
-import { createChannelIngressQueue } from "../channels/message/ingress-queue.js";
+import {
+  countOpenChannelIngressQueueEntries,
+  createChannelIngressQueue,
+} from "../channels/message/ingress-queue.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import {
   admitGaiaKeyedOutput,
@@ -33,6 +36,7 @@ import {
   withPluginRuntimePluginIdScope,
   withPluginRuntimePluginScope,
 } from "./runtime/gateway-request-scope.js";
+import type { RuntimeChannelIngressQueueOptions } from "./runtime/types-core.js";
 import type { PluginRuntime } from "./runtime/types.js";
 
 const PLUGIN_GATEWAY_SESSION_MUTATION_METHODS = new Set([
@@ -824,7 +828,7 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
               return createPluginStateSyncKeyedStore<T>(pluginId, options);
             },
             openChannelIngressQueue: <TPayload, TMetadata = unknown, TCompletedMetadata = unknown>(
-              options?: Omit<Parameters<typeof createChannelIngressQueue>[0], "channelId">,
+              options?: RuntimeChannelIngressQueueOptions,
             ) => {
               const record = assertPluginIngressQueueAllowed();
               if (record?.origin === "config" && options?.stateDir !== undefined) {
@@ -836,11 +840,37 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
                 record?.origin === "config"
                   ? baseState.resolveStateDir()
                   : (options?.stateDir ?? baseState.resolveStateDir());
-              return createChannelIngressQueue<TPayload, TMetadata, TCompletedMetadata>({
-                ...options,
+              const { restartPolicy, ...queueOptions } = options ?? {};
+              const queueConfig = {
+                ...queueOptions,
                 channelId: pluginId,
                 stateDir,
-              });
+              };
+              const queue = createChannelIngressQueue<TPayload, TMetadata, TCompletedMetadata>(
+                queueConfig,
+              );
+              if (restartPolicy === "block-while-open") {
+                const blockerId = JSON.stringify([
+                  "channel-ingress",
+                  pluginId,
+                  queueOptions.accountId?.trim() || "default",
+                  stateDir,
+                ]);
+                const blocker = {
+                  id: blockerId,
+                  pluginId,
+                  getPendingCount: () => countOpenChannelIngressQueueEntries(queueConfig),
+                };
+                const existingIndex = registry.restartBlockers.findIndex(
+                  (entry) => entry.id === blockerId,
+                );
+                if (existingIndex === -1) {
+                  registry.restartBlockers.push(blocker);
+                } else {
+                  registry.restartBlockers[existingIndex] = blocker;
+                }
+              }
+              return queue;
             },
           }) as PluginRuntime["state"];
         }

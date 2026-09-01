@@ -72,6 +72,13 @@ type RuntimeSessionStoreReadParams = {
   storePath?: string;
 };
 type RuntimeSessionStoreListParams = Partial<Omit<RuntimeSessionStoreReadParams, "sessionKey">>;
+export type RuntimeChannelIngressQueueOptions = Omit<
+  CreateChannelIngressQueueOptions,
+  "channelId"
+> & {
+  /** Keep graceful gateway restart deferred while this queue has pending or claimed rows. */
+  restartPolicy?: "block-while-open";
+};
 type RuntimeSessionStoreEntrySummary = {
   sessionKey: string;
   entry: RuntimeSessionEntry;
@@ -420,7 +427,7 @@ export type PluginRuntimeCore = {
       options: import("../../plugin-state/plugin-state-store.types.js").OpenKeyedStoreOptions,
     ) => import("../../plugin-state/plugin-state-store.types.js").PluginStateSyncKeyedStore<T>;
     openChannelIngressQueue: <TPayload, TMetadata = unknown, TCompletedMetadata = unknown>(
-      options?: Omit<CreateChannelIngressQueueOptions, "channelId">,
+      options?: RuntimeChannelIngressQueueOptions,
     ) => import("../../channels/message/ingress-queue.js").ChannelIngressQueue<
       TPayload,
       TMetadata,

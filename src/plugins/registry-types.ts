@@ -504,7 +504,14 @@ export type PluginRegistry = {
   sessionSchedulerJobs: PluginSessionSchedulerJobRegistryRegistration[];
   sessionActions: PluginSessionActionRegistryRegistration[];
   conversationBindingResolvedHandlers: PluginConversationBindingResolvedHandlerRegistration[];
+  restartBlockers: PluginRestartBlockerRegistration[];
   diagnostics: PluginDiagnostic[];
+};
+
+export type PluginRestartBlockerRegistration = {
+  id: string;
+  pluginId: string;
+  getPendingCount: () => number;
 };
 
 export type PluginRegistryParams = {

@@ -63,6 +63,7 @@ import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js
 import { setCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
 import type { PluginHookGatewayCronService } from "../plugins/hook-types.js";
 import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
+import { getPluginRestartBlockerCount } from "../plugins/restart-blockers.js";
 import {
   pinActivePluginChannelRegistry,
   pinActivePluginHttpRouteRegistry,
@@ -727,6 +728,7 @@ export async function startGatewayServer(
   }
   setGatewaySigusr1RestartPolicy({ allowExternal: isRestartEnabled(cfgAtStart) });
   let getActiveTaskCount = () => 0;
+  let getActivePluginRestartBlockerCount = () => 0;
   setPreRestartDeferralCheck(
     () =>
       getTotalQueueSize() +
@@ -735,7 +737,8 @@ export async function startGatewayServer(
       getActiveCronJobCount() +
       getActiveBackgroundExecSessionCount() +
       getActiveGatewayRootWorkCount({ excludeCurrent: true }) +
-      getActiveTaskCount(),
+      getActiveTaskCount() +
+      getActivePluginRestartBlockerCount(),
   );
   const seededControlUiAllowedOrigins = controlUiSeed.seededAllowedOrigins
     ? cfgAtStart.gateway?.controlUi?.allowedOrigins
@@ -904,6 +907,7 @@ export async function startGatewayServer(
     ]);
   }
   let { pluginRegistry, baseGatewayMethods } = pluginBootstrap;
+  getActivePluginRestartBlockerCount = () => getPluginRestartBlockerCount(pluginRegistry);
   // Unconfigured clean installs get no service; durable rows still need list/status projection.
   const hasConfiguredWorkerProfiles =
     Object.keys(gatewayPluginConfigAtStart.cloudWorkers?.profiles ?? {}).length > 0;
@@ -2215,6 +2219,7 @@ export async function startGatewayServer(
       logCron,
       logReload,
       cronReconciliation,
+      getPluginRestartBlockerCount: getActivePluginRestartBlockerCount,
       onCronRestart: () => {
         gatewayCronStartHandled = true;
       },

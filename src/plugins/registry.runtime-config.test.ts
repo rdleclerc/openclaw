@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 // Verifies plugin registry behavior with runtime config inputs.
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,7 @@ import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { resolveUserPath } from "../utils.js";
 import { createPluginRecord } from "./loader-records.js";
 import { createPluginRegistry } from "./registry.js";
+import { getPluginRestartBlockerCount } from "./restart-blockers.js";
 import {
   bindGaiaAcceptedEnvelope,
   getPluginRuntimeGatewayRequestScope,
@@ -86,6 +87,61 @@ describe("plugin registry runtime config scope", () => {
     expect(() => workspaceApi.runtime.state.openChannelIngressQueue({ accountId: "test" })).toThrow(
       "only available to bundled, trusted, or explicitly configured plugins",
     );
+  });
+
+  it("counts opted-in ingress rows as restart blockers until they are terminal", async () => {
+    const runtime = createPluginRuntime();
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-ingress-restart-"));
+    runtime.state.resolveStateDir = () => stateDir;
+    const pluginRegistry = createTestRegistry(runtime);
+    const registry = pluginRegistry.registry;
+    const configured = createPluginRecord({
+      id: "configured-ingress-owner",
+      name: "Configured Ingress Owner",
+      source: "/explicit/plugins/configured-ingress-owner/index.js",
+      origin: "config",
+      enabled: true,
+      configSchema: false,
+    });
+
+    try {
+      const api = pluginRegistry.createApi(configured, { config: {} as OpenClawConfig });
+      const queue = api.runtime.state.openChannelIngressQueue<{ text: string }>({
+        accountId: "test",
+        restartPolicy: "block-while-open",
+      });
+      expect(registry.restartBlockers).toHaveLength(1);
+      expect(getPluginRestartBlockerCount(registry)).toBe(0);
+
+      await queue.enqueue("event-1", { text: "hello" });
+      expect(getPluginRestartBlockerCount(registry)).toBe(1);
+
+      const claim = await queue.claim("event-1", { ownerId: "test-owner" });
+      expect(claim).not.toBeNull();
+      expect(getPluginRestartBlockerCount(registry)).toBe(1);
+      await queue.complete(claim!);
+      expect(getPluginRestartBlockerCount(registry)).toBe(0);
+
+      api.runtime.state.openChannelIngressQueue({
+        accountId: "test",
+        restartPolicy: "block-while-open",
+      });
+      expect(registry.restartBlockers).toHaveLength(1);
+
+      registry.restartBlockers.push(
+        { id: "invalid", pluginId: "invalid", getPendingCount: () => Number.NaN },
+        {
+          id: "throws",
+          pluginId: "throws",
+          getPendingCount: () => {
+            throw new Error("unavailable");
+          },
+        },
+      );
+      expect(getPluginRestartBlockerCount(registry)).toBe(2);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps the Gaia keyed output runtime boundary exact and derives ownership in OpenClaw", async () => {

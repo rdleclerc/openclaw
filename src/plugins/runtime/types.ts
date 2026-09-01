@@ -111,6 +111,7 @@ export type RuntimeGatewayCapabilities = Readonly<{
   agentWaitProviderStarted: true;
   agentWaitTimeoutPhase: true;
   auditAgentRunSourceSequence: true;
+  channelIngressRestartBarrier: true;
   sessionsAbortDurableTerminal: true;
 }>;
 

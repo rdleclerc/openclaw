@@ -476,6 +476,29 @@ function queueNameForParts(channelId: string, accountId: string): string {
   return JSON.stringify([channelId, accountId]);
 }
 
+/** Count durable ingress rows that still own processing or delivery work. */
+export function countOpenChannelIngressQueueEntries(
+  options: CreateChannelIngressQueueOptions,
+): number {
+  const channelId = normalizePart(options.channelId, "unknown");
+  const accountId = normalizePart(options.accountId, "default");
+  const queueName = queueNameForParts(channelId, accountId);
+  const { db } = openStateDatabase(options.stateDir);
+  const row = executeSqliteQueryTakeFirstSync(
+    db,
+    getChannelIngressKysely(db)
+      .selectFrom("channel_ingress_events")
+      .select((eb) => eb.fn.countAll<number | bigint>().as("count"))
+      .where("queue_name", "=", queueName)
+      .where("status", "in", ["pending", "claimed"]),
+  );
+  const count = Number(row?.count ?? 0);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error(`Invalid open ingress count for ${queueName}`);
+  }
+  return count;
+}
+
 /** Creates a durable channel/account-scoped ingress queue backed by the OpenClaw state database. */
 export function createChannelIngressQueue<
   TPayload,

@@ -331,6 +331,7 @@ function createReloadHandlersForTest(
   reloadPlugins?: Parameters<typeof createGatewayReloadHandlers>[0]["reloadPlugins"],
   stopPostReadySidecars = vi.fn(),
   recovery: boolean | NonNullable<ReloadHandlerParams["requestRecoveryRestart"]> = true,
+  getPluginRestartBlockerCount?: () => number,
 ) {
   const cron = { start: vi.fn(async () => {}), stop: vi.fn() };
   const stopExitWatchers = vi.fn();
@@ -383,6 +384,7 @@ function createReloadHandlersForTest(
           ? requestGatewayRestartWithSignalAdmission
           : null,
     ...(typeof recovery === "boolean" ? { restartRecoveryAvailable: recovery } : {}),
+    ...(getPluginRestartBlockerCount ? { getPluginRestartBlockerCount } : {}),
     createHealthMonitor: () => null,
   });
   return {
@@ -2378,6 +2380,64 @@ describe("gateway restart deferral preflight", () => {
       );
 
       markExited(session, 0, null, "completed");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(signalSpy).toHaveBeenCalledOnce();
+      expect(logReload.info).toHaveBeenCalledWith(
+        "all operations and replies completed; restarting gateway now",
+      );
+    } finally {
+      process.removeListener("SIGUSR1", signalSpy);
+      restartTesting.resetSigusr1State();
+      resetGatewayWorkAdmission();
+    }
+  });
+
+  it("defers config restart until plugin-owned obligations are terminal", async () => {
+    restartTesting.resetSigusr1State();
+    resetGatewayWorkAdmission();
+    const logReload = { info: vi.fn(), warn: vi.fn() };
+    let pluginObligations = 1;
+    const { requestGatewayRestart } = createReloadHandlersForTest(
+      logReload,
+      undefined,
+      undefined,
+      undefined,
+      true,
+      () => pluginObligations,
+    );
+    const signalSpy = vi.fn();
+    process.once("SIGUSR1", signalSpy);
+    vi.useFakeTimers();
+
+    try {
+      expect(
+        requestGatewayRestart(
+          {
+            changedPaths: ["gateway.port"],
+            restartGateway: true,
+            restartReasons: ["gateway.port"],
+            hotReasons: [],
+            reloadHooks: false,
+            restartGmailWatcher: false,
+            restartCron: false,
+            restartHeartbeat: false,
+            restartHealthMonitor: false,
+            reloadPlugins: false,
+            restartChannels: new Set(),
+            disposeMcpRuntimes: false,
+            noopPaths: [],
+          },
+          {},
+        ).status,
+      ).toBe("accepted");
+
+      expect(signalSpy).not.toHaveBeenCalled();
+      expect(logReload.warn).toHaveBeenCalledWith(
+        "config change requires gateway restart (gateway.port) — deferring until 1 plugin-owned obligation(s) complete",
+      );
+
+      pluginObligations = 0;
       await vi.advanceTimersByTimeAsync(500);
 
       expect(signalSpy).toHaveBeenCalledOnce();

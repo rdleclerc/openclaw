@@ -67,6 +67,7 @@ function createTelegramPluginRegistry() {
     services: [],
     commands: [],
     conversationBindingResolvedHandlers: [],
+    restartBlockers: [],
     diagnostics: [],
   };
 }

@@ -359,6 +359,7 @@ type GatewayReloadHandlerParams = {
   createHealthMonitor: (config: OpenClawConfig) => ChannelHealthMonitor | null;
   createGmailRestartAbortController?: () => GatewayGmailRestartAbortController;
   clearGmailRestartAbortController?: (controller: GatewayGmailRestartAbortController) => void;
+  getPluginRestartBlockerCount?: () => number;
   onCronRestart?: () => void;
   requestRecoveryRestart?: GatewayRestartEmitter;
   restartRecoveryAvailable?: boolean;
@@ -407,7 +408,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
   const restartRecoveryAvailable =
     params.restartRecoveryAvailable !== false && params.requestRecoveryRestart !== undefined;
 
-  const getActiveCounts = () => {
+  const getActiveCounts = (pluginObligations = 0) => {
     const queueSize = getTotalQueueSize();
     const pendingReplies = getTotalPendingReplies();
     const embeddedRuns = getActiveEmbeddedRunCount();
@@ -421,15 +422,19 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
       backgroundExecSessions,
       rootRequests,
       activeTasks,
+      pluginObligations,
       totalActive:
         queueSize +
         pendingReplies +
         embeddedRuns +
         backgroundExecSessions +
         rootRequests +
-        activeTasks,
+        activeTasks +
+        pluginObligations,
     };
   };
+  const getRestartActiveCounts = () =>
+    getActiveCounts(params.getPluginRestartBlockerCount?.() ?? 0);
   const formatActiveDetails = (counts: ReturnType<typeof getActiveCounts>) => {
     const details = [];
     if (counts.queueSize > 0) {
@@ -449,6 +454,9 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
     }
     if (counts.activeTasks > 0) {
       details.push(`${counts.activeTasks} background task run(s)`);
+    }
+    if (counts.pluginObligations > 0) {
+      details.push(`${counts.pluginObligations} plugin-owned obligation(s)`);
     }
     return details;
   };
@@ -1348,7 +1356,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
       }
     };
 
-    const active = getActiveCounts();
+    const active = getRestartActiveCounts();
 
     if (active.totalActive > 0 || options?.prepareRuntimeConfig) {
       // Avoid spinning up duplicate polling loops from repeated config changes.
@@ -1376,7 +1384,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
 
       let failedEmission: { reason: string; intent?: GatewayRestartIntent } | undefined;
       restartDeferral = deferGatewayRestartUntilIdle({
-        getPendingCount: () => getActiveCounts().totalActive,
+        getPendingCount: () => getRestartActiveCounts().totalActive,
         maxWaitMs: resolveGatewayRestartDeferralTimeoutMs(
           nextConfig.gateway?.reload?.deferralTimeoutMs,
         ),
@@ -1426,7 +1434,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
             params.logReload.info("all operations and replies completed; restarting gateway now");
           },
           onStillPending: (_pending, elapsedMs) => {
-            const remaining = formatActiveDetails(getActiveCounts());
+            const remaining = formatActiveDetails(getRestartActiveCounts());
             const taskBlockersValue = formatTaskBlockers();
             params.logReload.warn(
               `restart still deferred after ${elapsedMs}ms with ${remaining.join(", ")} active${
@@ -1435,7 +1443,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
             );
           },
           onTimeout: (_pending, elapsedMs) => {
-            const remaining = formatActiveDetails(getActiveCounts());
+            const remaining = formatActiveDetails(getRestartActiveCounts());
             const taskBlockersLocal = formatTaskBlockers();
             restartPending = false;
             restartDeferral = null;
@@ -1600,6 +1608,9 @@ export function startManagedGatewayConfigReloader(
         activeGmailRestartAbortController = null;
       }
     },
+    ...(params.getPluginRestartBlockerCount
+      ? { getPluginRestartBlockerCount: params.getPluginRestartBlockerCount }
+      : {}),
     ...(params.onCronRestart ? { onCronRestart: params.onCronRestart } : {}),
     ...(params.requestRecoveryRestart
       ? { requestRecoveryRestart: params.requestRecoveryRestart }

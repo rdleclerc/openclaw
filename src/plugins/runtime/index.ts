@@ -57,6 +57,7 @@ const RUNTIME_GATEWAY_CAPABILITIES: RuntimeGatewayCapabilities = Object.freeze({
   agentWaitProviderStarted: true,
   agentWaitTimeoutPhase: true,
   auditAgentRunSourceSequence: true,
+  channelIngressRestartBarrier: true,
   sessionsAbortDurableTerminal: true,
 });
 
