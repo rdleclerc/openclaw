@@ -12,6 +12,7 @@ import {
   completeDeliveryQueueEntry,
   failPendingDeliveryQueueEntry,
   loadDeliveryQueueEntryRecord,
+  loadDeliveryQueueEntryRecordsByGaiaSlackRequest,
   loadDeliveryQueueEntries,
   loadDeliveryQueueEntry,
   moveDeliveryQueueEntryToFailed,
@@ -227,6 +228,12 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value)) ?? "null";
 }
 
+function gaiaSlackAdmissionRequestId(runId: string): string | undefined {
+  const replay = /^gaia-slack-admission-replay:(req_[a-f0-9]+)$/u.exec(runId);
+  const continuation = /^gaia-slack-admission-continuation:(req_[a-f0-9]+):[1-9]\d*$/u.exec(runId);
+  return replay?.[1] ?? continuation?.[1];
+}
+
 /** Derive the stable Gaia owner row ID from the host-accepted run identity. */
 export function deriveGaiaKeyedOutputOwnerId(runId: string): string {
   const normalizedRunId = runId.trim();
@@ -363,6 +370,26 @@ export async function admitGaiaKeyedOutput(
         ...params,
         accepted: acceptance.accepted,
       });
+      const slackRequestId = gaiaSlackAdmissionRequestId(acceptance.accepted.runId);
+      if (slackRequestId) {
+        const sibling = loadDeliveryQueueEntryRecordsByGaiaSlackRequest({
+          queueName: QUEUE_NAME,
+          replayRunId: `gaia-slack-admission-replay:${slackRequestId}`,
+          continuationRunIdPrefix: `gaia-slack-admission-continuation:${slackRequestId}:`,
+          stateDir,
+        }).find((record) => {
+          const storedRunId = (record.entry as QueuedDelivery | null)?.gaiaKeyedOutput?.accepted
+            .runId;
+          return (
+            storedRunId !== acceptance.accepted.runId &&
+            storedRunId !== undefined &&
+            gaiaSlackAdmissionRequestId(storedRunId) === slackRequestId
+          );
+        });
+        if (sibling) {
+          return { status: "conflict", ...candidate };
+        }
+      }
       const inserted = upsertDeliveryQueueEntry({
         queueName: QUEUE_NAME,
         entry: candidate.entry,

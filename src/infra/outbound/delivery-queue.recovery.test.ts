@@ -1935,6 +1935,31 @@ describe("delivery-queue recovery", () => {
       );
     });
 
+    it("blocks a Slack admission continuation without changing existing owner IDs", async () => {
+      const requestId = "req_58ffc420a34baf99c59e23d53c68aedd";
+      const firstRunId = `gaia-slack-admission-replay:${requestId}`;
+      const laterRunId = `gaia-slack-admission-continuation:${requestId}:1`;
+      persistAcceptance(firstRunId);
+      persistAcceptance(laterRunId);
+
+      const first = await admitGaiaKeyedOutput(gaiaParams("One reply.", firstRunId), tmpDir());
+      await completeDelivery(first.ownerId, tmpDir());
+      const later = await admitGaiaKeyedOutput(gaiaParams("One reply.", laterRunId), tmpDir());
+
+      expect(first.status).toBe("new");
+      expect(later.status).toBe("conflict");
+      expect(first.ownerId).toBe(
+        "cc0ee9a08f889b0fa96a23c71fc3807be4e717b195548f2889196c15853c6383",
+      );
+      expect(later.ownerId).toBe(
+        "56af27bcc20d867218b5aca1294be4d08e00eadbd601c03d2e8ddb458277b712",
+      );
+      expect(inspectGaiaKeyedOutput(accepted(firstRunId), tmpDir())).toMatchObject({
+        ownerId: first.ownerId,
+        status: "completed",
+      });
+    });
+
     it("persists exact acceptance tuples, refreshes before ownership, and retains authority", async () => {
       const initial = accepted("acceptance-run");
       const acceptanceId = deriveGaiaAcceptanceId(initial.runId);

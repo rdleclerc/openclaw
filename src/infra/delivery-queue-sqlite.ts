@@ -278,6 +278,57 @@ export function loadDeliveryQueueEntryRecord(
     : null;
 }
 
+/** Find durable Gaia owner rows for one Slack request without changing their stable IDs. */
+export function loadDeliveryQueueEntryRecordsByGaiaSlackRequest(params: {
+  queueName: string;
+  replayRunId: string;
+  continuationRunIdPrefix: string;
+  stateDir?: string;
+}): DeliveryQueueEntryRecord[] {
+  const database = openStateDatabase(params.stateDir);
+  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
+  const rows = executeSqliteQuerySync(
+    database.db,
+    queueDb
+      .selectFrom("delivery_queue_entries")
+      .select([
+        "id",
+        "status",
+        "entry_kind",
+        "entry_json",
+        "enqueued_at",
+        "retry_count",
+        "last_attempt_at",
+        "last_error",
+        "platform_send_started_at",
+        "recovery_state",
+      ])
+      .where("queue_name", "=", params.queueName)
+      .where((eb) => {
+        const acceptedRunId = eb
+          .case()
+          .when(eb.fn<number>("json_valid", ["entry_json"]), "=", 1)
+          .then(
+            eb.fn<string>("json_extract", [
+              "entry_json",
+              eb.val("$.gaiaKeyedOutput.accepted.runId"),
+            ]),
+          )
+          .else(null)
+          .end();
+        return eb.or([
+          eb(acceptedRunId, "=", params.replayRunId),
+          eb(acceptedRunId, "like", `${params.continuationRunIdPrefix}%`),
+        ]);
+      }),
+  ).rows as QueueRow[];
+  return rows.map((row) => ({
+    status: row.status,
+    entry: inflate(row),
+    metadata: { entryKind: row.entry_kind ?? undefined },
+  }));
+}
+
 /** Read row status without hiding dead-lettered entries. */
 export function getDeliveryQueueEntryStatus(
   queueName: string,
