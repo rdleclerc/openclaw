@@ -626,6 +626,54 @@ describe("deliverOutboundPayloads", () => {
     }
   });
 
+  it("blocks an unbound Gaia continuation before the Slack adapter", async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-gaia-continuation-fence-"));
+    gaiaRecoveryStateDirs.push(stateDir);
+    const requestId = "req_74ee8993cb69193225d94a557e158a82";
+    const original = {
+      ...GAIA_ACCEPTED_ENVELOPE,
+      runId: `gaia-slack-admission-replay:${requestId}`,
+    };
+    admitGaiaAcceptance(original, stateDir);
+    const owner = await admitGaiaKeyedOutput(
+      {
+        accepted: original,
+        channel: "slack",
+        to: "C123",
+        payloads: [{ text: "first" }],
+        replyPayloadSendingHook: createGaiaReceiptHook({ runId: original.runId }),
+      },
+      stateDir,
+    );
+    await completeDelivery(owner.ownerId, stateDir);
+
+    const sendSlack = vi.fn().mockResolvedValue({ channel: "slack", messageId: "duplicate" });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "slack",
+          source: "test",
+          plugin: createOutboundTestPlugin({
+            id: "slack",
+            outbound: { deliveryMode: "direct", sendText: async () => sendSlack() },
+          }),
+        },
+      ]),
+    );
+
+    const continuationRunId = `gaia-slack-admission-continuation:${requestId}:1`;
+    const results = await deliverOutboundPayloads(
+      createGaiaDeliveryParams({
+        deliveryQueueStateDir: stateDir,
+        replyPayloadSendingHook: createGaiaReceiptHook({ runId: continuationRunId }),
+      }),
+    );
+
+    expect(results).toEqual([]);
+    expect(sendSlack).not.toHaveBeenCalled();
+    expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
+  });
+
   it("allows only the durable Gaia Slack fence winner to enter the adapter", async () => {
     const { stateDir, admitted } = await createGaiaPendingOwner();
     let signalAdapterEntered: (() => void) | undefined;

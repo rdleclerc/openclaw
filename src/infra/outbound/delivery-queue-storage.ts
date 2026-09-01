@@ -234,6 +234,24 @@ function gaiaSlackAdmissionRequestId(runId: string): string | undefined {
   return replay?.[1] ?? continuation?.[1];
 }
 
+/** Reject a different Gaia run when one Slack request already has a durable output owner. */
+export function hasGaiaSlackRequestOutputOwnerConflict(runId: string, stateDir?: string): boolean {
+  const normalizedRunId = runId.trim();
+  const requestId = gaiaSlackAdmissionRequestId(normalizedRunId);
+  if (!requestId) {
+    return false;
+  }
+  return loadDeliveryQueueEntryRecordsByGaiaSlackRequest({
+    queueName: QUEUE_NAME,
+    replayRunId: `gaia-slack-admission-replay:${requestId}`,
+    continuationRunIdPrefix: `gaia-slack-admission-continuation:${requestId}:`,
+    stateDir,
+  }).some((record) => {
+    const storedRunId = (record.entry as QueuedDelivery | null)?.gaiaKeyedOutput?.accepted.runId;
+    return storedRunId !== undefined && storedRunId !== normalizedRunId;
+  });
+}
+
 /** Derive the stable Gaia owner row ID from the host-accepted run identity. */
 export function deriveGaiaKeyedOutputOwnerId(runId: string): string {
   const normalizedRunId = runId.trim();
@@ -370,25 +388,8 @@ export async function admitGaiaKeyedOutput(
         ...params,
         accepted: acceptance.accepted,
       });
-      const slackRequestId = gaiaSlackAdmissionRequestId(acceptance.accepted.runId);
-      if (slackRequestId) {
-        const sibling = loadDeliveryQueueEntryRecordsByGaiaSlackRequest({
-          queueName: QUEUE_NAME,
-          replayRunId: `gaia-slack-admission-replay:${slackRequestId}`,
-          continuationRunIdPrefix: `gaia-slack-admission-continuation:${slackRequestId}:`,
-          stateDir,
-        }).find((record) => {
-          const storedRunId = (record.entry as QueuedDelivery | null)?.gaiaKeyedOutput?.accepted
-            .runId;
-          return (
-            storedRunId !== acceptance.accepted.runId &&
-            storedRunId !== undefined &&
-            gaiaSlackAdmissionRequestId(storedRunId) === slackRequestId
-          );
-        });
-        if (sibling) {
-          return { status: "conflict", ...candidate };
-        }
+      if (hasGaiaSlackRequestOutputOwnerConflict(acceptance.accepted.runId, stateDir)) {
+        return { status: "conflict", ...candidate };
       }
       const inserted = upsertDeliveryQueueEntry({
         queueName: QUEUE_NAME,

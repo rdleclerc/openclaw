@@ -79,6 +79,7 @@ import {
   completeDelivery,
   deriveGaiaKeyedOutputOwnerId,
   fingerprintGaiaKeyedOutput,
+  hasGaiaSlackRequestOutputOwnerConflict,
   inspectGaiaKeyedOutput,
   type GaiaKeyedOutputOwner,
 } from "./delivery-queue-storage.js";
@@ -1582,6 +1583,22 @@ export async function deliverOutboundPayloadsInternal(
     ? createRenderedMessageBatchPlan(queuePayloads)
     : renderedBatchPlan;
   const acceptedEnvelope = recoveredAcceptedEnvelope ?? hostAcceptedEnvelope;
+
+  const receiptHook = params.replyPayloadSendingHook;
+  const unboundGaiaSlackRunId =
+    gaiaOutputMode === undefined &&
+    channel === "slack" &&
+    receiptHook?.messageSentReceiptPluginId === "gaia-workflow-preflight"
+      ? receiptHook.runId?.trim()
+      : undefined;
+  // Continuation delivery can outlive the gateway request scope that held its
+  // accepted envelope. The durable sibling owner must still fence the adapter.
+  if (
+    unboundGaiaSlackRunId &&
+    hasGaiaSlackRequestOutputOwnerConflict(unboundGaiaSlackRunId, params.deliveryQueueStateDir)
+  ) {
+    return [];
+  }
 
   const gaiaKeyedOutputAdmission =
     gaiaOutputMode === "live"
