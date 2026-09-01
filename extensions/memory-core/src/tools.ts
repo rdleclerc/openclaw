@@ -737,8 +737,13 @@ export function createMemorySearchTool(options: {
                 );
               }
             }
-            const supplementResults = shouldQuerySupplements
-              ? await runUnavailablePhase(
+            let supplementDegradation:
+              | { degraded: true; warning: string; action: string }
+              | undefined;
+            let supplementResults: MemoryCorpusSearchResult[] = [];
+            if (shouldQuerySupplements) {
+              try {
+                supplementResults = await runUnavailablePhase(
                   "supplement",
                   async () =>
                     await runWithDefaultDeadline(
@@ -752,8 +757,26 @@ export function createMemorySearchTool(options: {
                           corpus: requestedCorpus,
                         }),
                     ),
-                )
-              : [];
+                );
+              } catch (error) {
+                if (
+                  callerSignal?.aborted ||
+                  requestedCorpus !== "all" ||
+                  surfacedMemoryResults.length === 0
+                ) {
+                  throw error;
+                }
+                // corpus=all treats compiled wiki as enrichment. Do not hide valid
+                // indexed hits when that lower-authority supplement misses its budget.
+                supplementDegradation = {
+                  degraded: true,
+                  warning: `Indexed memory results are available, but the optional wiki supplement failed: ${formatErrorMessage(error)}`,
+                  action:
+                    "Use the returned indexed results. Retry with corpus=wiki only if wiki coverage is required.",
+                };
+                failedUnavailablePhase = undefined;
+              }
+            }
             // Wiki and memory scores use incomparable scales, so corpus=all first
             // balances candidate selection and then backfills any unused slots.
             const effectiveMax = Math.max(1, maxResults ?? 10);
@@ -778,6 +801,7 @@ export function createMemorySearchTool(options: {
               fallback,
               citations: citationsMode,
               mode: searchMode,
+              ...supplementDegradation,
               debug: searchDebug,
             });
           } finally {

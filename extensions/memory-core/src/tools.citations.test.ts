@@ -613,7 +613,32 @@ describe("memory tools", () => {
     expect(getMemorySearchManagerMockCalls()).toBe(1);
   });
 
-  it("does not cooldown primary memory when a corpus=all wiki supplement stalls", async () => {
+  it("returns indexed memory with a warning when a corpus=all wiki supplement fails", async () => {
+    registerMemoryCorpusSupplement("memory-wiki", {
+      search: async () => {
+        throw new Error("compiled wiki unavailable");
+      },
+      get: async () => null,
+    });
+
+    const tool = createMemorySearchToolOrThrow();
+    const result = await tool.execute("call_all_failed_wiki", {
+      query: "alpha",
+      corpus: "all",
+    });
+
+    expect(result.details).toMatchObject({
+      results: [{ corpus: "memory", path: "MEMORY.md" }],
+      degraded: true,
+      warning:
+        "Indexed memory results are available, but the optional wiki supplement failed: compiled wiki unavailable",
+      action:
+        "Use the returned indexed results. Retry with corpus=wiki only if wiki coverage is required.",
+    });
+    expect(result.details).not.toHaveProperty("disabled");
+  });
+
+  it("returns indexed memory when a corpus=all wiki supplement stalls", async () => {
     vi.useFakeTimers();
     try {
       let searchCalls = 0;
@@ -642,11 +667,15 @@ describe("memory tools", () => {
       });
       await vi.advanceTimersByTimeAsync(15_000);
       const stalledAllResult = await stalledAllResultPromise;
-      expectUnavailableMemorySearchDetails(stalledAllResult.details, {
-        error: "memory_search timed out after 15s",
-        warning: "Memory search is unavailable due to an embedding/provider error.",
-        action: "Check embedding provider configuration and retry memory_search.",
+      expect(stalledAllResult.details).toMatchObject({
+        results: [{ corpus: "memory", path: "MEMORY.md" }],
+        degraded: true,
+        warning:
+          "Indexed memory results are available, but the optional wiki supplement failed: memory_search timed out after 15s",
+        action:
+          "Use the returned indexed results. Retry with corpus=wiki only if wiki coverage is required.",
       });
+      expect(stalledAllResult.details).not.toHaveProperty("disabled");
 
       const memoryResult = await tool.execute("call_memory_after_stalled_wiki", {
         query: "alpha",
