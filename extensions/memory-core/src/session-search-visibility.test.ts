@@ -39,12 +39,23 @@ vi.mock("openclaw/plugin-sdk/session-transcript-hit", async (importOriginal) => 
       storePath: "(test)",
       store: combinedSessionStore,
     })),
+    resolveCurrentSessionKeysBySessionIdForGateway: vi.fn(
+      (_cfg: unknown, params: { agentId: string; sessionId: string }) =>
+        Object.entries(combinedSessionStore)
+          .filter(
+            ([sessionKey, entry]) =>
+              entry.sessionId === params.sessionId &&
+              sessionKey.toLowerCase().startsWith(`agent:${params.agentId.toLowerCase()}:`),
+          )
+          .map(([sessionKey]) => sessionKey),
+    ),
   };
 });
 
 describe("filterMemorySearchHitsBySessionVisibility", () => {
   afterEach(async () => {
     vi.mocked(sessionTranscriptHit.loadCombinedSessionStoreForGateway).mockClear();
+    vi.mocked(sessionTranscriptHit.resolveCurrentSessionKeysBySessionIdForGateway).mockClear();
     combinedSessionStore = crossAgentStore;
     while (tempRoots.length > 0) {
       const root = tempRoots.pop();
@@ -137,6 +148,101 @@ describe("filterMemorySearchHitsBySessionVisibility", () => {
       hits,
     });
     expect(filtered).toEqual(hits);
+    expect(sessionTranscriptHit.loadCombinedSessionStoreForGateway).not.toHaveBeenCalled();
+    expect(
+      sessionTranscriptHit.resolveCurrentSessionKeysBySessionIdForGateway,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("keeps mapped session hits from another thread in the same external conversation", async () => {
+    combinedSessionStore = {
+      "agent:main:slack:channel:c09azp8dylx:thread:old": {
+        sessionId: "old-session",
+        updatedAt: 1,
+        sessionFile: "sqlite-session://main/old-session",
+      },
+    };
+    const searchPath = "qmd/sessions-main/old-session.md";
+    const indexPath = await createQmdArtifactIndex({
+      agentId: "main",
+      artifactPath: "old-session.md",
+      collection: "sessions-main",
+      searchPath,
+      sessionId: "old-session",
+    });
+    const hit = attachMappedQmdHit(
+      {
+        path: searchPath,
+        source: "sessions",
+        score: 1,
+        snippet: "x",
+        startLine: 1,
+        endLine: 2,
+      },
+      {
+        artifactPath: "old-session.md",
+        collection: "sessions-main",
+        indexPath,
+        searchPath,
+      },
+    );
+
+    const filtered = await filterMemorySearchHitsBySessionVisibility({
+      cfg: asOpenClawConfig({}),
+      requesterSessionKey: "agent:main:slack:channel:c09azp8dylx:thread:new",
+      sandboxed: false,
+      hits: [hit],
+    });
+
+    expect(filtered).toEqual([hit]);
+    expect(sessionTranscriptHit.loadCombinedSessionStoreForGateway).not.toHaveBeenCalled();
+    expect(
+      sessionTranscriptHit.resolveCurrentSessionKeysBySessionIdForGateway,
+    ).toHaveBeenCalledTimes(1);
+  });
+
+  it("still denies mapped session hits from another external conversation", async () => {
+    combinedSessionStore = {
+      "agent:main:slack:channel:other:thread:old": {
+        sessionId: "other-session",
+        updatedAt: 1,
+        sessionFile: "sqlite-session://main/other-session",
+      },
+    };
+    const searchPath = "qmd/sessions-main/other-session.md";
+    const indexPath = await createQmdArtifactIndex({
+      agentId: "main",
+      artifactPath: "other-session.md",
+      collection: "sessions-main",
+      searchPath,
+      sessionId: "other-session",
+    });
+    const hit = attachMappedQmdHit(
+      {
+        path: searchPath,
+        source: "sessions",
+        score: 1,
+        snippet: "x",
+        startLine: 1,
+        endLine: 2,
+      },
+      {
+        artifactPath: "other-session.md",
+        collection: "sessions-main",
+        indexPath,
+        searchPath,
+      },
+    );
+
+    const filtered = await filterMemorySearchHitsBySessionVisibility({
+      cfg: asOpenClawConfig({}),
+      requesterSessionKey: "agent:main:slack:channel:c09azp8dylx:thread:new",
+      sandboxed: false,
+      hits: [hit],
+    });
+
+    expect(filtered).toStrictEqual([]);
+    expect(sessionTranscriptHit.loadCombinedSessionStoreForGateway).not.toHaveBeenCalled();
   });
 
   it("loads the combined session store once per filter pass", async () => {

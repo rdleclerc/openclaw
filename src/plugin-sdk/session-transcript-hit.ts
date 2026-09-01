@@ -5,7 +5,8 @@ import { normalizeOptionalString } from "../../packages/normalization-core/src/s
 import { uniqueStrings } from "../../packages/normalization-core/src/string-normalization.js";
 import { parseUsageCountedSessionIdFromFileName } from "../config/sessions/artifacts.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import { normalizeAgentId } from "../routing/session-key.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
+import { parseSessionDeliveryRoute } from "../sessions/session-key-utils.js";
 export {
   formatSessionTranscriptMemoryHitKey,
   parseSessionTranscriptMemoryHitKey,
@@ -20,7 +21,10 @@ export type {
   SessionTranscriptReadParams,
 } from "./session-transcript-memory-hit.js";
 
-export { loadCombinedSessionStoreForGateway } from "../config/sessions/combined-store-gateway.js";
+export {
+  loadCombinedSessionStoreForGateway,
+  resolveCurrentSessionKeysBySessionIdForGateway,
+} from "../config/sessions/combined-store-gateway.js";
 
 const QMD_ARCHIVE_STEM_RE = /^(.+)-jsonl-(reset|deleted)-(.+)$/;
 const QMD_ARCHIVE_TIMESTAMP_RE =
@@ -185,4 +189,27 @@ export function resolveTranscriptStemToSessionKeys(params: {
   return archivedOwnerAgentId
     ? [`agent:${normalizeAgentId(archivedOwnerAgentId)}:${params.stem}`]
     : [];
+}
+
+/** True when two agent-owned external session keys address the same chat outside thread ids. */
+export function areSessionKeysInSameDeliveryConversation(
+  leftSessionKey: string,
+  rightSessionKey: string,
+): boolean {
+  const leftAgent = parseAgentSessionKey(leftSessionKey)?.agentId;
+  const rightAgent = parseAgentSessionKey(rightSessionKey)?.agentId;
+  if (!leftAgent || !rightAgent || normalizeAgentId(leftAgent) !== normalizeAgentId(rightAgent)) {
+    return false;
+  }
+  const left = parseSessionDeliveryRoute(leftSessionKey);
+  const right = parseSessionDeliveryRoute(rightSessionKey);
+  if (!left || !right) {
+    return false;
+  }
+  return (
+    left.channel === right.channel &&
+    left.accountId === right.accountId &&
+    left.peerKind === right.peerKind &&
+    left.peerId === right.peerId
+  );
 }

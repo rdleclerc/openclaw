@@ -123,6 +123,7 @@ export {
   updateResolvedSessionEntry,
   upsertSessionEntry,
 } from "./session-accessor.entry.js";
+export { listCurrentSqliteSessionKeysBySessionId as listCurrentSessionKeysBySessionId } from "./session-accessor.sqlite.js";
 export {
   canonicalizeSessionEntryAliases,
   createSessionEntryWithTranscript,

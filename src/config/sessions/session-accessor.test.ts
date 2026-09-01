@@ -16,6 +16,7 @@ import {
   createSessionEntryWithTranscript,
   deleteSessionEntryLifecycle,
   findTranscriptEvent,
+  listCurrentSessionKeysBySessionId,
   listSessionEntries,
   listSessionEntriesByStatus,
   listSessionTranscriptInstances,
@@ -131,6 +132,35 @@ describe("session accessor seam", () => {
       sessionId: "session-1",
       updatedAt: expect.any(Number),
     });
+  });
+
+  it("lists current keys for one session id through the read-only point lookup", async () => {
+    await upsertSessionEntry(
+      { agentId: "main", sessionKey: "agent:main:one", storePath },
+      { sessionId: "shared-session", updatedAt: 10 },
+    );
+    await upsertSessionEntry(
+      { agentId: "main", sessionKey: "agent:main:two", storePath },
+      { sessionId: "other-session", updatedAt: 20 },
+    );
+
+    expect(
+      listCurrentSessionKeysBySessionId({
+        agentId: "main",
+        sessionId: "shared-session",
+        storePath,
+      }),
+    ).toEqual(["agent:main:one"]);
+    expect(() =>
+      listCurrentSessionKeysBySessionId({
+        agentId: "peer",
+        sessionId: "shared-session",
+        storePath: expectDefined(
+          resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
+          "test SQLite store path",
+        ),
+      }),
+    ).toThrow(/not owned by agent peer/i);
   });
 
   it("lists retained transcript instances across same-key session rotation", async () => {

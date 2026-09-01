@@ -1,10 +1,13 @@
 // Memory Core plugin module implements session search visibility behavior.
+import { createSubsystemLogger } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import type { MemorySearchResult } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
 import { resolveSessionAgentId } from "openclaw/plugin-sdk/memory-host-core";
 import {
+  areSessionKeysInSameDeliveryConversation,
   extractTranscriptIdentityFromSessionsMemoryHit,
   loadCombinedSessionStoreForGateway,
+  resolveCurrentSessionKeysBySessionIdForGateway,
   resolveSessionTranscriptMemoryHitKeyToSessionKeys,
   resolveTranscriptStemToSessionKeys,
 } from "openclaw/plugin-sdk/session-transcript-hit";
@@ -14,6 +17,8 @@ import {
   resolveEffectiveSessionToolsVisibility,
 } from "openclaw/plugin-sdk/session-visibility";
 import { readQmdSessionArtifactIdentity } from "./qmd-session-artifacts.js";
+
+const log = createSubsystemLogger("memory");
 
 function normalizeAgentIdForCompare(value: string | undefined): string | undefined {
   return value?.trim().toLowerCase() || undefined;
@@ -51,6 +56,9 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
   sandboxed: boolean;
   hits: MemorySearchResult[];
 }): Promise<MemorySearchResult[]> {
+  if (!params.hits.some((hit) => hit.source === "sessions")) {
+    return params.hits;
+  }
   const visibility = resolveEffectiveSessionToolsVisibility({
     cfg: params.cfg,
     sandboxed: params.sandboxed,
@@ -71,11 +79,27 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
         a2aPolicy,
       })
     : null;
-
-  const { store: combinedSessionStore } = loadCombinedSessionStoreForGateway(
-    params.cfg,
-    scopedAgentId ? { agentId: scopedAgentId } : {},
-  );
+  let combinedSessionStore: ReturnType<typeof loadCombinedSessionStoreForGateway>["store"] | null =
+    null;
+  const getCombinedSessionStore = () => {
+    combinedSessionStore ??= loadCombinedSessionStoreForGateway(
+      params.cfg,
+      scopedAgentId ? { agentId: scopedAgentId } : {},
+    ).store;
+    return combinedSessionStore;
+  };
+  const isAllowedSessionKey = (key: string): boolean => {
+    if (guard?.check(key).allowed) {
+      return true;
+    }
+    return Boolean(
+      guard &&
+      params.requesterSessionKey &&
+      !params.sandboxed &&
+      visibility === "tree" &&
+      areSessionKeysInSameDeliveryConversation(params.requesterSessionKey, key),
+    );
+  };
 
   const next: MemorySearchResult[] = [];
   for (const hit of params.hits) {
@@ -97,19 +121,34 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
       ) {
         continue;
       }
+      let resolvedKeys: string[] = [];
+      try {
+        resolvedKeys = artifactIdentity.archived
+          ? resolveSessionTranscriptMemoryHitKeyToSessionKeys({
+              store: {},
+              key: artifactIdentity.memoryKey,
+              includeSyntheticFallback: true,
+            })
+          : resolveCurrentSessionKeysBySessionIdForGateway(params.cfg, {
+              agentId: artifactIdentity.agentId,
+              sessionId: artifactIdentity.sessionId,
+            });
+      } catch (error) {
+        // Authorization lookups fail closed while unrelated memory hits remain usable.
+        log.warn(
+          `failed to resolve current session identity for memory visibility: ${String(error)}`,
+        );
+        resolvedKeys = [];
+      }
       const keys = filterSessionKeysByScopedAgent({
         cfg: params.cfg,
         scopedAgentId,
-        keys: resolveSessionTranscriptMemoryHitKeyToSessionKeys({
-          store: combinedSessionStore,
-          key: artifactIdentity.memoryKey,
-          includeSyntheticFallback: artifactIdentity.archived,
-        }),
+        keys: resolvedKeys,
       });
       if (keys.length === 0) {
         continue;
       }
-      const allowed = keys.some((key) => guard.check(key).allowed);
+      const allowed = keys.some(isAllowedSessionKey);
       if (!allowed) {
         continue;
       }
@@ -145,7 +184,7 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
       : undefined;
     const liveKeys = identity.liveStem
       ? resolveTranscriptStemToSessionKeys({
-          store: combinedSessionStore,
+          store: getCombinedSessionStore(),
           stem: identity.liveStem,
           allowQmdSlugFallback: false,
         })
@@ -157,7 +196,7 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
         liveKeys.length > 0
           ? liveKeys
           : resolveTranscriptStemToSessionKeys({
-              store: combinedSessionStore,
+              store: getCombinedSessionStore(),
               stem: identity.stem,
               allowQmdSlugFallback: isQmdSessionHit && !identity.archived,
               ...(archivedOwnerAgentId ? { archivedOwnerAgentId } : {}),
@@ -166,7 +205,7 @@ export async function filterMemorySearchHitsBySessionVisibility(params: {
     if (keys.length === 0) {
       continue;
     }
-    const allowed = keys.some((key) => guard.check(key).allowed);
+    const allowed = keys.some(isAllowedSessionKey);
     if (!allowed) {
       continue;
     }

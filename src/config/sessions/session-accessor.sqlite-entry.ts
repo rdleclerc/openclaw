@@ -3,6 +3,7 @@ import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
+import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
   openOpenClawAgentDatabase,
   resolveOpenClawAgentSqlitePath,
@@ -108,6 +109,23 @@ export function resolveSqliteSessionKeyBySessionId(
       .limit(1),
   );
   return row?.session_key;
+}
+
+/** Lists current session-entry keys for one transcript id using an indexed read-only lookup. */
+export function listCurrentSqliteSessionKeysBySessionId(
+  scope: Pick<SessionTranscriptReadScope, "agentId" | "env" | "sessionId" | "storePath">,
+): string[] {
+  const resolved = resolveSqliteTranscriptReadScope(scope);
+  return withOpenClawAgentDatabaseReadOnly(({ db }) => {
+    const rows = db
+      .prepare(
+        "SELECT session_key AS sessionKey FROM session_entries WHERE session_id = ? ORDER BY session_key ASC",
+      )
+      .all(resolved.sessionId) as Array<{ sessionKey?: unknown }>;
+    return rows.flatMap((row) =>
+      typeof row.sessionKey === "string" && row.sessionKey.trim() ? [row.sessionKey] : [],
+    );
+  }, toDatabaseOptions(resolved));
 }
 
 /** Lists session entries from the additive SQLite session store. */
