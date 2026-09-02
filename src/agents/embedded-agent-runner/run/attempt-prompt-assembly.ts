@@ -127,6 +127,9 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
     : await resolvePromptBuildHookResult({
         config: attempt.config ?? getRuntimeConfig(),
         prompt: attempt.prompt,
+        // This remains the immutable visible request when attempt.prompt has
+        // already acquired runtime context or other model-only transforms.
+        requestPrompt: attempt.transcriptPrompt,
         messages: promptBuildMessages,
         hookCtx,
         hookRunner: input.hookRunner,

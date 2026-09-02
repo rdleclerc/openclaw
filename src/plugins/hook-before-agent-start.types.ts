@@ -20,6 +20,8 @@ export type PluginHookBeforeModelResolveResult = {
 
 // before_prompt_build hook
 export type PluginHookBeforePromptBuildEvent = {
+  /** Host-owned user-visible request before runtime or context-engine prompt transforms. */
+  requestPrompt?: string;
   prompt: string;
   /** Session messages prepared for this run. */
   messages: unknown[];

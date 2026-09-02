@@ -179,6 +179,34 @@ describe("resolvePromptBuildHookResult", () => {
     expect(result.prependContext).toBe("from-hook");
   });
 
+  it("passes the host-owned request separately from the rendered prompt", async () => {
+    const runBeforePromptBuild = vi.fn(async () => undefined);
+    const hookRunner = {
+      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
+      runBeforePromptBuild,
+      runBeforeAgentStart: vi.fn(async () => undefined),
+    };
+    const messages = [{ role: "assistant", content: "prior context" }];
+
+    await resolvePromptBuildHookResult({
+      config: {},
+      prompt: "assembled model context",
+      requestPrompt: "visible user request",
+      messages,
+      hookCtx: {},
+      hookRunner,
+    });
+
+    expect(runBeforePromptBuild).toHaveBeenCalledWith(
+      {
+        prompt: "assembled model context",
+        requestPrompt: "visible user request",
+        messages,
+      },
+      {},
+    );
+  });
+
   it("merges prompt-build and before_agent_start context fields in deterministic order", async () => {
     // Prompt-build hook context comes before before_agent_start context so plugin
     // injections are replayed in stable order.

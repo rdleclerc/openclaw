@@ -719,6 +719,7 @@ export async function runCopilotAttempt(
         }
       : await resolveAgentHarnessBeforePromptBuildResult({
           prompt: input.prompt,
+          requestPrompt: input.transcriptPrompt,
           developerInstructions: originalDeveloperInstructions,
           messages,
           ctx: hookContext,

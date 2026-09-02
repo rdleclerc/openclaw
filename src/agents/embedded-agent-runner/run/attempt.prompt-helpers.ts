@@ -57,7 +57,7 @@ type PromptBuildHookRunner = {
     ctx: PluginHookAgentContext,
   ) => Promise<PluginAgentTurnPrepareResult | undefined>;
   runBeforePromptBuild: (
-    event: { prompt: string; messages: unknown[] },
+    event: { prompt: string; requestPrompt?: string; messages: unknown[] },
     ctx: PluginHookAgentContext,
   ) => Promise<PluginHookBeforePromptBuildResult | undefined>;
   runBeforeAgentStart: (
@@ -107,6 +107,7 @@ export function forgetPromptBuildDrainCacheForRun(runId: string | undefined): vo
 export async function resolvePromptBuildHookResult(params: {
   config: OpenClawConfig;
   prompt: string;
+  requestPrompt?: string;
   messages: unknown[];
   hookCtx: PluginHookAgentContext;
   hookRunner?: PromptBuildHookRunner | null;
@@ -177,6 +178,7 @@ export async function resolvePromptBuildHookResult(params: {
         .runBeforePromptBuild(
           {
             prompt: params.prompt,
+            ...(params.requestPrompt !== undefined ? { requestPrompt: params.requestPrompt } : {}),
             messages: params.messages,
           },
           params.hookCtx,

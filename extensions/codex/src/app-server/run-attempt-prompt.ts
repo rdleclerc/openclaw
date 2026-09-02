@@ -175,6 +175,9 @@ export async function prepareCodexAttemptPrompt(context: CodexAttemptContext) {
   const buildPromptFromCurrentInputs = () =>
     resolveAgentHarnessBeforePromptBuildResult({
       prompt: prependCurrentInboundContext(promptState.promptText, params.currentInboundContext),
+      // Keep the host-owned visible request separate from the rendered prompt.
+      // Context-engine projection must not replace transport provenance.
+      requestPrompt: params.transcriptPrompt,
       developerInstructions: promptState.developerInstructions,
       messages: codexModelInputHistoryMessages,
       ctx: hookContext,

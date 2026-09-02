@@ -29,6 +29,7 @@ type AgentHarnessPromptBuildResult = {
 /** Runs before-prompt hooks and returns the adjusted prompt fields. */
 export async function resolveAgentHarnessBeforePromptBuildResult(params: {
   prompt: string;
+  requestPrompt?: string;
   developerInstructions: string;
   messages: unknown[];
   ctx: AgentHarnessHookContext;
@@ -60,6 +61,7 @@ export async function resolveAgentHarnessBeforePromptBuildResult(params: {
   const hookCtx = buildAgentHookContext(params.ctx);
   const promptEvent = {
     prompt: params.prompt,
+    ...(params.requestPrompt !== undefined ? { requestPrompt: params.requestPrompt } : {}),
     messages: params.messages,
   };
 

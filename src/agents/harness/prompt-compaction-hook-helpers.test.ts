@@ -11,6 +11,27 @@ afterEach(() => {
 });
 
 describe("resolveAgentHarnessBeforePromptBuildResult", () => {
+  it("passes the host-owned request separately from the rendered prompt", async () => {
+    const handler = vi.fn(() => undefined);
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_prompt_build", handler }]),
+    );
+
+    await resolveAgentHarnessBeforePromptBuildResult({
+      prompt: "assembled model context",
+      requestPrompt: "visible user request",
+      developerInstructions: "base instructions",
+      messages: [],
+      ctx: {},
+    });
+
+    expect(handler.mock.calls[0]?.[0]).toEqual({
+      prompt: "assembled model context",
+      requestPrompt: "visible user request",
+      messages: [],
+    });
+  });
+
   it("retains an empty prompt range without hooks", async () => {
     const result = await resolveAgentHarnessBeforePromptBuildResult({
       prompt: "",

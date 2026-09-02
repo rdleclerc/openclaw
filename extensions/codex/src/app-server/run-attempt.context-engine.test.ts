@@ -551,14 +551,15 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
   });
 
   it("bounds active context-engine projections when prompt hooks append context", async () => {
+    const beforePromptBuild = vi.fn(async (event: { prompt: string }) => ({
+      appendContext: `${event.prompt}\n\nhook append marker`,
+      prependContext: "hook prefix context",
+    }));
     initializeGlobalHookRunner(
       createMockPluginRegistry([
         {
           hookName: "before_prompt_build",
-          handler: async (event) => ({
-            appendContext: `${(event as { prompt: string }).prompt}\n\nhook append marker`,
-            prependContext: "hook prefix context",
-          }),
+          handler: beforePromptBuild,
         },
       ]),
     );
@@ -580,6 +581,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     params.contextEngine = contextEngine;
     params.contextTokenBudget = 300_000;
     params.prompt = "current prompt survives";
+    params.transcriptPrompt = params.prompt;
     params.currentInboundContext = { text: "current inbound context survives" };
 
     const run = runCodexAppServerAttempt(params);
@@ -591,6 +593,12 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     expect(inputText).toContain("current inbound context survives");
     expect(inputText).toContain("current prompt survives");
     expect(inputText).toContain("hook append marker");
+    const promptHookEvent = beforePromptBuild.mock.calls[0]?.[0] as {
+      prompt: string;
+      requestPrompt?: string;
+    };
+    expect(promptHookEvent.prompt).toContain("OpenClaw assembled context for this turn:");
+    expect(promptHookEvent.requestPrompt).toBe("current prompt survives");
 
     await harness.completeTurn();
     await run;
