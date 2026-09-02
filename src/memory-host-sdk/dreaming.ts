@@ -10,6 +10,7 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveUserPath } from "../utils.js";
 
 export const DEFAULT_MEMORY_DREAMING_ENABLED = false;
 export const DEFAULT_MEMORY_DREAMING_TIMEZONE = undefined;
@@ -132,6 +133,7 @@ export type MemoryDreamingPhaseName = "light" | "deep" | "rem";
 export type MemoryDreamingConfig = {
   enabled: boolean;
   frequency: string;
+  workspace?: string;
   timezone?: string;
   verboseLogging: boolean;
   storage: MemoryDreamingStorageConfig;
@@ -359,6 +361,7 @@ export function resolveMemoryDreamingConfig(params: {
   const dreaming = asNullableRecord(params.pluginConfig?.dreaming);
   const frequency =
     normalizeTrimmedString(dreaming?.frequency) ?? DEFAULT_MEMORY_DREAMING_FREQUENCY;
+  const workspace = normalizeTrimmedString(dreaming?.workspace);
   const timezone =
     normalizeTrimmedString(dreaming?.timezone) ??
     normalizeTrimmedString(params.cfg?.agents?.defaults?.userTimezone) ??
@@ -385,6 +388,7 @@ export function resolveMemoryDreamingConfig(params: {
   return {
     enabled: normalizeBoolean(dreaming?.enabled, DEFAULT_MEMORY_DREAMING_ENABLED),
     frequency,
+    ...(workspace ? { workspace } : {}),
     ...(timezone ? { timezone } : {}),
     verboseLogging: normalizeBoolean(
       dreaming?.verboseLogging,
@@ -624,6 +628,24 @@ export function resolveMemoryDreamingWorkspaces(
   }
   if (agentIds.length === 0) {
     agentIds.push(resolveDefaultAgentId(cfg));
+  }
+
+  const configuredDreamingWorkspace = resolveMemoryDreamingConfig({
+    pluginConfig: resolveMemoryDreamingPluginConfig(cfg),
+    cfg,
+  }).workspace;
+  if (configuredDreamingWorkspace) {
+    const primaryAgentId =
+      normalizeOptionalLowercaseString(options.primaryAgentId) ?? resolveDefaultAgentId(cfg);
+    if (!seenAgents.has(primaryAgentId)) {
+      agentIds.push(primaryAgentId);
+    }
+    return [
+      {
+        workspaceDir: resolveUserPath(configuredDreamingWorkspace, options.env),
+        agentIds,
+      },
+    ];
   }
 
   const byWorkspace = new Map<string, MemoryDreamingWorkspace>();

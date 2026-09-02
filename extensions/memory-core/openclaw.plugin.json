@@ -25,6 +25,11 @@
       "placeholder": "0 3 * * *",
       "help": "Optional cron cadence for the full dreaming sweep (light, REM, then deep)."
     },
+    "dreaming.workspace": {
+      "label": "Dreaming Workspace",
+      "placeholder": "/path/to/mutable/memory-workspace",
+      "help": "Optional trusted mutable workspace for dreaming inputs and outputs. When set, dreaming does not write to agent workspaces."
+    },
     "dreaming.model": {
       "label": "Dreaming Model",
       "placeholder": "anthropic/claude-sonnet-4-6",
@@ -44,6 +49,10 @@
           },
           "frequency": {
             "type": "string"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Trusted mutable workspace used for dreaming inputs and outputs instead of agent workspaces."
           },
           "model": {
             "type": "string"

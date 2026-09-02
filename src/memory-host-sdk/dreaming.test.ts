@@ -17,6 +17,7 @@ describe("memory dreaming host helpers", () => {
         dreaming: {
           enabled: true,
           frequency: "0 */4 * * *",
+          workspace: " /workspace/memory-state ",
           timezone: "Europe/London",
           model: " anthropic/claude-sonnet-4-6 ",
           storage: {
@@ -39,6 +40,7 @@ describe("memory dreaming host helpers", () => {
 
     expect(resolved.enabled).toBe(true);
     expect(resolved.frequency).toBe("0 */4 * * *");
+    expect(resolved.workspace).toBe("/workspace/memory-state");
     expect(resolved.timezone).toBe("Europe/London");
     expect(resolved.execution.defaults.model).toBe("anthropic/claude-sonnet-4-6");
     expect(resolved.phases.light.execution.model).toBe("anthropic/claude-sonnet-4-6");
@@ -217,6 +219,38 @@ describe("memory dreaming host helpers", () => {
       {
         workspaceDir: "/workspace/main",
         agentIds: ["main"],
+      },
+    ]);
+  });
+
+  it("uses one explicit mutable dreaming workspace instead of agent workspaces", () => {
+    const cfg = {
+      agents: {
+        list: [{ id: "review", workspace: "/tmp/review-workspace" }],
+      },
+      plugins: {
+        entries: {
+          "memory-core": {
+            config: {
+              dreaming: {
+                workspace: "~/memory-state",
+              },
+            },
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(
+      resolveMemoryDreamingWorkspaces(cfg, {
+        primaryWorkspaceDir: "/workspace/read-only-release",
+        primaryAgentId: "main",
+        env: { HOME: "/Users/tester" },
+      }),
+    ).toEqual([
+      {
+        workspaceDir: "/Users/tester/memory-state",
+        agentIds: ["review", "main"],
       },
     ]);
   });
