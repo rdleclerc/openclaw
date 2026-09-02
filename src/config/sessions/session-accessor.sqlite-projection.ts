@@ -163,6 +163,7 @@ export async function applySqliteSessionEntryReplacements<T>(params: {
           applySqliteSessionEntryMaintenance(transactionDb, {
             activeSessionKey: params.activeSessionKey ?? "",
             archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+            sessionStorePath: params.storePath,
             skipMaintenance: params.skipMaintenance ?? true,
           }),
         );
@@ -261,6 +262,7 @@ export async function applySqliteSessionStoreProjection<T>(params: {
           applySqliteSessionEntryMaintenance(transactionDb, {
             activeSessionKey: params.activeSessionKey ?? "",
             archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+            sessionStorePath: params.storePath,
             skipMaintenance: params.skipMaintenance,
           }),
         );
@@ -348,6 +350,7 @@ export async function applySqliteSessionEntryLifecycleMutation(params: {
           maintenanceConfig: params.maintenanceOverride
             ? { ...resolveMaintenanceConfig(), ...params.maintenanceOverride }
             : undefined,
+          sessionStorePath: params.storePath,
           skipMaintenance: params.skipMaintenance,
         }),
       );
@@ -445,6 +448,7 @@ export async function purgeSqliteDeletedAgentSessionEntries(
         applySqliteSessionEntryMaintenance(transactionDb, {
           activeSessionKey: "",
           archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+          sessionStorePath: params.storePath,
         }),
       );
       archivedTranscripts = deleteMaterializedSqliteSessionStatePlans(

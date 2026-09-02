@@ -12,6 +12,7 @@ import {
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { isInternalSessionEffectsKey } from "./internal-session-key.js";
 import { deriveLastRoutePatch, deriveSessionMetaPatch } from "./metadata.js";
+import { resolveStorePath } from "./paths.js";
 import type {
   ExactSessionEntry,
   SessionAccessScope,
@@ -238,6 +239,12 @@ export async function patchSqliteSessionEntry(
   options: SqliteSessionEntryPatchOptions = {},
 ): Promise<SessionEntry | null> {
   const resolved = resolveSqliteScope(scope);
+  const sessionStorePath =
+    scope.storePath ??
+    resolveStorePath(undefined, {
+      agentId: resolved.agentId,
+      env: resolved.env,
+    });
   return await runExclusiveSqliteSessionWrite(resolved, async () => {
     const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
     const prepared = readSqliteSessionEntrySelectionSnapshot(
@@ -297,6 +304,7 @@ export async function patchSqliteSessionEntry(
           activeSessionKey: resolved.sessionKey,
           archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
           maintenanceConfig: options.maintenanceConfig,
+          sessionStorePath,
           skipMaintenance: options.skipMaintenance,
         }),
       );
@@ -367,6 +375,7 @@ export async function patchSqliteSessionEntryTarget(
           activeSessionKey: scope.target.canonicalKey,
           archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
           maintenanceConfig: options.maintenanceConfig,
+          sessionStorePath: scope.storePath,
           skipMaintenance: options.skipMaintenance,
         }),
       );

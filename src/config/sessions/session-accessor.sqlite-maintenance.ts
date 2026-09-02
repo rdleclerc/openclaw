@@ -40,7 +40,10 @@ import {
 } from "./session-accessor.sqlite-scope.js";
 import { parseSqliteSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import { collectSessionMaintenancePreserveKeys } from "./store-maintenance-preserve.js";
+import {
+  collectActiveSessionWorkAdmissionKeys,
+  collectSessionMaintenancePreserveKeys,
+} from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
   capEntryCount,
@@ -246,6 +249,7 @@ export function applySqliteSessionEntryMaintenance(
     archiveDirectory: string;
     forceMaintenance?: boolean;
     maintenanceConfig?: ResolvedSessionMaintenanceConfig;
+    sessionStorePath?: string;
     skipMaintenance?: boolean;
   },
 ): SqliteSessionEntryMaintenancePlan {
@@ -307,10 +311,17 @@ export function applySqliteSessionEntryMaintenance(
       removedSessionIds.add(sessionId);
     }
   };
+  const activeAdmissionKeys = params.sessionStorePath
+    ? collectActiveSessionWorkAdmissionKeys({
+        storePath: params.sessionStorePath,
+        store,
+      })
+    : undefined;
   const preserveKeys =
-    collectSessionMaintenancePreserveKeys(
-      collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
-    ) ?? new Set<string>();
+    collectSessionMaintenancePreserveKeys([
+      ...collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
+      ...(activeAdmissionKeys ?? []),
+    ]) ?? new Set<string>();
   if (
     shouldRunModelRunPrune({
       maintenance,

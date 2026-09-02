@@ -7,6 +7,7 @@ import {
   writePersistedAuthProfileStateRaw,
 } from "../../agents/auth-profiles/sqlite.js";
 import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
@@ -1559,6 +1560,75 @@ describe("sqlite session normalization", () => {
         storePath: paths.sqlitePath,
       }).map((summary) => summary.sessionKey),
     ).toEqual(["agent:main:newer", "agent:main:newest"]);
+  });
+
+  it("preserves every active SQLite admission under protected-row cap pressure", async () => {
+    vi.mocked(getRuntimeConfig).mockReturnValue({
+      session: {
+        maintenance: {
+          mode: "enforce",
+          pruneAfter: "365d",
+          maxEntries: 1,
+        },
+      },
+    });
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scopeFor = (sessionKey: string) => ({
+      agentId: "main",
+      env,
+      sessionKey,
+      storePath: paths.sqlitePath,
+    });
+    const now = Date.now();
+    const sessionId = "active-cron-session";
+    const stableKey = "agent:main:cron:memory-dream";
+    const runKey = `${stableKey}:run:${sessionId}`;
+    const protectedSlackKey = "agent:main:slack:channel:c123:thread:123.456";
+    const seed = async (sessionKey: string, entry: SessionEntry) =>
+      await patchSqliteSessionEntry(scopeFor(sessionKey), () => entry, {
+        fallbackEntry: entry,
+        replaceEntry: true,
+        skipMaintenance: true,
+      });
+
+    await seed(protectedSlackKey, { sessionId: "protected-slack", updatedAt: now - 4 });
+    await seed("agent:main:cron:removable", {
+      sessionId: "removable-cron",
+      updatedAt: now - 3,
+    });
+    await seed(stableKey, { sessionId, updatedAt: now - 2 });
+    await seed(runKey, {
+      sessionId,
+      lifecycleRevision: "active-revision",
+      updatedAt: now - 1,
+      cronRunContinuation: {
+        lifecycleRevision: "active-revision",
+        phase: "running",
+      },
+    });
+    const admission = await beginSessionWorkAdmission({
+      scope: paths.sqlitePath,
+      identities: [stableKey, runKey, sessionId],
+      assertAllowed: () => {},
+    });
+
+    try {
+      await patchSqliteSessionEntry(scopeFor(stableKey), () => ({ updatedAt: now }));
+
+      const keys = new Set(
+        listSqliteSessionEntries({
+          agentId: "main",
+          env,
+          storePath: paths.sqlitePath,
+        }).map((entry) => entry.sessionKey),
+      );
+      expect(keys).toContain(protectedSlackKey);
+      expect(keys).toContain(stableKey);
+      expect(keys).toContain(runKey);
+      expect(keys).not.toContain("agent:main:cron:removable");
+    } finally {
+      admission.release();
+    }
   });
 
   it("evicts old SQLite transcript rows only when no remaining entry references them", async () => {

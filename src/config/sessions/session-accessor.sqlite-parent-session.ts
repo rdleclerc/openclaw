@@ -229,6 +229,7 @@ export async function forkSqliteSessionEntryFromParentTarget(
         applySqliteSessionEntryMaintenance(writeDatabase, {
           activeSessionKey: sessionTarget.canonicalKey,
           archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+          sessionStorePath: params.storePath,
           skipMaintenance: true,
         }),
       );
@@ -274,6 +275,7 @@ async function persistSqliteParentForkSkipPatch(params: {
       applySqliteSessionEntryMaintenance(database, {
         activeSessionKey: params.sessionTarget.canonicalKey,
         archiveDirectory: resolveSqliteTranscriptArchiveDirectory(params.resolved),
+        sessionStorePath: params.params.storePath,
         skipMaintenance: true,
       }),
     );
