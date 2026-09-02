@@ -628,6 +628,7 @@ export async function tryDispatchAcpReply(params: {
       auditTerminalOutcome = "blocked";
       throw agentPolicyError;
     }
+    const acpWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, acpAgentId);
     let extractedFileImages = params.extractedFileImages ?? [];
     if (hasInboundMediaForUnderstanding(params.ctx) && !params.ctx.MediaUnderstanding?.length) {
       try {
@@ -637,7 +638,7 @@ export async function tryDispatchAcpReply(params: {
           cfg: params.cfg,
           agentId: acpAgentId,
           agentDir: resolveAgentDir(params.cfg, acpAgentId),
-          workspaceDir: resolveAgentWorkspaceDir(params.cfg, acpAgentId),
+          workspaceDir: acpWorkspaceDir,
         });
         if (mediaResult.extractedFileImages.length > 0) {
           extractedFileImages = [...extractedFileImages, ...mediaResult.extractedFileImages];
@@ -653,6 +654,7 @@ export async function tryDispatchAcpReply(params: {
     const resolvedTurnAttachments = await resolveAgentTurnAttachments({
       ctx: params.ctx,
       cfg: params.cfg,
+      workspaceDir: acpWorkspaceDir,
       includeAttachmentIndexes: true,
     });
     const mediaAttachments = resolvedTurnAttachments.attachments;

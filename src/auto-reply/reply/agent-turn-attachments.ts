@@ -48,6 +48,7 @@ function hasInboundHistoryMedia(ctx: MsgContext): boolean {
 export async function resolveAgentTurnAttachments(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
+  workspaceDir?: string;
   runtime?: AgentTurnAttachmentRuntime;
   includeRecentHistoryImages?: boolean;
   includeAttachmentIndexes?: boolean;
@@ -93,6 +94,7 @@ export async function resolveAgentTurnAttachments(params: {
     localPathRoots: runtime.resolveMediaAttachmentLocalRoots({
       cfg: params.cfg,
       ctx: params.ctx,
+      workspaceDir: params.workspaceDir,
     }),
   });
   const results: AgentTurnAttachment[] = [];

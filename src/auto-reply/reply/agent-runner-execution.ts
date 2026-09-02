@@ -157,6 +157,7 @@ async function runAgentTurnWithFallbackInternal(
       resolveCurrentTurnImages({
         ctx: params.sessionCtx,
         cfg: runtimeConfig,
+        workspaceDir: params.followupRun.run.workspaceDir,
         images: params.followupRun.images ?? params.opts?.images,
         imageOrder: params.followupRun.imageOrder ?? params.opts?.imageOrder,
       }),

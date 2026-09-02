@@ -61,6 +61,65 @@ describe("resolveCurrentTurnImages", () => {
     });
   });
 
+  it("hydrates current images from the resolved agent workspace", async () => {
+    await withTempDir({ prefix: "openclaw-current-turn-workspace-images-" }, async (base) => {
+      const stateDir = path.join(base, "state");
+      const workspaceDir = path.join(base, "workspace");
+      const attachmentPath = path.join(workspaceDir, "media", "inbound", "slack.jpg");
+      const imageBytes = Buffer.from("slack-workspace-image");
+      await fs.mkdir(stateDir, { recursive: true });
+      await fs.mkdir(path.dirname(attachmentPath), { recursive: true });
+      await fs.writeFile(attachmentPath, imageBytes);
+      setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
+
+      const result = await resolveCurrentTurnImages({
+        ctx: {
+          Body: "caption",
+          MediaPath: attachmentPath,
+          MediaType: "image/jpeg",
+        } satisfies MsgContext,
+        cfg: {} as OpenClawConfig,
+        workspaceDir,
+      });
+
+      expect(result).toStrictEqual({
+        images: [
+          {
+            type: "image",
+            data: imageBytes.toString("base64"),
+            mimeType: "image/jpeg",
+          },
+        ],
+        imageOrder: ["inline"],
+      });
+    });
+  });
+
+  it("does not hydrate an arbitrary local image outside the allowed roots", async () => {
+    await withTempDir({ prefix: "openclaw-current-turn-outside-images-" }, async (base) => {
+      const stateDir = path.join(base, "state");
+      const workspaceDir = path.join(base, "workspace");
+      const outsidePath = path.join(base, "outside", "private.png");
+      await fs.mkdir(stateDir, { recursive: true });
+      await fs.mkdir(workspaceDir, { recursive: true });
+      await fs.mkdir(path.dirname(outsidePath), { recursive: true });
+      await fs.writeFile(outsidePath, "not-authorized");
+      setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
+
+      const result = await resolveCurrentTurnImages({
+        ctx: {
+          Body: "read /tmp/private.png",
+          MediaPath: outsidePath,
+          MediaType: "image/png",
+        } satisfies MsgContext,
+        cfg: {} as OpenClawConfig,
+        workspaceDir,
+      });
+
+      expect(result).toStrictEqual({});
+    });
+  });
+
   it("preserves the full order when only inline image payloads are present", async () => {
     const inlineImage = {
       type: "image" as const,

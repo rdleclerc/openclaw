@@ -164,6 +164,7 @@ function resolveMergedTurnImages(entries: OrderedTurnImage[]): {
 export async function resolveCurrentTurnImages(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
+  workspaceDir?: string;
   images?: ImageContent[];
   imageOrder?: PromptImageOrderEntry[];
   extractedFileImages?: ExtractedFileImage[];
@@ -202,6 +203,7 @@ export async function resolveCurrentTurnImages(params: {
     const resolved = await resolveAgentTurnAttachments({
       ctx: createUndescribedImageContext(params.ctx, undescribedImageAttachments),
       cfg: params.cfg,
+      workspaceDir: params.workspaceDir,
       includeRecentHistoryImages: false,
     });
     const images = resolved.attachments.map(

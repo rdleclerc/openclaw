@@ -1401,6 +1401,7 @@ export async function runPreparedReply(
     resolveCurrentTurnImages({
       ctx,
       cfg,
+      workspaceDir,
       images: opts?.images,
       imageOrder: opts?.imageOrder,
       extractedFileImages: opts?.extractedFileImages,
