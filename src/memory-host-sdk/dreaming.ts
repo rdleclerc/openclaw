@@ -637,7 +637,7 @@ export function resolveMemoryDreamingWorkspaces(
   if (configuredDreamingWorkspace) {
     const primaryAgentId =
       normalizeOptionalLowercaseString(options.primaryAgentId) ?? resolveDefaultAgentId(cfg);
-    if (!seenAgents.has(primaryAgentId)) {
+    if (!agentIds.includes(primaryAgentId)) {
       agentIds.push(primaryAgentId);
     }
     return [

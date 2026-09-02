@@ -253,6 +253,20 @@ describe("memory dreaming host helpers", () => {
         agentIds: ["review", "main"],
       },
     ]);
+
+    expect(
+      resolveMemoryDreamingWorkspaces(
+        {
+          plugins: cfg.plugins,
+        } as OpenClawConfig,
+        { env: { HOME: "/Users/tester" } },
+      ),
+    ).toEqual([
+      {
+        workspaceDir: "/Users/tester/memory-state",
+        agentIds: ["main"],
+      },
+    ]);
   });
 
   it("uses default agent fallback and timezone-aware day helpers", () => {
