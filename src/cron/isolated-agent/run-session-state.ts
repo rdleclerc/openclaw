@@ -189,6 +189,14 @@ export function createCronRunContinuationSession(params: {
     entry?.cronRunContinuation?.lifecycleRevision === continuation.lifecycleRevision;
   const persist = async (create: boolean, phase: "running" | "ready", basePersisted = false) => {
     const source = structuredClone(params.cronSession.sessionEntry);
+    // A broad session snapshot writer can preserve this exact run's identity
+    // while dropping only the hidden marker. Reattach only to that same run.
+    const canReattachSameRun = (entry: SessionEntry | undefined) =>
+      entry !== undefined &&
+      entry.cronRunContinuation === undefined &&
+      Boolean(source.sessionId) &&
+      entry.sessionId === source.sessionId &&
+      entry.lifecycleRevision === continuation.lifecycleRevision;
     let persisted = false;
     let alreadySealed = false;
     await params.persistSessionEntry({
@@ -196,12 +204,12 @@ export function createCronRunContinuationSession(params: {
       sessionKey: params.runSessionKey,
       fallbackEntry: source,
       update: (current) => {
-        if ((current && !owns(current)) || (!current && !create)) {
+        if ((current && !owns(current) && !canReattachSameRun(current)) || (!current && !create)) {
           throw new CronSessionLifecycleClaimError(params.runSessionKey);
         }
         // Leaving running transfers ownership to gateway continuation turns.
         // The initial cron owner must never overwrite their newer state.
-        if (current && current.cronRunContinuation?.phase !== "running") {
+        if (current?.cronRunContinuation && current.cronRunContinuation.phase !== "running") {
           alreadySealed = phase === "ready" && current.cronRunContinuation?.phase === "ready";
           if (alreadySealed) {
             return current;

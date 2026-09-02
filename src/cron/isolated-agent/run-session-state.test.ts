@@ -55,6 +55,45 @@ function makeGuardedPersistSessionEntry(persistedStore: Record<string, SessionEn
 }
 
 describe("createPersistCronSessionEntry", () => {
+  it("reattaches an exact run after a broad snapshot drops only its continuation marker", async () => {
+    const runSessionKey = "agent:main:cron:job:run:run-session-id";
+    const lifecycleRevision = crypto.randomUUID();
+    const cronSession = {
+      ...makeCronSession(makeSessionEntry({ lifecycleRevision })),
+      lifecycleRevision,
+    } as MutableCronSession;
+    const store: Record<string, SessionEntry> = {};
+    const continuation = createCronRunContinuationSession({
+      cronSession,
+      runSessionKey,
+      persistSessionEntry: makeGuardedPersistSessionEntry(store),
+    });
+
+    await continuation.initialize();
+    const sameRunWithoutMarker = { ...store[runSessionKey] };
+    delete sameRunWithoutMarker.cronRunContinuation;
+    store[runSessionKey] = sameRunWithoutMarker;
+
+    await continuation.sync();
+    expect(store[runSessionKey]?.cronRunContinuation).toMatchObject({
+      lifecycleRevision,
+      phase: "running",
+    });
+
+    const differentSessionWithoutMarker = {
+      ...store[runSessionKey],
+      sessionId: "different-session-id",
+    };
+    delete differentSessionWithoutMarker.cronRunContinuation;
+    store[runSessionKey] = differentSessionWithoutMarker;
+    await expect(continuation.sync()).rejects.toBeInstanceOf(CronSessionLifecycleClaimError);
+
+    store[runSessionKey] = makeSessionEntry({
+      lifecycleRevision: crypto.randomUUID(),
+    });
+    await expect(continuation.sync()).rejects.toBeInstanceOf(CronSessionLifecycleClaimError);
+  });
+
   it("owns an exact hidden continuation row without colliding with another run", async () => {
     const runSessionKey = "agent:main:cron:job:run:run-session-id";
     const lifecycleRevision = crypto.randomUUID();
